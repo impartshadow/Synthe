@@ -23,7 +23,9 @@ def w(tmp_path):
 
 def _pinned_approval(w, packet, commit):
     params = {**ss.planned_params(packet["handoff"], PUSH), "commit": commit}
-    return ss.detached_approval(packet, w.keys["rishab"], PUSH, ts(dt.timedelta(days=1)), params)
+    policy = (w.registry.get("agents") or {}).get("builder", {}).get("policy")
+    return ss.detached_approval(packet, w.keys["rishab"], PUSH, ts(dt.timedelta(days=1)), params,
+                                policy=policy)
 
 
 def _stage(w):
@@ -75,8 +77,11 @@ def _require_pin(w):
 def test_unpinned_approval_does_not_commit_when_the_pin_is_required(w):
     _require_pin(w)
     p, tok, a = _stage(w)
+    # No commit pin (the finding), but a budget pin is mandatory since the
+    # budget-binding rework: sign it the supported way, minus the commit.
+    policy = (w.registry.get("agents") or {}).get("builder", {}).get("policy")
     unpinned = ss.detached_approval(p, w.keys["rishab"], PUSH, ts(dt.timedelta(days=1)),
-                                    ss.planned_params(p["handoff"], PUSH))
+                                    ss.planned_params(p["handoff"], PUSH), policy=policy)
     out = cm.submit_approval(w.cfg, unpinned)
     assert out["receipt"]["decision"] == "approval_accepted" and out["commits"] == []
     assert w.remote_ref("feature/x") is None and staged_state(w, "d1") == {PUSH: "STAGED"}
@@ -106,7 +111,9 @@ def test_sign_cli_pins_the_commit(w, tmp_path):
     pk.write_text(json.dumps(p))
     kk.write_text(json.dumps({k: v for k, v in w.keys["rishab"].items() if k != "_secret"}))
     r = subprocess.run([sys.executable, str(ROOT / "src/synthe_sign.py"), "approve", str(pk), "--key", str(kk),
-                        "--action", PUSH, "--detached", "--commit", a, "--out", str(out)],
+                        "--action", PUSH, "--detached", "--commit", a,
+                        "--budget", '{"tokens": 100000, "usd": 5, "minutes": 60}',
+                        "--out", str(out)],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert json.loads(out.read_text())["params"]["commit"] == a

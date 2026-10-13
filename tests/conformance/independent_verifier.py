@@ -4,8 +4,8 @@ Implements:
 - Canonical JSON: sorted keys, compact separators, UTF-8,
   whole-number floats written as ints (SPEC §5)
 - Packet signature: "synthe/handoff-signature/v1\\n" + canonical(handoff)
-- Approval signature: "synthe/approval-signature/v1\\n" +
-  canonical({action, approver, expires_at, idempotency_key, from, to})
+- Approval signature: "synthe/approval-signature/v2\\n" +
+  canonical({action, approver, expires_at, idempotency_key, from, to, budget, estimates})
 
 Uses the `cryptography` library for Ed25519 math (RFC 8032, as SPEC references).
 Does NOT import synthe_crypto or synthe_sign.
@@ -28,7 +28,7 @@ def canonical(obj) -> bytes:
 
 
 PACKET_DOMAIN = "synthe/handoff-signature/v1\n"
-APPROVAL_DOMAIN = "synthe/approval-signature/v1\n"
+APPROVAL_DOMAIN = "synthe/approval-signature/v2\n"
 
 
 def packet_signing_input(handoff: dict) -> bytes:
@@ -43,6 +43,10 @@ def approval_signing_input(approval: dict, handoff: dict) -> bytes:
         "idempotency_key": handoff.get("idempotency_key"),
         "from": handoff.get("from"),
         "to": handoff.get("to"),
+        # v2 (SPEC §5): the approval binds the budget and the approved
+        # action's cost estimates the approver reviewed.
+        "budget": approval.get("budget"),
+        "estimates": approval.get("estimates"),
     }
     # NOTE (T1.4 finding): SPEC §5 does not mention `params`, but the
     # reference implementation includes it when present. Including it here

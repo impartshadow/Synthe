@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import handoff_check as hc      # noqa: E402
 import synthe_crypto as sc      # noqa: E402
 import synthe_mcp as mcp        # noqa: E402
+import synthe_sign as ss        # noqa: E402
 
 V3 = ROOT / "examples" / "v03"
 AT = dt.datetime(2026, 10, 1, 6, 0, tzinfo=dt.timezone.utc)
@@ -65,6 +66,8 @@ def approve(packet, k, action="send_email", with_kid=True):
     """Replace the packet's approvals with one signed by k (approvers sign before the sender)."""
     h = packet["handoff"]
     appr = {"action": action, "approver": k["agent"], "expires_at": "2999-01-01T00:00:00Z"}
+    # v2: an approval must pin the budget it authorizes; pin the effective budget.
+    appr["budget"] = ss._approval_budget_pin(h, None, reg()["agents"]["caddy"]["policy"], action)
     appr["sig"] = sc.b64u(sc.sign_bytes(k["_secret"], sc.approval_signing_input(appr, h)))
     if with_kid:
         appr["kid"] = k["kid"]

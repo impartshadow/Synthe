@@ -269,14 +269,95 @@ def planned_params(h: dict, action: str):
     return None
 
 
+_APPROVAL_BUDGET_DIMS = ("tokens", "usd", "minutes")
+
+
+def _approval_budget_pin(h: dict, budget: dict | None, policy: dict | None,
+                         action: str) -> dict:
+    """The complete budget ceiling an approval pins -- the EFFECTIVE budget the
+    checker will compare the packet against.
+
+    Per-dimension precedence: the approver's explicit `budget` (the tightest
+    cap, what the approver names) wins; then the packet's explicit
+    `authority.budget` (what the approver reviewed); then the receiver
+    policy's `defaults.budget`, which fills exactly the dimensions the packet
+    omits -- the same merge rule as `handoff_check.apply_receiver_defaults`,
+    so the pin is unambiguous whenever the policy is supplied.
+
+    A v2 approval with no budget pin caps nothing, so it authorizes nothing:
+    signing is REFUSED unless a complete (tokens/usd/minutes) numeric
+    non-negative budget can be determined. ValueError names the remedy.
+    """
+    if budget is not None and not isinstance(budget, dict):
+        raise ValueError(
+            f"cannot sign approval for '{action}': the explicit budget must be "
+            f"a JSON object of budget dimensions, e.g. "
+            f"'{{\"tokens\": 1000, \"usd\": 5, \"minutes\": 30}}'")
+    pin: dict = {}
+    packet_budget = (h.get("authority") or {}).get("budget")
+    if isinstance(packet_budget, dict):
+        for dim in _APPROVAL_BUDGET_DIMS:
+            if dim in packet_budget:
+                pin[dim] = packet_budget[dim]
+    defaults_budget = ((policy or {}).get("defaults") or {}).get("budget")
+    if isinstance(defaults_budget, dict):
+        for dim in _APPROVAL_BUDGET_DIMS:
+            if dim not in pin and dim in defaults_budget:
+                pin[dim] = defaults_budget[dim]
+    if isinstance(budget, dict):
+        for dim in _APPROVAL_BUDGET_DIMS:
+            if dim in budget:
+                pin[dim] = budget[dim]  # the approver's explicit cap wins per dimension
+    missing = [d for d in _APPROVAL_BUDGET_DIMS if d not in pin]
+    bad = [d for d in _APPROVAL_BUDGET_DIMS
+           if d in pin and (isinstance(pin[d], bool)
+                            or not isinstance(pin[d], (int, float))
+                            or pin[d] < 0)]
+    if missing or bad:
+        detail = []
+        if missing:
+            detail.append(f"missing dimensions: {', '.join(missing)}")
+        if bad:
+            detail.append(f"invalid dimensions (must be non-negative numbers): {', '.join(bad)}")
+        raise ValueError(
+            f"cannot sign approval for '{action}': no budget to bind ({'; '.join(detail)}). "
+            f"The packet names no usable authority.budget, so name the budget you are authorizing: "
+            f"budget={{'tokens': 1000, 'usd': 5, 'minutes': 30}} "
+            f"(synthe-sign approve --budget '{{\"tokens\": 1000, \"usd\": 5, \"minutes\": 30}}'), "
+            f"or pass the receiver policy whose defaults.budget the checker would apply.")
+    return {d: pin[d] for d in _APPROVAL_BUDGET_DIMS}
+
+
+def _approval_estimates(h: dict, action: str) -> dict | None:
+    """The amount-like fields (`est_tokens`/`est_usd`/`est_minutes`) of the
+    planned action this approval covers, if the plan names any."""
+    for act in h.get("planned_actions") or []:
+        if isinstance(act, dict) and action in (act.get("name"), act.get("tool")):
+            est = {k: act[k] for k in ("est_tokens", "est_usd", "est_minutes") if k in act}
+            return est or None
+    return None
+
+
 def approve_packet(packet: dict, key: dict, action: str, expires_at: str | None,
-                   params: dict | None = None) -> dict:
+                   params: dict | None = None, budget: dict | None = None,
+                   policy: dict | None = None) -> dict:
     h = packet["handoff"]
     appr = {"action": action, "approver": key["agent"]}
     if expires_at:
         appr["expires_at"] = expires_at
     if params is not None:
         appr["params"] = json.loads(json.dumps(params))  # a copy, never a shared reference
+    # The approval binds the budget (and the approved action's cost estimates)
+    # the approver reviewed: the packet's spend may only come down afterwards.
+    # An explicit `budget` caps tighter than the packet states, per dimension;
+    # otherwise the packet's own budget is what the approver authorizes; dims
+    # the packet omits are pinned from the receiver policy's defaults.budget
+    # (exactly what the checker will apply). Signing without a complete
+    # budget to bind is refused: an unpinned approval would cap nothing.
+    appr["budget"] = _approval_budget_pin(h, budget, policy, action)
+    estimates = _approval_estimates(h, action)
+    if estimates is not None:
+        appr["estimates"] = estimates
     msg = sc.approval_signing_input(appr, h)
     # A Touch ID key (synthe_touchid.signing_key) signs in the Secure Enclave, after a finger on the sensor.
     sig = key["_sign"](msg) if callable(key.get("_sign")) else sc.sign_bytes(key["_secret"], msg)
@@ -287,11 +368,12 @@ def approve_packet(packet: dict, key: dict, action: str, expires_at: str | None,
 
 
 def detached_approval(packet: dict, key: dict, action: str, expires_at: str | None,
-                      params: dict | None = None) -> dict:
+                      params: dict | None = None, budget: dict | None = None,
+                      policy: dict | None = None) -> dict:
     """An approval signed exactly like an embedded one, plus the handoff fields
     it is bound to (idempotency_key, from, to), as a standalone object."""
     scratch = json.loads(json.dumps(packet))
-    approve_packet(scratch, key, action, expires_at, params)
+    approve_packet(scratch, key, action, expires_at, params, budget, policy)
     h = packet["handoff"]
     appr = scratch["handoff"]["authority"]["approvals"][-1]
     return {**appr, "idempotency_key": h.get("idempotency_key"), "from": h.get("from"), "to": h.get("to"),
@@ -321,9 +403,29 @@ def cmd_approve(a) -> int:
             sys.stderr.write("--commit needs the planned params pinned (drop --no-params)\n")
             return 2
         params = {**params, "commit": a.commit}  # bind this approval to the commit the approver read
+    budget = None
+    if getattr(a, "budget", None):
+        try:
+            budget = json.loads(a.budget)
+        except ValueError:
+            sys.stderr.write("--budget must be JSON, e.g. '{\"tokens\":1000,\"usd\":5,\"minutes\":60}'\n")
+            return 2
+        if not isinstance(budget, dict):
+            sys.stderr.write("--budget must be a JSON object of budget dimensions\n")
+            return 2
+    pinned: dict | None = None
+    try:
+        # The CLI has no receiver policy: the budget comes from --budget and/or
+        # the packet's own authority.budget. Refusing here (not deep inside the
+        # signer) keeps the failure message in front of the approver.
+        pinned = _approval_budget_pin(h, budget, None, a.action)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return 2
     sys.stderr.write(f"approving '{a.action}' as {a.key and _load(a.key).get('agent')} for handoff "
                      f"{h.get('id')} ({h.get('from')} -> {h.get('to')}): {h.get('purpose')}\n"
                      f"  params: {json.dumps(params) if params else '(none pinned)'}\n"
+                     f"  budget: {json.dumps(pinned)} (the approval caps the spend at this)\n"
                      f"  expires: {a.expires_at or '(no expiry)'}\n")
     if a.detached:
         # v0.5: the same signed approval, delivered on its own to whatever
@@ -331,9 +433,9 @@ def cmd_approve(a) -> int:
         if not a.out:
             sys.stderr.write("--detached needs --out APPROVAL.json\n")
             return 2
-        _write(detached_approval(packet, _approver_key(a.key), a.action, a.expires_at, params), a.out)
+        _write(detached_approval(packet, _approver_key(a.key), a.action, a.expires_at, params, budget), a.out)
         return 0
-    _write(approve_packet(packet, _approver_key(a.key), a.action, a.expires_at, params), a.out)
+    _write(approve_packet(packet, _approver_key(a.key), a.action, a.expires_at, params, budget), a.out)
     return 0
 
 
@@ -414,10 +516,27 @@ def cmd_verify(a) -> int:
             continue
         revoked = (appr.get("kid") is not None
                    and sc.kid_is_revoked(registry, appr.get("approver"), appr.get("kid")))
+        try:
+            raw_sig = sc.unb64u(appr["sig"])
+        except Exception:
+            raw_sig = b""
         good = (not revoked and sc.verify_approval(registry, appr.get("approver"), appr.get("kid"),
-                                  sc.approval_signing_input(appr, h), sc.unb64u(appr["sig"])))
+                                                   sc.approval_signing_input(appr, h), raw_sig))
+        status = "REVOKED" if revoked else ("verified" if good else "INVALID")
+        if not revoked and not good:
+            # Name the retired scheme explicitly: it was a real approval once,
+            # it just predates the budget binding and cannot be honored now.
+            old = sc.verify_approval(registry, appr.get("approver"), appr.get("kid"),
+                                     sc.approval_signing_input_v1(appr, h), raw_sig)
+            if old:
+                status = "UNSUPPORTED_VERSION"
+        elif good and not isinstance(appr.get("budget"), dict):
+            # The signature is real, but a v2 approval that pins no budget caps
+            # nothing: the checker rejects it as approval_budget_missing.
+            status = "UNPINNED_BUDGET"
+            good = False
         report["approvals"].append({"action": appr.get("action"), "approver": appr.get("approver"),
-                                    "status": "REVOKED" if revoked else ("verified" if good else "INVALID")})
+                                    "status": status})
         ok &= good and not revoked
     problems = sc.revocation_problems(registry)
     if problems:
@@ -590,6 +709,11 @@ def main(argv=None) -> int:
     p.add_argument("--commit", help="pin the approval to this commit SHA (the one whose diff you read)")
     p.add_argument("--no-params", action="store_true",
                    help="do not pin the planned action's params into the approval")
+    p.add_argument("--budget",
+                   help="explicit budget cap as JSON, e.g. '{\"tokens\":1000,\"usd\":5,\"minutes\":60}'; "
+                        "wins per dimension over the packet's own authority.budget. REQUIRED when the "
+                        "packet names no authority.budget: an approval is never signed without a "
+                        "budget to bind")
     p.add_argument("--out")
     p.add_argument("--detached", action="store_true",
                    help="write the signed approval to --out on its own (for the effect executor) "

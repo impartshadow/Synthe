@@ -37,6 +37,7 @@ UX guards, not the credential wall. The new Linux setup path still needs a clean
 | Sender drops an approval requirement | policy's `approval_required_for` is unioned in | `approval_missing` |
 | Forged or typed-in approval | approvals must carry a valid Ed25519 or ES256 signature from a registered, trusted approver key | `approval_unsigned`, `approval_signature_invalid`, `approver_not_trusted` |
 | Approval replayed onto another handoff | signature binds `idempotency_key`, `from`, `to` | `approval_signature_invalid` |
+| Approved spend stretched after signing | v2 approvals pin the reviewed budget and cost estimates as signed ceilings; signing is refused without a complete budget to bind, and unpinned v2 approvals are rejected outright; pre-v2 approvals are rejected outright | `approval_budget_exceeded`, `approval_estimates_exceeded`, `approval_budget_missing`, `approval_version_unsupported` |
 | Same work executed twice | ledger claim (RESERVED → COMPLETED, file lock) | `duplicate_idempotency_key`, `idempotency_key_reserved` |
 | Stale cache restores an older ledger (rollback) | HMAC-sealed hash chain + monotonic seq checked against the out-of-cache anchor (repo variable) | `ledger_rollback` |
 | Forged or swapped-in ledger file | chain seal (HMAC when `SYNTHE_LEDGER_HMAC_KEY` is set); unsealed file under an anchor refused as downgrade | `ledger_corrupt`, `ledger_rollback` |

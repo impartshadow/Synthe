@@ -323,6 +323,7 @@ def test_stale_holder_cannot_commit_twice(w):
         "push_docs",
         ts(dt.timedelta(days=7)),
         ss.planned_params(p["handoff"], "push_docs"),
+        policy=(w.registry.get("agents") or {}).get("builder", {}).get("policy"),
     )
     p = ss.sign_packet(p, w.keys["planner"])
     token = w.claim(p)

@@ -108,6 +108,13 @@ def render(detail: dict, full: bool = False, ui=None) -> str:
              f" Push         commit {_short(eff.get('commit'))} to {clean(eff.get('remote'), True)} / "
              f"{clean(eff.get('branch'), True)}"
              + ("   (a new branch)" if old in (None, "new") else f"   (replacing {_short(old)})")]
+    budget = detail.get("effective_budget")
+    if not isinstance(budget, dict):
+        budget = (((detail.get("packet") or {}).get("handoff") or {}).get("authority") or {}).get("budget")
+    if isinstance(budget, dict) and budget:
+        # The approval binds this budget: the spend may only come down afterwards.
+        dims = " / ".join(f"{k} {budget[k]}" for k in ("tokens", "usd", "minutes") if k in budget)
+        lines.append(f" Budget       {clean(dims, True)}   [the approval caps the spend at this]")
     if ch.get("available"):
         lines.append(f" Changes      {clean(ch.get('stat'), True) or 'no file changes'}   "
                      f"[from the broker's copy]")
@@ -145,7 +152,9 @@ def diff_has_more(detail: dict) -> bool:
 
 def build_approval(detail: dict, key: dict, expires_in_min: int = DEFAULT_EXPIRES_MIN, now=None) -> dict:
     """A detached approval for exactly this proposal: the plan's params plus the commit the broker
-    showed, signed with the approver's key, valid for `expires_in_min` minutes."""
+    showed, signed with the approver's key, valid for `expires_in_min` minutes. The approval pins
+    the broker-supplied effective budget (the ceiling the checker will apply), so minimal packets
+    that name no budget of their own are still capped."""
     if not 0 < expires_in_min <= MAX_EXPIRES_MIN:
         raise ValueError(f"approvals last between 1 and {MAX_EXPIRES_MIN} minutes")
     eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
@@ -160,8 +169,18 @@ def build_approval(detail: dict, key: dict, expires_in_min: int = DEFAULT_EXPIRE
     if params is None:
         raise ValueError("the handoff's plan names no params for this action, so the approval can't pin them")
     expires = (now or dt.datetime.now(dt.timezone.utc)) + dt.timedelta(minutes=expires_in_min)
-    return ss.detached_approval(packet, key, detail["action"], expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                {**params, "commit": commit})
+    budget = detail.get("effective_budget")
+    if budget is not None and not isinstance(budget, dict):
+        raise ValueError("the broker's effective_budget is malformed; not approving")
+    try:
+        return ss.detached_approval(packet, key, detail["action"], expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                    {**params, "commit": commit}, budget=budget)
+    except ValueError as e:
+        # No budget to bind (packet names none, broker supplied none): fail
+        # closed with the remedy, never sign an uncapped approval.
+        raise ValueError(f"{e} Approve it with "
+                         f"synthe-sign approve --detached --budget '{{\"tokens\": ..., \"usd\": ..., \"minutes\": ...}}'") \
+            from None
 
 
 def touchid_reason(detail: dict) -> str:

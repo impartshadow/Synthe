@@ -52,7 +52,12 @@
        "branch": "feature/x"
       },
       "kid": "mallory-1",
-      "sig": "E7tA5yScOovIACB-RVxVgxQlOZiUarIQngIBVAdEs20LfzoW9rsp72_C9L0oJ6lu3RspM6GyGgVFGFARK3DfDA"
+      "sig": "TdetknZAnS6_8cY_xG_84wM_WPqMzdpGu-88VTOltAMBvENjjNhJ6FJqO42dGPlMqGmAljdqyVsJlR5Mo6WTAw",
+      "budget": {
+       "tokens": 50000,
+       "usd": 5,
+       "minutes": 60
+      }
      }
     ]
    },
@@ -88,7 +93,7 @@
    "signer": "planner",
    "kid": "planner-1",
    "alg": "Ed25519",
-   "sig": "gfj8IL1BwpVik5eWoT6mYbKd6nVulKyNYuKv1sE17ylsG07eSf8RYA_OhnD5EePpO_VaqhvuLfyqcKya6m3cDQ"
+   "sig": "ctWSoA4VuJK5u518UdIhH48L0NTbbHEaOauwUN8lSEGb6ZnIai7pSlEtsUiqD130NseVyyBMzOh0ulIpiYcXCg"
   }
  },
  "registry": {
@@ -99,7 +104,7 @@
      {
       "kid": "planner-1",
       "alg": "Ed25519",
-      "public_key": "bOPqoRHeca9uPKT-1Ugh2MWaEU2Z9Xy-e6BWAuh1O7E"
+      "public_key": "KxUL3Pq4qnvnq9iQda5tEV4camSHo5JVq5bgo6HunKo"
      }
     ]
    },
@@ -167,7 +172,7 @@
      {
       "kid": "mallory-1",
       "alg": "Ed25519",
-      "public_key": "I57ssyjtj6XqEGXZBCg2w2tJcXxF57Vd-x9O1ET8BHQ"
+      "public_key": "11fRQUhSyhPi0aAYlyioHp0L_AgYgvplhUTj2EKInrQ"
      }
     ]
    }

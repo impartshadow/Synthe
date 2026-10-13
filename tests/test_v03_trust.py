@@ -194,7 +194,9 @@ def test_cli_keygen_approve_sign_verify(tmp_path):
     p["handoff"]["authority"]["approvals"] = []
     (tmp_path / "p.json").write_text(json.dumps(p))
     subprocess.run([py, src / "synthe_sign.py", "approve", tmp_path / "p.json", "--key", tmp_path / "rohan.json",
-                    "--action", "send_email", "--out", tmp_path / "p.json"], check=True)
+                    "--action", "send_email",
+                    "--budget", '{"tokens": 50000, "usd": 2, "minutes": 30}',
+                    "--out", tmp_path / "p.json"], check=True)
     subprocess.run([py, src / "synthe_sign.py", "sign", tmp_path / "p.json", "--key", tmp_path / "cora.json",
                     "--out", tmp_path / "p.json"], check=True)
     v = subprocess.run([py, src / "synthe_sign.py", "verify", tmp_path / "p.json", "--registry",

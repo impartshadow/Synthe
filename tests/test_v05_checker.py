@@ -23,6 +23,12 @@ def reg(**policy):
     return r
 
 
+def caddy_policy(registry=None):
+    """The receiver policy whose defaults.budget the checker applies to the
+    minimal v03 packets -- the effective budget approvals must pin."""
+    return (registry or reg())["agents"]["caddy"]["policy"]
+
+
 def packet(key="k-v05", params=None, approve=True, approval_params=None, depends_on=None, owned=None):
     """The public valid-signed packet with a fresh key, re-approved by rohan and re-signed by cora."""
     p = json.loads((V3 / "packets" / "valid-signed.json").read_text())
@@ -36,7 +42,8 @@ def packet(key="k-v05", params=None, approve=True, approval_params=None, depends
     if owned is not None:
         h["scope"]["owned_paths"] = owned
     if approve:
-        ss.approve_packet(p, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR, approval_params)
+        ss.approve_packet(p, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR, approval_params,
+                          policy=caddy_policy())
     return ss.sign_packet(p, ss.load_key(KEYS / "cora.key.json"))
 
 
@@ -80,14 +87,16 @@ def test_unpinned_approval_still_works_as_in_v03():
 # ---- detached and deferred approvals (v0.5) ---------------------------------
 def test_detached_approval_counts_like_an_embedded_one():
     p = packet(approve=False)
-    detached = ss.detached_approval(p, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR)
+    detached = ss.detached_approval(p, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR,
+                                    policy=caddy_policy())
     assert check(p)["decision"] == "REJECT"
     assert check(p, extra_approvals=[detached])["decision"] == "ACCEPT"
 
 
 def test_detached_approval_for_another_handoff_is_refused():
     other = packet(key="k-other", approve=False)
-    detached = ss.detached_approval(other, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR)
+    detached = ss.detached_approval(other, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR,
+                                    policy=caddy_policy())
     assert check(packet(approve=False), extra_approvals=[detached])["decision"] == "REJECT"
 
 

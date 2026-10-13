@@ -170,7 +170,8 @@ def test_approval_from_other_agent_with_same_kid_still_verifies(keys):
         "boss": {"keys": [_entry(keys["boss"], "k1")]},
     }}
     h = {"id": "h1", "from": "boss", "to": "ops", "idempotency_key": "k1"}
-    appr = {"action": "push", "approver": "boss", "kid": "k1"}
+    appr = {"action": "push", "approver": "boss", "kid": "k1",
+            "budget": {"tokens": 1000, "usd": 5, "minutes": 60}}  # v2 approvals bind a budget
     appr["sig"] = sc.b64u(sc.sign_bytes(keys["boss"], sc.approval_signing_input(appr, h)))
     rec = sc.sign_revocation(sc.make_revocation("worker", "k1", NOW, "leak", "ops-1"),
                              keys["op"])
@@ -207,7 +208,8 @@ def test_usable_keys_excludes_revoked(reg, keys):
 
 def _signed_approval(keys, kid="worker-1"):
     h = {"id": "h1", "from": "worker", "to": "ops", "idempotency_key": "k1"}
-    appr = {"action": "push", "approver": "worker", "kid": kid}
+    appr = {"action": "push", "approver": "worker", "kid": kid,
+            "budget": {"tokens": 1000, "usd": 5, "minutes": 60}}  # v2 approvals bind a budget
     appr["sig"] = sc.b64u(sc.sign_bytes(keys["worker"], sc.approval_signing_input(appr, h)))
     return h, appr
 

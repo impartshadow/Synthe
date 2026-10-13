@@ -100,7 +100,10 @@ def main(argv=None) -> int:
          "acceptance": {"expires_at": ts(1), "required_evidence": ["test_output"],
                         "evidence": [{"kind": "test_output", "ref": "task.md"}]}}
     p = {"handoff": h}
-    ss.approve_packet(p, keys["approver"], "push_branch", ts(1), ss.planned_params(h, "push_branch"))
+    # The packet names no budget; pin the receiver policy's defaults.budget --
+    # the effective budget the checker will apply.
+    ss.approve_packet(p, keys["approver"], "push_branch", ts(1), ss.planned_params(h, "push_branch"),
+                      policy=policy)
     Path(a.packet).write_text(json.dumps(ss.sign_packet(p, keys["planner"])))
     return 0
 

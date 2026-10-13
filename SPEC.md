@@ -58,7 +58,7 @@ approval or a tool.
 | `authority.allowed_tools` | yes* | tools the receiver may call |
 | `authority.budget` | yes* | numeric `tokens`, `usd`, `minutes` |
 | `authority.approval_required_for` | yes* | actions/tools that need an approval first (may be empty) |
-| `authority.approvals[]` | no | `{action, approver, expires_at?, kid?, sig?}` |
+| `authority.approvals[]` | no | `{action, approver, expires_at?, kid?, sig?, budget?, estimates?}` |
 | `planned_actions[]` | policy | `{name, tool, params?, est_tokens?, est_usd?, est_minutes?}` |
 | `sender_role` / `receiver_role` | no | v0.6: team role labels for this handoff's edge; verified against the receiver's team topology (section 15) |
 | `capability` | policy | v0.6: signed capability declaration — `version` (required), `env[]` (env vars it may read), `paths[]` (file globs it may touch), `tools[]` (tools/APIs it may call), `network` (egress, denied by default), `admission_receipt?` (cross-reference to a skill-admission receipt). The packet signature covers it, so any change (including a version change) requires re-declaration and re-signing |
@@ -186,8 +186,30 @@ bytes never change.
   written as ints.
 - **Packet signature** signs `"synthe/handoff-signature/v1\n" + canonical(handoff)`.
   `signer` must equal `handoff.from`, and the key must be in `agents.<from>.keys`.
-- **Approval signature** signs `"synthe/approval-signature/v1\n" + canonical({action, approver, expires_at, idempotency_key, from, to})`.
+- **Approval signature** signs `"synthe/approval-signature/v2\n" + canonical({action, approver, expires_at, idempotency_key, from, to, budget, estimates})`.
   That binds an approval to exactly one handoff, so it can't be replayed onto another.
+- **Approvals bind the budget.** The approval pins the `budget` (`tokens`, `usd`,
+  `minutes`) and the approved action's cost estimates (`est_tokens`, `est_usd`,
+  `est_minutes`) the approver reviewed, as signed ceilings: afterwards the packet's
+  budget and the action's estimates may only come down, never up. A packet budget
+  above the approved budget is `approval_budget_exceeded`; estimates above the
+  approved estimates are `approval_estimates_exceeded`. Only the receiver-policy
+  ceiling used to limit magnitude; now the approver's cap binds too. Upgrading from v1
+  approvals: [`docs/APPROVALS_V2.md`](docs/APPROVALS_V2.md).
+- **The pin is the effective budget, and it is mandatory.** Per dimension the pin
+  takes the approver's explicit budget first, then the packet's explicit
+  `authority.budget`, then the receiver policy's `defaults.budget` -- the same
+  merge the checker applies, so the pin is exactly the budget the checker will
+  compare against. Signing is refused unless a complete (`tokens`/`usd`/`minutes`)
+  budget can be bound: the approver names one (`synthe-sign approve --budget
+  '{...}'`) or supplies the receiver policy. An approval with no budget pin caps
+  nothing, so it authorizes nothing: a v2 approval carrying no pin is rejected
+  outright as `approval_budget_missing`, never treated as unlimited.
+- **Retired v1 approvals fail closed.** Approvals signed under
+  `synthe/approval-signature/v1` (before the budget binding) are rejected with
+  `approval_version_unsupported`: they are never re-verified under the new
+  semantics, and they never pass as a confusing `approval_signature_invalid`.
+  Have the approver re-approve.
 - Order: approvers sign first, then the sender signs. The sender's signature
   covers the approvals list.
 - **`kid` (unreleased).** When the signer or approver has more than one usable key for that signature
@@ -395,7 +417,9 @@ legacy -> adopted; corrupt or anchor-forbidden -> refused, never overwritten).
 `approval_signature_invalid`, `authority_exceeds_receiver_policy`,
 `budget_exceeded`, `dependency_incomplete`, `dependency_unknown`, `claim_conflict` (v0.5), `approval_kid_required` (unreleased),
 `capability_not_declared` (v0.6), `capability_exceeds_receiver_policy` (v0.6), `topology_violation` (v0.6),
-`capability_path_unsafe` (v0.6.1), `topology_role_unbound` (v0.6.1)
+`capability_path_unsafe` (v0.6.1), `topology_role_unbound` (v0.6.1),
+`approval_version_unsupported` (v2), `approval_budget_missing` (v2),
+`approval_budget_exceeded` (v2), `approval_estimates_exceeded` (v2)
 
 **invalid (v0.6 additions):** `capability_declaration_missing`, `topology_declaration_missing`,
 `topology_malformed`, `topology_signature_missing`, `topology_signature_invalid`,

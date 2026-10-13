@@ -49,7 +49,9 @@ def stage(w, idem="k1", branch="feature/x", **kw):
 def detached(w, packet, approver="rishab", exp=None, params="planned"):
     if params == "planned":
         params = ss.planned_params(packet["handoff"], PUSH)
-    return ss.detached_approval(packet, w.keys[approver], PUSH, exp or ts(dt.timedelta(days=1)), params)
+    policy = (w.registry.get("agents") or {}).get("builder", {}).get("policy")
+    return ss.detached_approval(packet, w.keys[approver], PUSH, exp or ts(dt.timedelta(days=1)), params,
+                                policy=policy)
 
 
 def staged_state(w, idem="k1"):
@@ -99,7 +101,8 @@ def test_detached_cli_needs_out_and_writes_a_bound_approval(w, tmp_path):
     pk.write_text(json.dumps(p))
     kf.write_text(json.dumps({k: v for k, v in w.keys["rishab"].items() if k != "_secret"}))
     base = [sys.executable, str(ROOT / "src" / "synthe_sign.py"), "approve", str(pk), "--key", str(kf),
-            "--action", PUSH, "--detached"]
+            "--action", PUSH, "--detached",
+            "--budget", '{"tokens": 100000, "usd": 5, "minutes": 60}']
     assert subprocess.run(base, capture_output=True, text=True).returncode == 2
     out = tmp_path / "a.json"
     assert subprocess.run(base + ["--out", str(out)], capture_output=True, text=True).returncode == 0

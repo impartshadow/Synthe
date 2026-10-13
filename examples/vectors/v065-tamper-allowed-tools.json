@@ -53,7 +53,12 @@
        "branch": "feature/x"
       },
       "kid": "rishab-1",
-      "sig": "aPC0mjLVjBLepZA9tSSrcM7d7kiyl-xD061MvhFclHeM26gBmYQLcejeH-ExjhH-v7qHG8t0iKXskqnFZEVzDQ"
+      "sig": "xLPBGMt2RNPwikRq5fCyJ5rup9q19OUtAkL9Fa5D_dQ2cz0bwsMoiecZSoq9BN-_OWzoClHOYQfpePsb5PUpCg",
+      "budget": {
+       "tokens": 50000,
+       "usd": 5,
+       "minutes": 60
+      }
      }
     ]
    },
@@ -157,7 +162,7 @@
      {
       "kid": "rishab-1",
       "alg": "Ed25519",
-      "public_key": "ie2DuKl0rW7fIlcYgzVPXGoD5yJ0dr-KHPcONcGSesc"
+      "public_key": "tQ44pbhsoScE0Kk8N435Gmj5s1_pDWQU7IdThM-6U_A"
      }
     ]
    },

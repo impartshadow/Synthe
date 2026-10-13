@@ -36,8 +36,17 @@
           "action": "send_email",
           "approver": "rohan",
           "expires_at": "2999-01-01T00:00:00Z",
+          "budget": {
+            "tokens": 50000,
+            "usd": 2,
+            "minutes": 30
+          },
+          "estimates": {
+            "est_tokens": 300,
+            "est_minutes": 1
+          },
           "kid": "rohan-test-1",
-          "sig": "lO9pHBN86DgdSTUzmJVoeQrY4mUE9Mp1oOCCp6qYyrRru-6WZoJ4NvZ9IcLzexevi2ZVd1evtqVqZnnen15qCQ"
+          "sig": "MC8vsWrpS5WutURU9UI8yHJHsAh6saC1d2uwrBwqbMdM0wxHMJe4reKmn38ykA0Je3Nizt125hR8OeXr0T7gCg"
         }
       ]
     },
@@ -80,6 +89,6 @@
     "signer": "cora",
     "kid": "cora-test-1",
     "alg": "Ed25519",
-    "sig": "pinWZXXx9N3bjLGhjgGiHcmfsh0Jbr7ki8ii__02BOVKYXCqeJY5tVFD0-UOVJtYAe8v-PF7cfrc75UQaIC0BQ"
+    "sig": "el4MlBTjrhmPdXnZPQcUVEVitGbn7_NQQZ6eWgJ0u3FjT3dyWV6Tn4YzCDKqtml9t-hZ1HWLJQnI3MKv9MXcDg"
   }
 }

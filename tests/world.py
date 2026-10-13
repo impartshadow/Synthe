@@ -126,8 +126,12 @@ class World:
         p = {"handoff": h}
         if approve:
             params = ss.planned_params(h, "push_branch") if pin_params else None
+            # Pin the EFFECTIVE budget the checker will apply: the packet names
+            # none, so the receiver policy's defaults.budget is what binds.
+            policy = (self.registry.get("agents") or {}).get("builder", {}).get("policy")
             ss.approve_packet(p, self.keys[approver], "push_branch",
-                              approval_exp or ts(dt.timedelta(days=7)), params)
+                              approval_exp or ts(dt.timedelta(days=7)), params,
+                              policy=policy)
         return ss.sign_packet(p, self.keys["planner"])
 
     def check(self, packet, **kw):

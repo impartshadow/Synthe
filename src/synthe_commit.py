@@ -1453,6 +1453,20 @@ def staged_detail(cfg: BrokerConfig, staged_id: str, max_patch: int = 200_000) -
            "effect": {k: params.get(k) for k in ("remote", "branch", "commit", "expected_old")},
            "packet": {k: v for k, v in packet.items() if k in ("handoff", "signature")},
            "agent_says": {"purpose": h.get("purpose")}}
+    # The budget the approval will bind: the packet's explicit authority.budget
+    # with the receiver's defaults.budget merged in, exactly as the checker
+    # applies them (apply_receiver_defaults). From the broker's own registry
+    # policy, never from agent text -- so the approver authorizes the real
+    # ceiling, and the terminal approval can pin it even for minimal packets
+    # that name no budget of their own.
+    registry, rerr = hc.load_registry(str(cfg.registry_path))
+    if not rerr:
+        h_eff = copy.deepcopy(h)
+        hc.apply_receiver_defaults(h_eff, hc.receiver_policy(registry, h.get("to")))
+        eff_budget = (h_eff.get("authority") or {}).get("budget")
+        if isinstance(eff_budget, dict) and eff_budget:
+            out["effective_budget"] = {k: eff_budget[k] for k in ("tokens", "usd", "minutes")
+                                       if k in eff_budget}
     commit, base = params.get("commit"), params.get("expected_old")
     if isinstance(commit, str) and _SHA1.fullmatch(commit):
         out["changes"] = GitPush(cfg).describe(
@@ -1937,11 +1951,15 @@ def submit_approval(cfg: BrokerConfig, approval, origin: dict | None = None) -> 
 
     a = approval if isinstance(approval, dict) else {}
     if not all(isinstance(a.get(k), str) and a.get(k) for k in ("action", "approver", "idempotency_key", "from", "to")) \
-            or (a.get("params") is not None and not isinstance(a.get("params"), dict)):
+            or (a.get("params") is not None and not isinstance(a.get("params"), dict)) \
+            or not isinstance(a.get("budget"), dict) \
+            or (a.get("estimates") is not None and not isinstance(a.get("estimates"), dict)):
         return {"receipt": finish("approval_rejected", [{
             "state": "invalid", "code": "approval_malformed",
             "message": "a detached approval needs action, approver, idempotency_key, from, to (strings), kid, "
-                       "sig, and optional params (an object): make it with synthe_sign.py approve --detached"}]),
+                       "sig, a budget object (v2: approvals must pin the budget they authorize -- an "
+                       "unpinned approval caps nothing), and optional params/estimates (objects): make it "
+                       "with synthe_sign.py approve --detached"}]),
             "commits": []}
     receipt["approval"] = _public_approval(a)
     receipt["handoff"] = {"id": a.get("handoff_id"), "idempotency_key": a["idempotency_key"],
