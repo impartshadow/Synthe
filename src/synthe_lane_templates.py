@@ -169,7 +169,9 @@ def locked(cfg):
 
 def submit(cfg, x):
     with locked(cfg):
-        registry, err = hc.load_registry(str(cfg.registry_path))
+        # Signed registry: enforced once a genesis key is pinned
+        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+        registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
         if err:
             fail("registry_unreadable")
         validate(cfg, registry, x)
@@ -186,7 +188,9 @@ def revoke(cfg, x):
     with locked(cfg):
         s = load(cfg)
         t = s["templates"].get(x.get("template_id"))
-        registry, err = hc.load_registry(str(cfg.registry_path))
+        # Signed registry: enforced once a genesis key is pinned
+        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+        registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
         if err or not t:
             fail("template_revocation_invalid")
         # Pulling a grant is a safety action: any human trusted for its receiver may, not only its signer.
@@ -232,7 +236,9 @@ def select(cfg, registry, receiver, params, *, paths=None, template_id=None):
 
 def reserve(cfg, receiver, params, paths, tid):
     """Caller holds lane lock inside the claim fence, immediately before dispatch."""
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         fail("registry_unreadable")
     t = select(cfg, registry, receiver, params, paths=paths, template_id=tid)
@@ -247,7 +253,9 @@ def reserve(cfg, receiver, params, paths, tid):
 
 def view(cfg):
     from synthe_commit import Deny
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         fail("registry_unreadable")
     with locked(cfg):

@@ -102,6 +102,61 @@ against v0.2. The missing piece is ordering: your workflow must
 serialize the runs that share a ledger. GitHub provides that as a
 workflow-level `concurrency` group.
 
+### Ledger integrity: sealed chain + out-of-cache anchor (v0.6)
+
+Cache chaining alone cannot tell a *fresh* restore from a *stale* one: an
+older snapshot, a forged empty file, or a deleted ledger all used to load as
+valid, silently forgetting claims. Every ledger write is now sealed into a
+hash chain under the reserved `"~synthe"` header (each head binds the previous
+head, a monotonic sequence number, and the full entry set), and the Action
+keeps an **out-of-cache anchor** -- the `SYNTHE_LEDGER_ANCHOR` repository
+variable holding the last published `"seq:head"` -- that the restored ledger
+must match or extend:
+
+1. **Fetch anchor** (new step, before the phase): takes the anchor from the
+   `ledger-anchor` input (pass `${{ vars.SYNTHE_LEDGER_ANCHOR }}`, no token
+   needed), or reads the repository variable through the API with
+   `anchor-token`. Empty / 404 means no anchor was ever published (first
+   run): the checker seals a genesis chain. Any other fetch failure fails the
+   workflow instead of running unanchored.
+2. The checker verifies the chain seal and the anchor on every load. Older
+   (`ledger_rollback`), divergent (`ledger_diverged`), or missing
+   (`ledger_rollback`) ledgers fail closed with named reason codes.
+3. **Publish anchor** (new step, after the save): writes the new head back to
+   the repository variable (`--ledger-head` prints it).
+
+To enable it:
+
+- Pass `ledger-anchor: ${{ vars.SYNTHE_LEDGER_ANCHOR }}` so the checker sees
+  the current anchor.
+- Pass `anchor-token` so the Action can publish the new head. **`GITHUB_TOKEN`
+  cannot write repository variables** (workflow permissions have no variables
+  scope), so use a fine-grained personal access token or a GitHub App token
+  with "Variables: read and write" on this repository, stored as a secret.
+- Pass `ledger-hmac-key` from a CI secret (e.g.
+  `${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}`). **Both the key and the anchor are
+  needed against someone who can write the ledger file:** without the key the
+  seal is a public checksum, so a forger can mint a chain with a higher
+  sequence number than the anchor; without the anchor, an older sealed
+  snapshot or a deleted file cannot be told from a legitimate one. Once the
+  key is set, an unsealed ledger is refused rather than adopted (adopt a
+  genuine pre-seal ledger once with `ledger-bootstrap: 'true'`). Rotate the
+  secret by setting the new value and keeping the old one available to the
+  checker as `SYNTHE_LEDGER_HMAC_KEY_PREVIOUS` until every cached ledger has
+  been re-sealed (the next save heals automatically).
+
+Without an anchor, rollback detection is disabled and the checker logs a
+warning (the seal still guards corruption). Without a key, a pre-chain ledger
+is adopted in place as a new genesis chain -- entries preserved, no manual
+migration step.
+
+**Cache eviction recovery.** `actions/cache` entries expire after 7 days of
+disuse. If the cache is totally evicted, the anchor still expects the old
+chain and the run fails closed with `ledger_rollback`. Recover deliberately:
+run once with `ledger-bootstrap: 'true'` -- anchor enforcement is skipped for
+that run, a fresh genesis chain is sealed, and the anchor is republished.
+(This is also the recovery if the ledger file is deleted.)
+
 ### Required caller workflow shape
 
 ```yaml
@@ -138,6 +193,9 @@ jobs:
           registry: agents/registry.json
           workspace: .
           phase: claim
+          ledger-anchor: ${{ vars.SYNTHE_LEDGER_ANCHOR }}
+          anchor-token: ${{ secrets.SYNTHE_ANCHOR_TOKEN }}   # PAT/App token with Variables: write
+          ledger-hmac-key: ${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}
 
       # 2. THE EFFECT: the receiving agent does the actual work here.
       - name: Do the work
@@ -175,6 +233,74 @@ Notes on the shape:
   ordering requirement is the same: only one claimant at a time against
   a given ledger state, or exactly-one is not guaranteed.
 
+### Cache eviction is now loud (not silent)
+
+`actions/cache` entries are evicted after 7 days unused (or past the
+10 GB repo limit). Previously a restore miss silently started the run from
+an empty ledger: every key reopened and exactly-once quietly became
+at-most-once. Now the Action refuses to do that:
+
+1. **Chain marker.** Every ledger the checker writes carries its chain
+   seal under the reserved top-level key `"~synthe"` (see "Ledger integrity:
+   sealed chain + out-of-cache anchor" above: `chain_seq`, `chain_prev`, `chain_head`, ...). The guard
+   treats that header as the marker that a ledger came from a real chain.
+   The `~` prefix is reserved: the checker REJECTs any packet whose
+   `idempotency_key` starts with `~` (`reserved_idempotency_key`), and audit
+   tooling should skip `~`-prefixed top-level keys when enumerating claims.
+2. **Continuity guard.** After the restore step,
+   `checker/ledger_guard.sh` runs before the checker phase. The restore
+   signal is the restore step's `cache-matched-key` output (non-empty when
+   the restore matched any cache entry), **not** `cache-hit`: the Action
+   saves with key `synthe-ledger-<repo>-<run_id>-<attempt>-<phase>` but
+   restores with the bare prefix `synthe-ledger-<repo>`, so every real
+   restore comes from restore-keys prefix fallback and `cache-hit` (true
+   only on an exact primary-key match) is never true on real GitHub.
+   - restore matched a key + marker present → chain intact, proceed;
+   - restore matched a key + no marker → legacy ledger (written before the
+     marker existed): proceed with a warning; the checker seals it
+     on the next write;
+   - restore matched a key but no ledger file materialized → anomalous,
+     proceed with a warning (this is not an eviction);
+   - restore matched nothing + a ledger file is already present (created
+     earlier in this job) → proceed;
+   - restore matched nothing + this is the workflow's first run
+     (`github.run_number == 1`) → genuine first run: proceed and
+     initialize a fresh chain;
+   - restore matched nothing + `ledger-bootstrap: 'true'` → operator-declared
+     fresh chain: proceed with a warning (use for one run only, after
+     reconciling);
+   - restore matched nothing otherwise → **fail the run loudly** (`::error::`,
+     non-zero exit) *before* the checker can ACCEPT against an empty
+     ledger.
+
+**If the guard fails:** do not just re-run. Reconcile any in-flight
+effects against the receiver's effect receipts (the ledger is one layer;
+the receipt is the source of truth), then run once with
+`ledger-bootstrap: 'true'` and remove it afterwards. Duplicate protection
+restarts empty for that run, so the reconciliation step is what keeps it
+safe.
+
+### Beyond the cache: durable backends (recommended)
+
+The cache is best-effort storage with a 7-day idle expiry. If your
+handoffs must stay duplicate-safe across longer idle windows, do not rely
+on it:
+
+- Pass the `ledger` input and persist that file in durable storage
+  yourself: download it at job start and upload it at job end (object
+  storage, a pinned artifact with retention sized to your idle window, a
+  persistent volume — whatever your org already pays for). The
+  cache/restore/save steps are skipped when `ledger` is set.
+- The checker auto-detects the ledger format by suffix: `.json` for the
+  plain file, `.sqlite` / `.sqlite3` for the crash-safe SQLite/WAL ledger
+  (v2). For a durable backend, the SQLite format is the better file to
+  persist.
+- The `concurrency` group requirement is unchanged: whatever the backend,
+  only one claimant at a time per ledger, or exactly-one is not guaranteed.
+
+Choosing and paying for the hosting is the repository owner's decision;
+the Action deliberately ships no backend service.
+
 ### What is proven, what is not
 
 Proven:
@@ -192,16 +318,29 @@ Proven:
   and a `duplicate` rejection; after a simulated complete step, a replay
   is rejected against the `COMPLETED` entry (`--mode fixed`,
   `--mode complete`; pinned by `tests/test_two_runner.py`).
+- **Eviction is loud at simulation level**: `--mode evicted` wipes the
+  cache snapshot between runs; the continuity guard fails the later run
+  loudly before the checker runs, while the workflow's genuine first run
+  still ACCEPTs and stamps the chain marker (pinned by
+  `tests/test_two_runner.py` S4 and `tests/test_ledger_durability.py`).
+- **Prefix restores are modeled**: `--mode prefix-restore` drives the real
+  guard with real-GitHub restore semantics (save key
+  `synthe-ledger-<repo>-<run_id>-<attempt>-<phase>`, restore via prefix
+  fallback, `cache-hit` never true, `cache-matched-key` non-empty): a
+  marked ledger restores intact, and a restored legacy ledger warns and
+  continues instead of failing with a false EVICTED error (pinned by
+  `tests/test_two_runner.py` S5).
 
 Not yet proven:
 
-- **Anything on real GitHub infrastructure.** The simulation does not
-  model cache eviction (entries unused for 7 days, or evicted past the
-  10 GB repo limit, silently reopen all keys), restore-key partial
-  matching edge cases, concurrency-group queueing behavior at scale, or
-  cross-branch cache visibility. Until the one-time real two-runner
-  verification workflow passes, describe cross-run protection as
-  "designed and simulation-tested", not as demonstrated.
+- **Anything on real GitHub infrastructure.** The simulation models
+  eviction as a snapshot wipe, prefix-fallback restores, and the guard's
+  first-run signal as `github.run_number`; it does not model
+  concurrency-group queueing behavior at scale, or cross-branch cache
+  visibility. Until the one-time real two-runner verification workflow
+  passes (including a forced-miss run to watch the guard fire),
+  describe cross-run protection as "designed and simulation-tested", not
+  as demonstrated.
 - **Forks and other repositories.** Caches do not cross forks; a fork's
   runs start from an empty ledger.
 - **Two different workflows (or a workflow that omits the group) sharing
@@ -217,6 +356,7 @@ Not yet proven:
 | `packet`    | yes      | —       | Path to the handoff packet JSON. |
 | `registry`  | no       | —       | Path to the agent registry JSON (canonical ids + aliases). Without it, identity checks are skipped. |
 | `ledger`    | no       | *(managed)* | Path to an idempotency ledger JSON for duplicate detection. Leave unset and the Action persists `.synthe/ledger.json` across runs via `actions/cache` (see above). Set it only if you manage that file's persistence yourself. |
+| `ledger-bootstrap` | no | `'false'` | Set to `'true'` for ONE run to declare a fresh ledger chain after an eviction-guard failure (reconcile in-flight effects first) or when adding the Action to a workflow that already has runs. |
 | `workspace` | no       | `.`     | Root for artifact existence/hash checks. |
 | `phase`     | no       | `claim` | `claim`: validate + record the key as `RESERVED`. `complete`: after the effect is real, flip the key to `COMPLETED` (same packet/registry/ledger inputs). |
 

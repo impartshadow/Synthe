@@ -45,7 +45,7 @@ def test_stage_writes_a_broker_that_loads(env, capsys):
     assert cfg.raw["isolation"]["mode"] == "container"
     remote = cfg.raw["effects"]["git_push"]["remotes"]["origin"]
     assert remote == {"url": "https://github.com/acme/app.git", "branches": ["agent/*"], "token_file": "github.token"}
-    reg, problems = hc.load_registry(str(vol / "registry.json"))
+    reg, problems = hc.load_registry(str(vol / "registry.json"), allow_unsigned=True)
     assert not problems
     policy = reg["agents"]["claude-code"]["policy"]
     assert policy["trusted_approvers"] == ["alice"]

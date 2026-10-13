@@ -60,6 +60,8 @@ approval or a tool.
 | `authority.approval_required_for` | yes* | actions/tools that need an approval first (may be empty) |
 | `authority.approvals[]` | no | `{action, approver, expires_at?, kid?, sig?}` |
 | `planned_actions[]` | policy | `{name, tool, params?, est_tokens?, est_usd?, est_minutes?}` |
+| `sender_role` / `receiver_role` | no | v0.6: team role labels for this handoff's edge; verified against the receiver's team topology (section 15) |
+| `capability` | policy | v0.6: signed capability declaration — `version` (required), `env[]` (env vars it may read), `paths[]` (file globs it may touch), `tools[]` (tools/APIs it may call), `network` (egress, denied by default), `admission_receipt?` (cross-reference to a skill-admission receipt). The packet signature covers it, so any change (including a version change) requires re-declaration and re-signing |
 | `depends_on[]` | no | v0.5: idempotency keys of upstream handoffs that must be `COMPLETED` (same ledger) before this handoff's effects may commit |
 | `acceptance.output_schema` | yes* | what the receiver must produce |
 | `acceptance.required_evidence` | yes* | evidence kinds that count as "done" |
@@ -73,6 +75,14 @@ When an entry point knows the authenticated caller identity, it supplies
 `as_receiver`. A packet whose signed `to` differs is rejected as
 `receiver_mismatch`. Offline validation may omit the binding; a multi-tenant
 service must derive it from authenticated transport state, never packet data.
+
+**Planned-action intent (v0.6).** A planned action's `params` may declare what
+the action will touch, so the gate can check it against the capability
+declaration (section 15) *before* anything executes: `params.env` (env var
+names read), `params.paths` (file paths touched), `params.network: true`
+(needs egress). Declaring intent is optional; staying inside the declaration
+is not. This check is a tripwire, not a guarantee — the intent params are
+volunteered by the sender; real enforcement is the runtime hook in 15.1.
 
 Evidence kinds `code_text`, `verbatim_quote` and `legal_text` must carry
 `verbatim: true`. Under evidence verification they must also pin `sha256`.
@@ -94,9 +104,32 @@ stamp); the checker ignores it.
 One JSON file, fixed by the operator. It decides who exists, which keys they
 sign with, and what each receiver will accept.
 
+**Signed registry (optional).** The registry may carry a top-level `signature`
+block: an Ed25519 operator signature over the rest of the file plus a rotation
+chain back to a genesis key (`synthe-sign sign-registry`,
+`synthe-sign rotate-registry-key`). It is enforced only when a genesis key is
+pinned (`--registry-genesis-key`, `SYNTHE_REGISTRY_GENESIS_KEY`, or a
+`registry-genesis.key` file next to the checker). With a pin, an unsigned,
+tampered or differently-rooted registry fails with `registry_signature_invalid`
+in every caller. Without one, the registry loads unverified (the CLI warns;
+`--require-signed-registry` rejects instead).
+
 ```json
 {
   "policy": { ... },                      // optional: applies to every receiver
+  "topologies": {                         // v0.6: named team topologies (section 15)
+    "ship-team": {
+      "version": "2026-10-12.1",
+      "roles": ["ceo", "designer", "em", "qa", "release"],
+      "edges": [["ceo", "designer"], ["designer", "em"], ["em", "qa"],
+                ["qa", "release"], ["qa", "em"]],
+      "role_capabilities": {
+        "qa": { "tools": ["run_tests", "read_repo"], "paths": ["tests/**"],
+                "env": [], "network": false }
+      },
+      "signed_by": "rohan", "kid": "rohan-1", "sig": "<base64url>"
+    }
+  },
   "agents": {
     "planner": { "role": "...", "keys": [ { "kid": "planner-1", "alg": "Ed25519", "public_key": "<b64url>" } ] },
     "builder": { "role": "...", "keys": [ ... ], "policy": { ... } },
@@ -120,12 +153,19 @@ sign with, and what each receiver will accept.
 | `require_planned_actions` | flag | no planned actions → `planned_actions_missing` |
 | `verify_evidence` | flag | evidence pinning (section 7); also `--verify-evidence` |
 | `exclusive_paths` | flag | v0.5: a second live claim on this receiver whose `owned_paths` may overlap one already held → `claim_conflict` (section 8) |
+| `capability` | ceiling (v0.6) | the most a sender's capability declaration may claim: `env`/`tools` must be subsets, each declared path must be covered by a ceiling path, `network: true` needs the ceiling to allow it, and a `version` pin must match. A declaration outside it → `capability_exceeds_receiver_policy` (section 15) |
+| `require_capability_declaration` | flag (v0.6) | packet without a `capability` object → `capability_declaration_missing` |
+| `topology` | naming (v0.6) | the team topology (registry `topologies` key) this receiver enforces edges against; later policy layers override |
+| `require_topology` | flag (v0.6) | packet without `sender_role` and `receiver_role` → `topology_declaration_missing` |
 | `max_ttl_hours` | ceiling | unreleased: a handoff whose `acceptance.expires_at` is more than this many hours after the check → `ttl_exceeded`. A long-lived handoff is a bearer token for whoever holds its bytes. Must be a positive number, or the check refuses with `registry_malformed` |
 | `defaults` | fill | receiver-owned fields filled when the sender left them out |
 
 **Merging.** The top-level `policy` and `agents.<receiver>.policy` merge as follows:
 restrictions union, ceilings intersect, budgets and `max_ttl_hours` take the minimum,
-flags OR together, and later `defaults` override earlier ones.
+flags OR together, and later `defaults` override earlier ones. A `capability`
+ceiling merges by narrowing: `env`/`tools` intersect, `network` ANDs, `paths`
+keep only the later layer's paths covered by an earlier path, and a `version`
+pin follows the later layer. The `topology` name follows the later layer.
 
 **Defaults** can fill `owned_paths`, `forbidden`, `allowed_tools`,
 `approval_required_for`, `output_schema`, `required_evidence`, `expires_at`,
@@ -171,7 +211,11 @@ Tooling: `src/synthe_sign.py keygen | approve | sign | verify`.
 Receiver defaults are applied to a copy first. Then:
 
 1. **Structure.** Required fields, enums, types, element shapes, full-length hashes,
-   non-negative numbers, and `planned_actions` if the policy requires them. *If this step fails,
+   non-negative numbers, and `planned_actions` if the policy requires them. v0.6:
+   capability declaration shape (`malformed:capability*`), role shapes
+   (`malformed:sender_role` / `malformed:receiver_role`), and the required
+   declarations (`capability_declaration_missing`, `topology_declaration_missing`)
+   when the receiver's policy demands them. *If this step fails,
    checking stops here.*
 2. **Identity.** `from`/`to` exist in the registry and are canonical, and the packet signature verifies.
 3. **Duplication and conflicts.** The idempotency key is looked up in the ledger (section 8). A
@@ -181,7 +225,12 @@ Receiver defaults are applied to a copy first. Then:
    ahead, and the commit waits (section 8).
 4. **Freshness.** `acceptance.expires_at` must be parseable, offset-aware and in the future.
 5. **Authority.** Planned actions are checked against tools, forbidden actions, approvals and budgets, with the
-   receiver policy as a ceiling.
+   receiver policy as a ceiling. v0.6: the team-topology edge is checked first
+   (`topology_violation`), then the capability declaration against the policy
+   ceiling (`capability_exceeds_receiver_policy`), then each planned action's
+   declared intent against the narrowed capability (`capability_not_declared`).
+   A malformed policy capability or a policy that requires topologies without
+   naming one is `registry_malformed`.
 6. **Artifacts** (when a workspace is given). Each path must stay inside the workspace, the file must
    exist, and the SHA-256 must match. If the receiver has a policy and the packet pins artifacts but
    no workspace was given, the check fails closed with `workspace_required`.
@@ -276,6 +325,38 @@ after the last) rule out a common path; a glob without wildcards is matched exac
 comparison is case-insensitive. A live claim recorded before v0.5 (no paths) counts as
 overlapping.
 
+**Integrity binding (v0.6): sealed chain + out-of-cache anchor.** Every ledger write
+seals a chain header under the reserved top-level key `"~synthe"` -- the ONE reserved
+namespace for chain metadata (idempotency keys may not start with `~`;
+`reserved_idempotency_key`). The header carries a monotonic `chain_seq` and a `chain_head`
+that hash-chains the previous head and the full entry set:
+
+`head_n = MAC("synthe-ledger-chain/v2" || seq_n || head_{n-1} || canonical(entries_n))`
+
+MAC is HMAC-SHA256 keyed by the `SYNTHE_LEDGER_HMAC_KEY` environment variable when set
+(a CI secret is the intended home), else plain SHA-256. Without the key the seal detects
+accidental corruption (bit-rot, hand edits, truncation) but NOT forgery by a file-holder;
+the header records `chain_keyed`, and a keyed seal loaded without the key (or vice versa)
+fails closed as `ledger_corrupt`. Key rotation: `SYNTHE_LEDGER_HMAC_KEY_PREVIOUS` is
+accepted for verification; sealing always uses the current key.
+
+Rollback -- a stale cache restoring an older snapshot, a forged empty ledger, a deleted
+file -- is caught by the monotonic `chain_seq` checked against an anchor stored OUTSIDE
+the cache: the `SYNTHE_LEDGER_ANCHOR` environment variable (`"seq:head"`), which the
+GitHub Action populates from the `SYNTHE_LEDGER_ANCHOR` repository variable before each
+run and republishes after it. A loaded ledger must match or extend the anchor:
+older (`ledger_rollback`), same-seq-different-head (`ledger_diverged`), or missing file
+(`ledger_rollback`) all fail closed. When anchoring is required
+(`SYNTHE_LEDGER_ANCHOR_REQUIRED=1`, set by the Action whenever it fetched an anchor)
+but the anchor is unavailable, the checker fails closed as `ledger_anchor_unavailable`.
+With no anchor configured (local runs, first run), the seal is still verified and a
+legacy unsealed ledger is adopted in place as a new genesis chain -- entries preserved,
+no manual migration step -- with a warning that rollback is not provable in that mode.
+`SYNTHE_LEDGER_BOOTSTRAP=1` skips anchor enforcement for one run (the documented
+recovery after a total cache eviction). The one legal operator (re-)initialization is
+`handoff_check.py --init-ledger PATH` (missing -> sealed genesis; sealed -> no-op;
+legacy -> adopted; corrupt or anchor-forbidden -> refused, never overwritten).
+
 ## 9. Failure states
 
 | State | Meaning | Who acts |
@@ -299,18 +380,27 @@ overlapping.
 `bad_expires_at`, `artifact_path_escapes_workspace`, `evidence_not_verbatim`,
 `verbatim_evidence_unpinned`, `evidence_path_escapes_workspace`,
 `workspace_required`, `packet_unreadable`, `registry_unreadable`,
-`registry_malformed`, `ledger_corrupt`, `ledger_required`,
+`registry_malformed`, `registry_signature_invalid`, `ledger_corrupt`, `ledger_required`,
 `receiver_mismatch`,
 `missing_idempotency_key`, `completion_unknown_key`, `claim_token_required`,
 `legacy_claim_unbound`,
 `release_not_reserved`, `dependency_cycle` (v0.5; `malformed:depends_on` is a `malformed:<f>`),
-`duplicate_field:<f>`, `malformed:non_finite_number`, `signature_kid_required`, `ttl_exceeded` (unreleased)
+`duplicate_field:<f>`, `malformed:non_finite_number`, `signature_kid_required`, `ttl_exceeded` (unreleased),
+`reserved_idempotency_key`, `ledger_rollback`, `ledger_diverged`,
+`ledger_anchor_unavailable` (v0.6 integrity binding; `ledger_corrupt` also covers seal mismatches)
 
 **blocked:** `tool_not_allowed`, `tool_not_allowed_by_receiver`,
 `forbidden_action`, `approval_missing`, `approval_expired`,
 `approval_expires_invalid`, `approver_not_trusted`, `approval_unsigned`,
 `approval_signature_invalid`, `authority_exceeds_receiver_policy`,
-`budget_exceeded`, `dependency_incomplete`, `dependency_unknown`, `claim_conflict` (v0.5), `approval_kid_required` (unreleased)
+`budget_exceeded`, `dependency_incomplete`, `dependency_unknown`, `claim_conflict` (v0.5), `approval_kid_required` (unreleased),
+`capability_not_declared` (v0.6), `capability_exceeds_receiver_policy` (v0.6), `topology_violation` (v0.6),
+`capability_path_unsafe` (v0.6.1), `topology_role_unbound` (v0.6.1)
+
+**invalid (v0.6 additions):** `capability_declaration_missing`, `topology_declaration_missing`,
+`topology_malformed`, `topology_signature_missing`, `topology_signature_invalid`,
+`topology_signer_not_founder`; `malformed:capability*`, `malformed:sender_role`, `malformed:receiver_role`
+are `malformed:<f>` codes.
 
 **incomplete:** `artifact_missing`, `evidence_missing`,
 `evidence_unreferenced`, `evidence_ref_missing`
@@ -365,7 +455,7 @@ only the packet.
 ## 13. Non-goals (v0.3)
 
 The checker makes no semantic judgment of deliverables, does not fetch URLs, and has no hosted service. It also does not handle
-multi-hop delegation chains or key revocation yet (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
+multi-hop delegation chains yet. Key revocation is built: see [`docs/KEY_REVOCATION.md`](docs/KEY_REVOCATION.md).
 
 ## 14. Mediated effects and receipts (v0.4)
 
@@ -453,3 +543,122 @@ Full detail: [`docs/COMMIT.md`](docs/COMMIT.md).
   `list_files`) serve a branch's files and blob ids from the broker's mirror, only for remotes the
   operator marks `"readable": true` (and only branches in `readable_refs`, else `branches`).
   Details: [`docs/COMMIT.md`](docs/COMMIT.md).
+
+## 15. Declared capabilities and role-scoped topologies (v0.6)
+
+The gate checks the envelope; these two features shrink what an injected or
+compromised agent can reach. Both are optional unless a receiver's policy
+requires them, so old packets and old registries keep working.
+
+### 15.1 Capability declarations
+
+A sender (or an admitted skill acting through it) may carry a signed
+capability declaration in `handoff.capability`: the env vars it may read
+(`env`), the file paths it may touch (`paths`, globs), the tools/APIs it may
+call (`tools`), and whether it may reach the network (`network`, denied by
+default). `version` is required and identifies the declaration; an optional
+`admission_receipt` cross-references the skill-admission receipt (Feature A).
+The declaration is part of the signed handoff, so changing anything —
+including the version — requires re-declaration and re-signing by the sender.
+
+**Path safety.** Every path is normalized before matching — declared paths,
+ceiling paths, planned-action paths, and runtime paths alike. Absolute paths,
+backslashes, and `..` segments are rejected outright (fail closed), so no
+traversal can escape its declared root: a declared path that does not
+normalize to a safe relative path makes the declaration malformed
+(`malformed:capability.paths`, invalid for packets), and a runtime or
+planned-action path that does not normalize is rejected with
+`capability_path_unsafe` (blocked), not merely "not declared".
+
+**Enforcement.** The checker rejects anything outside the declaration with
+`capability_not_declared` (blocked) *before* the action executes:
+
+- a planned action whose `tool` is not in `tools`;
+- `params.env` naming an env var not in `env`;
+- `params.paths` touching a path no declared glob matches;
+- `params.network: true` when `network` is not declared true (network egress
+  is denied by default).
+
+This planned-action check is a **tripwire, not a guarantee**: the intent
+params (`params.env` / `params.paths` / `params.network`) are volunteered by
+the sender, and a malicious sender can volunteer nothing while doing
+something else. The real enforcement point is the runtime hook below, called
+by the least-privilege proxy that actually performs the reads, writes, and
+calls — the admission-time check exists to catch mistakes and honest
+declarations early, not to contain an adversary.
+
+A declaration is exhaustive: a dimension it omits allows nothing. The
+receiver's policy `capability` ceiling narrows it like every other ceiling —
+`env`/`tools` must be subsets, each declared path must be covered by a ceiling
+path, `network: true` needs the ceiling to allow it, a `version` pin must
+match — else `capability_exceeds_receiver_policy` (blocked). The receiver
+role's capability (15.2) narrows it the same way. With
+`require_capability_declaration`, a packet without one is
+`capability_declaration_missing` (invalid).
+
+**Runtime hook.** `handoff_check.check_capability_use(declaration, kind, value)`
+is the same rule for a least-privilege runtime proxy: `kind` is `env`,
+`path`, `tool` or `network`, and it returns `None` when the access is inside
+the declaration or a `capability_not_declared` reason dict otherwise — except
+an unsafe path shape (absolute, backslash, or `..`), which returns
+`capability_path_unsafe`. With no declaration in force it denies everything.
+
+### 15.2 Role-scoped handoff topologies
+
+Teams declare a topology in the registry (`topologies.<name>`): named `roles`,
+directed `edges` (`[from_role, to_role]` pairs; list both directions
+explicitly), per-role `role_capabilities` shaped like a capability declaration
+(no `version`; the topology carries that), and `members` — the agent-to-role
+binding, `{role: [agent ids]}`, that makes role claims checkable. Packets gain
+`sender_role` / `receiver_role`. The gate rejects a handoff whose edge is not
+declared with `topology_violation` (blocked). Each role's tools are enforced
+exactly like 15.1: a role invoking a tool outside its role declaration is
+`capability_not_declared`.
+
+Roles would otherwise be sender-asserted labels: nothing stops a sender from
+claiming whichever role has the edge they want. So the gate also checks the
+packet's `from` against `members[sender_role]` and its `to` against
+`members[receiver_role]` — `from` is already signature-bound (the signer must
+equal `from`), so this pins the *role claim* to the *signing agent*. A claim
+by an agent not bound to that role is `topology_role_unbound` (blocked), and a
+topology with no binding for a claimed role fails closed the same way: an
+unverifiable role claim is rejected, never silently passed. `members` is
+optional in the topology shape, but any role claim against a topology that
+does not bind that role is rejected.
+
+Topology declarations are signed and versioned: `signed_by` must be a
+registered human founder (`topology_signer_not_founder` otherwise), the
+Ed25519 signature covers the name, version, roles, edges, role capabilities
+and members under the domain `synthe/topology-signature/v1`, and the checker
+re-verifies it on every check — changing the topology (including the member
+binding) without re-signing is `topology_signature_invalid`, a missing
+signature is `topology_signature_missing`, a broken shape (including a
+malformed `members` map) is `topology_malformed` (all invalid). A packet that
+declares roles while the receiver's policy names no topology fails closed with
+`topology_violation`: an unverifiable routing claim is rejected, never
+silently passed. With `require_topology`, a packet without both roles is
+`topology_declaration_missing` (invalid); a policy that sets the flag without
+naming a topology, or names one the registry does not define, is
+`registry_malformed`.
+
+Synthe does not assign roles or manage the team. It only enforces the
+declared topology. An ACCEPT verdict carries the topology name that admitted
+the edge.
+
+Topology declarations are signed and versioned: `signed_by` must be a
+registered human founder (`topology_signer_not_founder` otherwise), the
+Ed25519 signature covers the name, version, roles, edges and role
+capabilities under the domain `synthe/topology-signature/v1`, and the checker
+re-verifies it on every check — changing the topology without re-signing is
+`topology_signature_invalid`, a missing signature is
+`topology_signature_missing`, a broken shape is `topology_malformed`
+(all invalid). A packet that declares roles while the receiver's policy names
+no topology fails closed with `topology_violation`: an unverifiable routing
+claim is rejected, never silently passed. With `require_topology`, a packet
+without both roles is `topology_declaration_missing` (invalid); a policy that
+sets the flag without naming a topology, or names one the registry does not
+define, is `registry_malformed`.
+
+Synthe does not assign roles or manage the team. It only enforces the
+declared topology. An ACCEPT verdict carries the topology name that admitted
+the edge.

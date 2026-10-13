@@ -10,6 +10,7 @@ from world import World
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+import handoff_check as hc  # noqa: E402
 import synthe_commit as cm  # noqa: E402
 import synthe_crypto as sc  # noqa: E402
 import synthe_mcp as mcp  # noqa: E402
@@ -107,6 +108,7 @@ def test_never_completed_duplicate_stays_unknown_and_requires_reconciliation(w):
     ledger = w.ledger()
     entry = ledger[packet["handoff"]["idempotency_key"]]
     entry["reserved_at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)).isoformat()
+    hc.seal_ledger(ledger)  # re-seal after the out-of-band edit (v2 integrity)
     (w.tmp / "ledger.json").write_text(json.dumps(ledger))
 
     retry = call(srv, "synthe_validate_handoff", {"packet": packet}, 2)
@@ -137,6 +139,7 @@ def test_replay_requires_the_exact_verified_receipt(w, monkeypatch):
     ledger = w.ledger()
     effect = ledger[packet["handoff"]["idempotency_key"]]["effects"]["push_branch"]
     effect["receipt_seq"] += 1  # a valid result exists, but this pointer does not name it exactly
+    hc.seal_ledger(ledger)  # re-seal after the out-of-band edit (v2 integrity)
     (w.tmp / "ledger.json").write_text(json.dumps(ledger))
     refused = call(srv, "synthe_propose_effect", args, 3)
 
@@ -172,6 +175,7 @@ def test_replay_rejects_a_valid_receipt_for_another_identity(w, monkeypatch):
 
     ledger = w.ledger()
     ledger[packet["handoff"]["idempotency_key"]]["effects"]["push_branch"]["receipt_seq"] = other["seq"]
+    hc.seal_ledger(ledger)  # re-seal after the out-of-band edit (v2 integrity)
     (w.tmp / "ledger.json").write_text(json.dumps(ledger))
     refused = call(srv, "synthe_propose_effect", args, 3)
 
@@ -195,6 +199,7 @@ def test_replay_refuses_a_matching_receipt_signed_by_another_registered_agent(w,
     assert other["broker"] == "mallory"
     ledger = w.ledger()
     ledger[packet["handoff"]["idempotency_key"]]["effects"]["push_branch"]["receipt_seq"] = other["seq"]
+    hc.seal_ledger(ledger)  # re-seal after the out-of-band edit (v2 integrity)
     (w.tmp / "ledger.json").write_text(json.dumps(ledger))
     monkeypatch.setattr(cm.GitPush, "commit", lambda *a, **k: pytest.fail("re-executed completed effect"))
     refused = call(srv, "synthe_propose_effect", args, 3)

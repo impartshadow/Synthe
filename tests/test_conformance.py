@@ -92,6 +92,7 @@ def test_crash_before_complete_past_ttl_rejected_unknown(tmp_path):
     data = json.loads(ledger.read_text())
     old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=72)
     data[KEY]["reserved_at"] = old.isoformat()
+    hc.seal_ledger(data)  # re-seal after the out-of-band edit (v2 integrity)
     ledger.write_text(json.dumps(data))
 
     code, out = invoke(pkt, ledger, "--reserve-ttl-hours", "24")

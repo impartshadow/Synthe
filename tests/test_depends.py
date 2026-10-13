@@ -198,6 +198,7 @@ def test_other_receivers_and_unrecorded_claims(wx):
     data = json.loads(led.read_text())
     data["legacy"] = {"state": "RESERVED", "handoff_id": "h-l", "to": "builder",
                       "reserved_at": hc.now_utc().isoformat()}
+    hc.seal_ledger(data)  # re-seal after the out-of-band edit (v2 integrity)
     led.write_text(json.dumps(data))
     v = wx.check(wx.packet(idem="b", owned_paths=["docs/**"]))
     assert "claim_conflict" in reject_codes(v) and "not recorded" in v["reasons"][0]["message"]

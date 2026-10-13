@@ -27,6 +27,7 @@ synthe-approve = "synthe_approve:main"
 synthe-approver = "synthe_approver:main"
 synthe-init = "synthe_init:main"
 synthe-task = "synthe_task:main"
+synthe-skill = "synthe_skill:main"
 git-remote-synthe = "synthe_git_remote:main"
 synthe-verify = "synthe_verify:main"
 
@@ -36,6 +37,7 @@ py-modules = [
   "handoff_check", "synthe_crypto", "synthe_sign", "synthe_plan", "synthe_commit",
   "synthe_broker", "synthe_client", "synthe_mcp", "synthe_a2a", "synthe_approve",
   "synthe_init", "synthe_task", "synthe_ui", "synthe_git_remote", "synthe_touchid",
+  "synthe_skill",
   "synthe_lane_templates", "synthe_approver", "synthe_verify",
 ]
 

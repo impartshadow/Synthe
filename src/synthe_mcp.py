@@ -224,7 +224,9 @@ class SyntheServer:
 
     # -- tools ---------------------------------------------------------------
     def _registry(self):
-        return hc.load_registry(self.registry_path)
+        # Signed registry: enforced once a genesis key is pinned
+        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+        return hc.load_registry(self.registry_path, allow_unsigned=True)
 
     def tool_validate(self, args):
         wait = args.get("wait_for_approval") is True

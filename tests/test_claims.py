@@ -25,8 +25,14 @@ def claim(ledger):
 
 def age_claim(ledger, hours=48):
     data = json.loads(ledger.read_text())
-    for entry in data.values():
+    for key, entry in data.items():
+        if key == hc.LEDGER_META_KEY or not isinstance(entry, dict):
+            continue
         entry["reserved_at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).isoformat()
+    # Re-seal: the v2 integrity binding treats an unsealed hand-edit as
+    # tampering (ledger_corrupt). Tests that simulate time passing must
+    # re-seal, exactly as the checker would on a real write.
+    hc.seal_ledger(data)
     ledger.write_text(json.dumps(data))
 
 

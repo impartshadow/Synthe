@@ -57,7 +57,10 @@ def test_json_migration_is_verified_and_never_overwrites(tmp_path):
     source.write_text(json.dumps(original))
     report = hc.migrate_ledger(source, destination)
     assert report["entries"] == 2 and json.loads(source.read_text()) == original
-    assert hc.load_ledger(destination) == original
+    # the migrated copy carries the v2 chain header; the claims must match
+    copied = hc.load_ledger(destination)
+    assert {k: v for k, v in dict(copied.items()).items()
+            if k != hc.LEDGER_META_KEY} == original
     with pytest.raises(FileExistsError):
         hc.migrate_ledger(source, destination)
 

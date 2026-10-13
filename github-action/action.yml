@@ -50,6 +50,48 @@ inputs:
       ledger itself.
     required: false
     default: 'claim'
+  ledger-hmac-key:
+    description: >-
+      HMAC key sealing the ledger's integrity chain (SYNTHE_LEDGER_HMAC_KEY).
+      Pass a CI secret, e.g. ${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}. Without it
+      the seal detects accidental corruption only, not forgery by someone who
+      can write the ledger file. Rotate via secrets plus the previous value;
+      see github-action/README.md.
+    required: false
+    default: ''
+  ledger-anchor:
+    description: >-
+      The current out-of-cache anchor: pass ${{ vars.SYNTHE_LEDGER_ANCHOR }}.
+      The restored ledger chain must match or extend it, so a stale cache
+      restore or a deleted ledger fails closed. Reading it this way needs no
+      token. Empty means no anchor has been published yet (first run).
+    required: false
+    default: ''
+  anchor-token:
+    description: >-
+      Token that can write the SYNTHE_LEDGER_ANCHOR repository variable, used
+      to publish the new chain head after each run (and to read it when
+      ledger-anchor is not passed). GITHUB_TOKEN cannot do this: workflow
+      permissions have no repository-variables scope. Use a fine-grained
+      personal access token or a GitHub App token with "Variables: read and
+      write" on this repository, stored as a secret. Without it, rollback
+      detection is disabled (the chain seal still guards corruption) and a
+      warning is logged.
+    required: false
+    default: ''
+  ledger-bootstrap:
+    description: >-
+      Set to 'true' for exactly ONE run to declare a fresh ledger chain: the
+      cache-eviction guard is skipped, anchor enforcement is skipped once, an
+      unsealed (pre-seal) ledger may be adopted even with ledger-hmac-key set,
+      a sealed genesis chain is written, and the anchor is republished. Use it
+      only after reconciling in-flight effects against the receiver's effect
+      receipts: recovery from an eviction-guard or ledger_rollback failure, a
+      first run of this Action in a workflow that already has runs, or a
+      deliberate reset. Duplicate protection restarts from what the ledger
+      holds for that run. Leave 'false' otherwise.
+    required: false
+    default: 'false'
 
 outputs:
   decision:
@@ -73,6 +115,7 @@ runs:
     # cache alone cannot order two runs that restore the same snapshot.
     # Skipped entirely when the caller supplies their own ledger path.
     - name: Restore handoff ledger
+      id: restore
       if: inputs.ledger == ''
       uses: actions/cache/restore@v4
       with:
@@ -80,6 +123,90 @@ runs:
         key: synthe-ledger-${{ github.repository }}
         restore-keys: |
           synthe-ledger-${{ github.repository }}
+    # Ledger-durability guard: cache entries are evicted after 7 days unused
+    # (or past the 10 GB repo limit). A restore that matches nothing on any
+    # run after the workflow's first means the ledger chain is broken;
+    # starting from an empty ledger would SILENTLY lose duplicate protection
+    # (exactly-once -> at-most-once), so fail the run here, before the
+    # checker can ACCEPT against an empty ledger.
+    #
+    # Restore-signal note: the save key is
+    # synthe-ledger-<repo>-<run_id>-<attempt>-<phase> while the restore uses
+    # the bare prefix, so real restores always come from restore-keys prefix
+    # fallback. actions/cache sets `cache-hit=true` ONLY on an exact
+    # primary-key match, so `cache-hit` is NEVER true on real GitHub. The
+    # guard therefore uses steps.restore.outputs.cache-matched-key (non-empty
+    # when the restore matched any entry, exact or prefix fallback) as the
+    # restore signal. A restored ledger WITHOUT the chain marker is a legacy
+    # ledger (written before the marker existed): warn and continue, never
+    # fail. Recovery: reconcile in-flight effects, then re-run once with
+    # ledger-bootstrap: 'true'. See github-action/README.md ("Cache eviction
+    # is now loud") and checker/ledger_guard.sh.
+    - name: Check ledger chain continuity
+      id: ledger-guard
+      if: inputs.ledger == ''
+      shell: bash
+      env:
+        LEDGER_FILE: .synthe/ledger.json
+        CACHE_MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        RUN_NUMBER: ${{ github.run_number }}
+        LEDGER_BOOTSTRAP: ${{ inputs.ledger-bootstrap }}
+      run: bash "${{ github.action_path }}/checker/ledger_guard.sh"
+    # Out-of-cache anchor: the last published chain head, stored as the
+    # SYNTHE_LEDGER_ANCHOR repository variable (NOT in actions/cache, so a
+    # stale cache restore is detectable). The checker requires the restored
+    # ledger to match or extend this anchor; anything older, divergent, or
+    # missing fails closed. A 404 means no anchor was ever published (first
+    # run with anchoring): the checker seals a genesis chain. Any other
+    # fetch failure fails the workflow rather than running unanchored.
+    # Skipped when the caller supplies their own ledger path or no token.
+    - name: Fetch ledger anchor
+      if: inputs.ledger == '' && (inputs.anchor-token != '' || inputs.ledger-anchor != '')
+      shell: bash
+      env:
+        ANCHOR_TOKEN: ${{ inputs.anchor-token }}
+        ANCHOR_VALUE: ${{ inputs.ledger-anchor }}
+      run: |
+        set -u
+        if [ -n "$ANCHOR_VALUE" ]; then
+          case "$ANCHOR_VALUE" in
+            *$'\n'*|*$'\r'*) echo "::error::ledger-anchor must be a single line"; exit 1 ;;
+          esac
+          {
+            echo "SYNTHE_LEDGER_ANCHOR=${ANCHOR_VALUE}"
+            echo "SYNTHE_LEDGER_ANCHOR_REQUIRED=1"
+          } >> "$GITHUB_ENV"
+          echo "Ledger anchor read from the ledger-anchor input; the restored ledger must match or extend it."
+          exit 0
+        fi
+        if [ -z "$ANCHOR_TOKEN" ]; then
+          echo "No ledger anchor published yet (ledger-anchor is empty); a genesis chain will be sealed."
+          exit 0
+        fi
+        resp="$(mktemp)"
+        code="$(curl -sS -o "$resp" -w '%{http_code}' \
+          -H "Authorization: Bearer ${ANCHOR_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/variables/SYNTHE_LEDGER_ANCHOR")"
+        if [ "$code" = "200" ]; then
+          value="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["value"])' "$resp")"
+          case "$value" in
+            *$'\n'*|*$'\r'*) echo "::error::SYNTHE_LEDGER_ANCHOR must be a single line"; exit 1 ;;
+          esac
+          {
+            echo "SYNTHE_LEDGER_ANCHOR=${value}"
+            echo "SYNTHE_LEDGER_ANCHOR_REQUIRED=1"
+          } >> "$GITHUB_ENV"
+          echo "Ledger anchor fetched; the restored ledger must match or extend it."
+        elif [ "$code" = "404" ]; then
+          echo "No ledger anchor published yet (first run with anchoring); a genesis chain will be sealed."
+        else
+          echo "::error::Could not fetch the ledger anchor (HTTP $code); refusing to run without it."
+          head -c 500 "$resp"
+          rm -f "$resp"
+          exit 1
+        fi
+        rm -f "$resp"
     - id: phase
       shell: bash
       env:
@@ -89,6 +216,10 @@ runs:
         HANDOFF_WORKSPACE: ${{ inputs.workspace }}
         # Selects claim (run_check.sh) vs complete (run_complete.sh).
         HANDOFF_PHASE: ${{ inputs.phase }}
+        # Integrity binding: HMAC key for the chain seal (CI secret), and the
+        # one-run bootstrap flag. The anchor itself arrives via GITHUB_ENV.
+        SYNTHE_LEDGER_HMAC_KEY: ${{ inputs.ledger-hmac-key }}
+        SYNTHE_LEDGER_BOOTSTRAP: ${{ inputs.ledger-bootstrap }}
       run: |
         if [ "$HANDOFF_PHASE" = "complete" ]; then
           bash "${{ github.action_path }}/checker/run_complete.sh"
@@ -99,15 +230,59 @@ runs:
     # rejections are also recorded state (a failed claim attempt must not
     # reopen the key for a racing retry). Complete phase likewise saves
     # after the flip. Only for the Action-managed ledger.
+    #
+    # The ledger is initialized with --init-ledger (a sealed genesis chain),
+    # not a bare '{}': a cache miss yields a sealed genesis, while any
+    # existing file without a valid seal fails closed. Under an anchor, a
+    # missing/evicted ledger refuses here with ledger_rollback -- re-run
+    # once with ledger-bootstrap: 'true' to re-bootstrap deliberately.
     - name: Ensure handoff ledger file exists
       if: always() && inputs.ledger == ''
       shell: bash
+      env:
+        SYNTHE_LEDGER_HMAC_KEY: ${{ inputs.ledger-hmac-key }}
+        SYNTHE_LEDGER_BOOTSTRAP: ${{ inputs.ledger-bootstrap }}
       run: |
         mkdir -p .synthe
-        [ -f .synthe/ledger.json ] || echo '{}' > .synthe/ledger.json
+        python3 "${{ github.action_path }}/checker/handoff_check.py" --init-ledger .synthe/ledger.json
     - name: Save handoff ledger
       if: always() && inputs.ledger == ''
       uses: actions/cache/save@v4
       with:
         path: .synthe/ledger.json
         key: synthe-ledger-${{ github.repository }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.phase }}
+    # Publish the new chain head as the out-of-cache anchor, so the next run
+    # can tell a fresh cache restore from a stale one. Skipped when the
+    # caller supplies their own ledger path or no token. Requires
+    # a token with Variables: write (not GITHUB_TOKEN; see README.md).
+    - name: Publish ledger anchor
+      if: always() && inputs.ledger == '' && inputs.anchor-token != ''
+      shell: bash
+      env:
+        ANCHOR_TOKEN: ${{ inputs.anchor-token }}
+      run: |
+        set -u
+        anchor="$(python3 "${{ github.action_path }}/checker/handoff_check.py" --ledger-head .synthe/ledger.json)"
+        if [ -z "$anchor" ]; then
+          echo "No sealed ledger chain to anchor (missing/unsealed ledger); skipping."
+          exit 0
+        fi
+        payload="$(python3 -c 'import json,sys; print(json.dumps({"name": "SYNTHE_LEDGER_ANCHOR", "value": sys.argv[1]}))' "$anchor")"
+        base="https://api.github.com/repos/${{ github.repository }}/actions/variables"
+        code="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+          -H "Authorization: Bearer ${ANCHOR_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "Content-Type: application/json" \
+          -d "$payload" "$base/SYNTHE_LEDGER_ANCHOR")"
+        if [ "$code" = "404" ]; then
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${ANCHOR_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$payload" "$base")"
+        fi
+        if [ "$code" != "200" ] && [ "$code" != "201" ] && [ "$code" != "204" ]; then
+          echo "::error::Could not publish the ledger anchor (HTTP $code)."
+          exit 1
+        fi
+        echo "Ledger anchor published."

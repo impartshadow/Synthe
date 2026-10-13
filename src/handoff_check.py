@@ -244,6 +244,17 @@ class SQLiteLedger(dict):
             self.conn.execute("INSERT INTO claims(key, value) VALUES (?, ?) "
                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                               (key, json.dumps(dict.__getitem__(self, key), sort_keys=True, separators=(",", ":"))))
+        # Re-seal the chain over the full table (one scan): the header row is
+        # written in the same transaction. Skipped when the current seal
+        # already covers these exact rows (e.g. nothing changed since adopt).
+        rows = self.conn.execute("SELECT key, value FROM claims").fetchall()
+        data = {k: json.loads(v) for k, v in rows}
+        if not _seal_is_current(data, data.get(LEDGER_META_KEY)):
+            seal_ledger(data)
+            self.conn.execute("INSERT INTO claims(key, value) VALUES (?, ?) "
+                              "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                              (LEDGER_META_KEY, json.dumps(data[LEDGER_META_KEY],
+                                                           sort_keys=True, separators=(",", ":"))))
         self.dirty_keys.clear()
 
 
@@ -255,20 +266,38 @@ def load_ledger(path: Path) -> dict:
             conn = _sqlite_connect(Path(path))
             conn.execute("SELECT key FROM claims LIMIT 1").fetchone()
             conn.close()
+            # SQLite stays lazy: the seal + anchor are verified when the
+            # ledger is locked for mutation (LockedLedger.__enter__); see
+            # _sqlite_verify_and_anchor. Read-only callers get raw rows.
             return SQLiteLedger(Path(path))
         except (OSError, sqlite3.DatabaseError):
-            return {"_corrupt": True}
+            return _corrupt_marker("ledger_corrupt", "ledger database is not readable")
     if path and path.exists():
         try:
-            return json.loads(path.read_text()) or {}
+            data = json.loads(path.read_text())
         except json.JSONDecodeError:
-            return {"_corrupt": True}
+            return _corrupt_marker("ledger_corrupt", "ledger file is not valid JSON")
+        if not isinstance(data, dict):
+            return _corrupt_marker("ledger_corrupt", "ledger file must contain a JSON object")
+        return _verify_json_ledger(data, path)
+    # Missing file: a fresh chain starts here -- unless an out-of-cache
+    # anchor says a chain already exists (rollback/deletion guard).
+    ok, code, message = check_ledger_anchor(exists=False, sealed=False)
+    if not ok:
+        return _corrupt_marker(code, message)
     return {}
 
 
 def save_ledger(path: Path, ledger: dict) -> None:
     """Write the ledger atomically: temp file in the same dir + os.replace,
-    so a concurrent reader never observes a torn file."""
+    so a concurrent reader never observes a torn file. Every save (re-)seals
+    the chain -- skipped only when the current seal already covers these
+    exact entries -- so every persisted state is verifiable. Never persists
+    a fail-closed corrupt marker."""
+    if not isinstance(ledger, dict) or ledger.get("_corrupt"):
+        raise ValueError("refusing to persist a corrupt ledger")
+    if not _seal_is_current(ledger, ledger.get(LEDGER_META_KEY)):
+        seal_ledger(ledger)
     if path and sqlite_ledger(path):
         try:
             conn = _sqlite_connect(Path(path))
@@ -297,12 +326,370 @@ def migrate_ledger(source: Path, destination: Path) -> dict:
         raise FileExistsError(destination)
     ledger = load_ledger(source)
     if ledger.get("_corrupt"):
-        raise ValueError("source ledger is corrupt")
+        raise ValueError(f"source ledger is corrupt: {ledger.get('_corrupt_reason')}: "
+                         f"{ledger.get('_corrupt_message')}")
     save_ledger(destination, ledger)
     copied = load_ledger(destination)
-    if copied.get("_corrupt") or dict(copied.items()) != ledger:
+    if copied.get("_corrupt") or _ledger_claims(copied) != _ledger_claims(ledger):
         raise ValueError("ledger migration verification failed")
-    return {"source": str(source), "destination": str(destination), "entries": len(ledger)}
+    return {"source": str(source), "destination": str(destination),
+            "entries": len(_ledger_claims(ledger))}
+
+
+# ---------------------------------------------------------------------------
+# Ledger integrity binding (v2): HMAC-sealed hash chain + out-of-cache anchor.
+#
+# Every ledger write seals a chain header under the reserved top-level key
+# "~synthe" -- the ONE reserved namespace for chain metadata in the ledger
+# file (idempotency keys may not start with "~"; see validate()). The header's
+# chain_head is a hash-chain link over (chain_seq, chain_prev, entries):
+#
+#   head_n = MAC("synthe-ledger-chain/v2" || seq_n || head_{n-1} || canonical(entries_n))
+#
+# MAC is HMAC-SHA256 keyed by the SYNTHE_LEDGER_HMAC_KEY environment variable
+# when set -- a CI secret is the intended home -- and plain SHA-256 otherwise.
+# Without the key the seal detects accidental corruption (bit-rot, hand
+# edits, truncation, torn writes) but NOT forgery by someone who can write the
+# file; the header records chain_keyed so a keyed seal and an unkeyed seal are
+# never mixed (mixing fails closed as ledger_corrupt). Key rotation is
+# supported via SYNTHE_LEDGER_HMAC_KEY_PREVIOUS: verification accepts either
+# key, sealing always uses the current one, so a rotation heals on next save.
+#
+# Rollback -- a stale cache restoring an older snapshot, a forged empty
+# ledger, a deleted file -- is not detectable from the file alone, so the
+# chain also carries a monotonic chain_seq that is checked against an anchor
+# stored OUTSIDE the cache: the SYNTHE_LEDGER_ANCHOR environment variable
+# ("seq:head"), which the GitHub Action populates from the
+# SYNTHE_LEDGER_ANCHOR repository variable before each run and republishes
+# after it. A loaded ledger must match or extend the anchor; anything older,
+# divergent, or missing fails closed with a named reason code.
+#
+# When no anchor is configured (local runs, tests, first run), the checker
+# degrades gracefully: the seal is still verified (corruption detection), a
+# legacy unsealed ledger is adopted in place as a new genesis chain -- no
+# manual --adopt-legacy step -- and a warning notes that rollback is not
+# provable. Set SYNTHE_LEDGER_ANCHOR_REQUIRED=1 (the Action does this whenever
+# it fetched an anchor) to make a missing/unreadable anchor fail closed as
+# ledger_anchor_unavailable instead. SYNTHE_LEDGER_BOOTSTRAP=1 skips anchor
+# enforcement for one run (the documented recovery after a total cache
+# eviction); the chain restarts and the anchor is republished.
+# ---------------------------------------------------------------------------
+
+LEDGER_CHAIN_FORMAT = "synthe-ledger-chain/v2"
+LEDGER_META_KEY = "~synthe"  # the ONE reserved namespace for chain metadata keys
+LEDGER_GENESIS_PREV = "synthe-ledger-genesis"
+
+LEDGER_HMAC_KEY_ENV = "SYNTHE_LEDGER_HMAC_KEY"
+LEDGER_HMAC_PREV_ENV = "SYNTHE_LEDGER_HMAC_KEY_PREVIOUS"
+LEDGER_ANCHOR_ENV = "SYNTHE_LEDGER_ANCHOR"  # "seq:head"
+LEDGER_ANCHOR_REQUIRED_ENV = "SYNTHE_LEDGER_ANCHOR_REQUIRED"
+LEDGER_BOOTSTRAP_ENV = "SYNTHE_LEDGER_BOOTSTRAP"
+LEDGER_ADOPT_LEGACY_ENV = "SYNTHE_LEDGER_ADOPT_LEGACY"
+
+_truthy = {"1", "true", "yes", "on"}
+
+_warned: set[str] = set()
+
+
+def _ledger_warn(message: str) -> None:
+    """Stderr warning, once per distinct message per process (the checker is
+    usually one CLI invocation, so operators still see it every run)."""
+    if message not in _warned:
+        _warned.add(message)
+        print(f"handoff_check: WARNING: {message}", file=sys.stderr)
+
+
+def _is_meta_key(key) -> bool:
+    """Chain-metadata namespace: reserved, never an idempotency claim."""
+    return isinstance(key, str) and key.startswith("~")
+
+
+def _ledger_claims(ledger: dict) -> dict:
+    """The claim entries of a ledger: everything except the chain header."""
+    return {k: v for k, v in ledger.items() if k != LEDGER_META_KEY}
+
+
+def _corrupt_marker(code: str, message: str) -> dict:
+    """Fail-closed ledger stand-in: every operation path checks `_corrupt`
+    and reports the specific reason via _ledger_seal_reject()."""
+    return {"_corrupt": True, "_corrupt_reason": code, "_corrupt_message": message}
+
+
+def _ledger_seal_reject(ledger: dict) -> dict:
+    code = ledger.get("_corrupt_reason") or "ledger_corrupt"
+    message = ledger.get("_corrupt_message") or "ledger file is not valid JSON"
+    return _reject("invalid", code, message)
+
+
+def _hmac_keys() -> tuple[bytes | None, bytes | None]:
+    """(current, previous) HMAC keys from the environment; None when unset."""
+    cur = os.environ.get(LEDGER_HMAC_KEY_ENV)
+    prev = os.environ.get(LEDGER_HMAC_PREV_ENV)
+    return (cur.encode() if cur else None, prev.encode() if prev else None)
+
+
+def _canonical_entries(entries: dict) -> bytes:
+    return json.dumps(entries, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode()
+
+
+def ledger_chain_link(seq: int, prev_head: str, entries: dict,
+                      key: bytes | None) -> str:
+    """One hash-chain link. Keyed (HMAC-SHA256) when a key is configured,
+    plain SHA-256 otherwise. The previous head is bound into the link, so
+    editing it invalidates the seal."""
+    msg = b"|".join((LEDGER_CHAIN_FORMAT.encode(), str(seq).encode(),
+                      prev_head.encode(), _canonical_entries(entries)))
+    if key is not None:
+        return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    return hashlib.sha256(msg).hexdigest()
+
+
+def seal_ledger(ledger: dict, *, created_by: str = "synthe") -> dict:
+    """(Re-)seal a ledger dict in place: bump chain_seq, link chain_prev to
+    the previous head, recompute chain_head. Unknown "~synthe" fields (e.g.
+    written by other tooling) are preserved. Returns the ledger."""
+    if not isinstance(ledger, dict) or ledger.get("_corrupt"):
+        raise ValueError("refusing to seal a corrupt ledger")
+    entries = _ledger_claims(ledger)
+    old = ledger.get(LEDGER_META_KEY)
+    old = old if isinstance(old, dict) else {}
+    try:
+        seq = int(old.get("chain_seq") or 0) + 1
+    except (TypeError, ValueError):
+        seq = 1
+    prev = old.get("chain_head") or LEDGER_GENESIS_PREV
+    key, _prev_key = _hmac_keys()
+    head = ledger_chain_link(seq, prev, entries, key)
+    header = dict(old)
+    header.update({
+        "chain_format": LEDGER_CHAIN_FORMAT,
+        "chain_seq": seq,
+        "chain_prev": prev,
+        "chain_head": head,
+        "chain_keyed": key is not None,
+        "sealed_at": now_utc().isoformat(),
+        "sealed_by": created_by,
+    })
+    ledger[LEDGER_META_KEY] = header
+    return ledger
+
+
+def verify_ledger_seal(ledger: dict):
+    """Verify the chain seal of a ledger dict that carries a "~synthe"
+    header with chain fields. Returns (ok, code, message, header,
+    used_prev_key). Callers must have established that chain fields exist;
+    a header without them is unsealed (legacy), not corrupt."""
+    header = ledger.get(LEDGER_META_KEY)
+    if not isinstance(header, dict):
+        return False, "ledger_corrupt", "chain header '~synthe' is malformed", {}, False
+    seq, prev, head = header.get("chain_seq"), header.get("chain_prev"), header.get("chain_head")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        return False, "ledger_corrupt", "chain header has a malformed chain_seq", header, False
+    if not isinstance(prev, str) or not prev or not isinstance(head, str) or not head:
+        return False, "ledger_corrupt", "chain header has a malformed chain link", header, False
+    key, prev_key = _hmac_keys()
+    keyed_env = key is not None
+    if bool(header.get("chain_keyed", False)) != keyed_env:
+        return (False, "ledger_corrupt",
+                "chain seal key state does not match the environment "
+                f"(header says keyed={bool(header.get('chain_keyed', False))}, "
+                f"environment {'has' if keyed_env else 'has no'} {LEDGER_HMAC_KEY_ENV}); "
+                "refusing to mix keyed and unkeyed seals", header, False)
+    entries = _ledger_claims(ledger)
+    expected = ledger_chain_link(seq, prev, entries, key)
+    used_prev = False
+    if not hmac.compare_digest(expected, head) and keyed_env and prev_key:
+        expected = ledger_chain_link(seq, prev, entries, prev_key)
+        used_prev = hmac.compare_digest(expected, head)
+    if not hmac.compare_digest(expected, head):
+        return (False, "ledger_corrupt",
+                "chain seal mismatch: the ledger file was edited, truncated, "
+                "or forged outside the checker (or the HMAC key changed without "
+                f"{LEDGER_HMAC_PREV_ENV})", header, False)
+    return True, "", "", header, used_prev
+
+
+def _seal_is_current(ledger: dict, header) -> bool:
+    """True when the ledger's seal already covers its exact entries with the
+    environment's current key state (so save_ledger can skip the reseal). A
+    seal made with the previous rotation key counts as stale: it verifies,
+    but the next save re-seals with the current key."""
+    if not isinstance(header, dict) or not isinstance(header.get("chain_head"), str):
+        return False
+    ok, _code, _msg, _hdr, used_prev = verify_ledger_seal(ledger)
+    return ok and not used_prev
+
+
+def _parse_anchor(raw: str):
+    """Parse a "seq:head" anchor; None when malformed."""
+    seq_s, sep, head = raw.partition(":")
+    if not sep or not head:
+        return None
+    try:
+        seq = int(seq_s)
+    except ValueError:
+        return None
+    if isinstance(seq, bool) or seq < 1:
+        return None
+    return seq, head
+
+
+def _read_anchor():
+    """Return (status, anchor, required, bootstrap).
+
+    status is "ok" (anchor usable), "absent" (not configured), or "malformed"
+    (set but unparseable -- treated as unavailable). required mirrors
+    SYNTHE_LEDGER_ANCHOR_REQUIRED (the Action sets it whenever it fetched an
+    anchor); bootstrap mirrors SYNTHE_LEDGER_BOOTSTRAP (one-run recovery)."""
+    raw = os.environ.get(LEDGER_ANCHOR_ENV, "").strip()
+    anchor = _parse_anchor(raw) if raw else None
+    status = "ok" if anchor else ("malformed" if raw else "absent")
+    required = os.environ.get(LEDGER_ANCHOR_REQUIRED_ENV, "").strip().lower() in _truthy
+    bootstrap = os.environ.get(LEDGER_BOOTSTRAP_ENV, "").strip().lower() in _truthy
+    return status, anchor, required, bootstrap
+
+
+def check_ledger_anchor(*, exists: bool, sealed: bool, seq: int = 0, head: str = ""):
+    """Enforce the out-of-cache anchor. A present anchor must be matched or
+    extended by the loaded chain; anything older, divergent, or missing fails
+    closed. Returns (ok, code, message)."""
+    status, anchor, required, bootstrap = _read_anchor()
+    if bootstrap:
+        _ledger_warn(f"{LEDGER_BOOTSTRAP_ENV}=1: anchor enforcement skipped for this run; "
+                     "the chain restarts here and the anchor will be republished.")
+        return True, "", ""
+    if status == "ok":
+        aseq, ahead = anchor
+        if not exists:
+            return (False, "ledger_rollback",
+                    f"ledger file is missing but an out-of-cache anchor exists (chain seq {aseq}); "
+                    "refusing to start a fresh chain -- this looks like a total cache eviction or a "
+                    f"deleted ledger. Re-run once with {LEDGER_BOOTSTRAP_ENV}=1 to re-bootstrap "
+                    "the chain deliberately.")
+        if not sealed:
+            return (False, "ledger_rollback",
+                    f"ledger has no verifiable chain seal but an out-of-cache anchor exists "
+                    f"(chain seq {aseq}); an unsealed file cannot extend a sealed chain -- refusing "
+                    "as a downgrade (possible forged or stale-cache file).")
+        if seq < aseq:
+            return (False, "ledger_rollback",
+                    f"ledger chain seq {seq} is behind the out-of-cache anchor seq {aseq}; the "
+                    "cache likely restored a stale snapshot. Refusing to forget newer claims.")
+        if seq == aseq and not hmac.compare_digest(head, ahead):
+            return (False, "ledger_diverged",
+                    f"ledger chain seq {seq} matches the anchor but the head differs: two writers "
+                    "sealed different states at the same sequence number. Refusing; reconcile "
+                    "outside the checker (the Action requires a `concurrency` group for safety).")
+        return True, "", ""
+    # Anchor unavailable.
+    if required:
+        detail = "is set but malformed" if status == "malformed" else "is not set"
+        return (False, "ledger_anchor_unavailable",
+                f"anchoring is required ({LEDGER_ANCHOR_REQUIRED_ENV}=1) but {LEDGER_ANCHOR_ENV} "
+                f"{detail}; refusing to run without the out-of-cache anchor.")
+    if exists and sealed:
+        _ledger_warn(f"no out-of-cache anchor configured ({LEDGER_ANCHOR_ENV}); chain seal "
+                     "verified, but rollback to an older snapshot is not provable in this mode.")
+    # Unsealed + no anchor: the caller adopts the ledger as a new genesis
+    # chain and logs the details itself.
+    return True, "", ""
+
+
+def _adopt_json_ledger(data: dict, path: Path) -> dict:
+    """Seal a legacy (unsealed) JSON ledger in place as a new genesis chain,
+    preserving every claim. Loudly logged; no manual migration step."""
+    n = len(_ledger_claims(data))
+    _ledger_warn(f"ledger {path} has no chain seal; adopting {n} existing claim(s) as a new "
+                 "genesis chain (entries preserved).")
+    return seal_ledger(data)
+
+
+def _unsealed_adoption_refusal(path: Path):
+    """None when an unsealed ledger may be adopted as a new genesis chain, else
+    a fail-closed corrupt marker. Without an HMAC key the seal is only a
+    checksum, so adoption is automatic (upgrade path). With a key, an unsealed
+    file is exactly what a forger who lacks the key would produce by stripping
+    the seal, so it is adopted only when the operator says so for this run."""
+    key, _prev = _hmac_keys()
+    if not key:
+        return None
+    if (os.environ.get(LEDGER_ADOPT_LEGACY_ENV, "").strip().lower() in _truthy
+            or os.environ.get(LEDGER_BOOTSTRAP_ENV, "").strip().lower() in _truthy):
+        return None
+    return _corrupt_marker(
+        "ledger_corrupt",
+        f"ledger {path} has no chain seal, but {LEDGER_HMAC_KEY_ENV} is set: an unsealed file may be "
+        "a forgery with its seal stripped, so it is not adopted automatically. If it is a genuine "
+        "pre-seal ledger, adopt it once with `handoff_check.py --init-ledger PATH --adopt-legacy` "
+        f"(or {LEDGER_ADOPT_LEGACY_ENV}=1, or the Action's ledger-bootstrap: 'true').")
+
+
+def _verify_json_ledger(data: dict, path: Path) -> dict:
+    """Seal verification + anchor enforcement for a parsed JSON ledger.
+    Returns the ledger dict, or a fail-closed corrupt marker."""
+    header = data.get(LEDGER_META_KEY)
+    has_chain = isinstance(header, dict) and isinstance(header.get("chain_head"), str)
+    if has_chain:
+        ok, code, message, header, _used_prev = verify_ledger_seal(data)
+        if not ok:
+            return _corrupt_marker(code, message)
+        ok, code, message = check_ledger_anchor(exists=True, sealed=True,
+                                                seq=header["chain_seq"], head=header["chain_head"])
+        if not ok:
+            return _corrupt_marker(code, message)
+        return data
+    ok, code, message = check_ledger_anchor(exists=True, sealed=False)
+    if not ok:
+        return _corrupt_marker(code, message)
+    refusal = _unsealed_adoption_refusal(path)
+    if refusal:
+        return refusal
+    return _adopt_json_ledger(data, path)
+
+
+def _sqlite_verify_and_anchor(conn: sqlite3.Connection, path: Path, existed: bool):
+    """Verify the chain seal + anchor for a SQLite ledger inside the caller's
+    transaction. Returns None when the ledger may be used, else a fail-closed
+    corrupt marker. A legacy (unsealed) table is adopted: the genesis header
+    row is written immediately so the chain is sealed from this point on."""
+    try:
+        rows = conn.execute("SELECT key, value FROM claims").fetchall()
+    except sqlite3.DatabaseError:
+        return _corrupt_marker("ledger_corrupt", "ledger database is not readable")
+    data: dict = {}
+    for k, v in rows:
+        try:
+            data[k] = json.loads(v)
+        except ValueError:
+            return _corrupt_marker("ledger_corrupt", f"ledger row {k!r} is not valid JSON")
+    header = data.get(LEDGER_META_KEY)
+    has_chain = isinstance(header, dict) and isinstance(header.get("chain_head"), str)
+    if has_chain:
+        ok, code, message, header, _used_prev = verify_ledger_seal(data)
+        if not ok:
+            return _corrupt_marker(code, message)
+        ok, code, message = check_ledger_anchor(exists=True, sealed=True,
+                                                seq=header["chain_seq"], head=header["chain_head"])
+        if not ok:
+            return _corrupt_marker(code, message)
+        return None
+    ok, code, message = check_ledger_anchor(exists=existed, sealed=False)
+    if not ok:
+        return _corrupt_marker(code, message)
+    if existed:
+        refusal = _unsealed_adoption_refusal(path)
+        if refusal:
+            return refusal
+    n = len(_ledger_claims(data))
+    _ledger_warn(f"SQLite ledger {path}: no chain seal; adopting {n} existing claim(s) as a new "
+                 "genesis chain (entries preserved).")
+    ledger = seal_ledger(dict(data))
+    conn.execute("INSERT INTO claims(key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (LEDGER_META_KEY, json.dumps(ledger[LEDGER_META_KEY],
+                                              sort_keys=True, separators=(",", ":"))))
+    return None
 
 
 def entry_state(entry: dict) -> str:
@@ -346,15 +733,19 @@ class LockedLedger:
     def __enter__(self) -> "LockedLedger":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if sqlite_ledger(self.path):
+            existed = self.path.exists()
             try:
                 self._conn = _sqlite_connect(self.path)
                 self._conn.execute("BEGIN IMMEDIATE")
-                self.ledger = SQLiteLedger(self.path, self._conn)
+                # Verify the chain seal + out-of-cache anchor before yielding;
+                # a legacy table is adopted (genesis header row written here).
+                marker = _sqlite_verify_and_anchor(self._conn, self.path, existed)
+                self.ledger = marker if marker is not None else SQLiteLedger(self.path, self._conn)
             except (OSError, sqlite3.DatabaseError):
                 if self._conn is not None:
                     self._conn.close()
                     self._conn = None
-                self.ledger = {"_corrupt": True}
+                self.ledger = _corrupt_marker("ledger_corrupt", "ledger database is not readable")
             return self
         self._fh = open(self.path.with_name(self.path.name + ".lock"), "a+")
         try:
@@ -362,16 +753,21 @@ class LockedLedger:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except ImportError:
             pass  # Windows: best-effort, atomic replace still applies
+        # load_ledger verifies the chain seal + anchor (or adopts a legacy
+        # file); a fail-closed marker is never saved back (see __exit__).
         self.ledger = load_ledger(self.path)
         return self
 
     def __exit__(self, *exc) -> bool:
         try:
             if self._conn is not None:
-                if self.dirty:
-                    self.ledger.flush()
-                self._conn.commit()
-            elif self.dirty:
+                if self.ledger.get("_corrupt"):
+                    self._conn.rollback()  # never persist a failed verification
+                else:
+                    if self.dirty:
+                        self.ledger.flush()  # flush() re-seals the chain
+                    self._conn.commit()
+            elif self.dirty and not self.ledger.get("_corrupt"):
                 save_ledger(self.path, self.ledger)
         finally:
             if self._conn is not None:
@@ -487,12 +883,386 @@ def parse_utc(value) -> tuple[dt.datetime | None, str | None]:
 _LIST_SETS = ("forbidden", "approval_required_for", "forbidden_paths")  # restrictions: union
 _LIST_CEILINGS = ("allowed_tools", "trusted_approvers")    # grants: intersection
 _FLAGS = ("require_signatures", "require_signed_approvals", "verify_evidence",
-          "require_planned_actions", "exclusive_paths")
+          "require_planned_actions", "exclusive_paths",
+          "require_capability_declaration", "require_topology")  # v0.6
 _MINIMUMS = ("max_ttl_hours",)                              # ceilings on time: the smallest wins
 
 
 def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _cap_strs(cap: dict, field: str) -> list:
+    """The string entries of a capability list dimension (robust to malformed
+    entries: the shape check reports those, this just never crashes)."""
+    v = cap.get(field)
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def _norm_cap_path(p) -> str | None:
+    """Normalize a capability path for matching. Returns the normalized
+    relative path, or None when the path is rejected outright: absolute paths,
+    backslashes, and `..` segments are never allowed (fail closed) — no
+    normalized path may escape its declared root. `.` and empty segments are
+    dropped; glob tokens (`*`, `?`, `**`) survive as segments."""
+    if not isinstance(p, str) or not p:
+        return None
+    if p.startswith("/") or "\\" in p:
+        return None
+    segs = []
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            return None
+        segs.append(seg)
+    return "/".join(segs) or None
+
+
+def _glob_covers(covering: str, covered: str) -> bool:
+    """Is every path matching `covered` also matched by `covering`? Sound but
+    conservative: equality always holds; a wildcard-free covering path covers
+    itself and paths beneath it (directory semantics); a `/**`-suffixed
+    covering glob covers anything whose literal prefix sits under it; anything
+    else must match exactly. Both sides are normalized first (absolute paths,
+    backslashes and `..` segments are rejected outright), so a traversal like
+    `src/../secrets` can never be "covered" by `src`. Used to decide whether a
+    declared path narrows a ceiling path; unsure means not covered (fail closed)."""
+    covering = _norm_cap_path(covering)
+    covered = _norm_cap_path(covered)
+    if covering is None or covered is None:
+        return False
+    if covering == covered:
+        return True
+    if covering == "**":
+        return True
+    if not any(w for w, _ in _glob_tokens(covering)):
+        return covered.startswith(covering + "/")
+    if covering.endswith("/**"):
+        prefix = covering[:-3]
+        # literal prefix of `covered`: the text before its first wildcard
+        lit_parts = []
+        for wild, text in _glob_tokens(covered):
+            if wild:
+                break
+            lit_parts.append(text)
+        lit = "".join(lit_parts)
+        return lit == prefix or lit.startswith(prefix + "/")
+    return False
+
+
+def _merge_capability_ceiling(cur: dict | None, new: dict) -> dict:
+    """Narrow two capability ceilings (authority may only narrow): env/tools
+    intersect, network ANDs, paths keep only the new paths covered by a
+    current path, and a version pin follows the later layer."""
+    if not isinstance(cur, dict):
+        return copy.deepcopy(new)
+    merged = copy.deepcopy(cur)
+    for dim in ("env", "tools"):
+        if dim in new:
+            have = set(_cap_strs(merged, dim)) if dim in merged else None
+            want = set(_cap_strs(new, dim))
+            merged[dim] = sorted(want if have is None else (have & want))
+    if "network" in new:
+        merged["network"] = bool(new["network"]) and bool(merged.get("network", True))
+    if "paths" in new:
+        if "paths" in merged:
+            merged["paths"] = [p for p in _cap_strs(new, "paths")
+                               if any(_glob_covers(c, p) for c in _cap_strs(merged, "paths"))]
+        else:
+            merged["paths"] = list(_cap_strs(new, "paths"))
+    if "version" in new:
+        merged["version"] = new["version"]
+    return merged
+
+
+def _capability_shape(cap, where: str = "capability", require_version: bool = True) -> list:
+    """Element-level shape of a capability object. Returns (code, message)
+    pairs; the caller decides the state (invalid for packets, registry_malformed
+    for policy ceilings, topology_malformed for role capabilities)."""
+    if not isinstance(cap, dict):
+        return [(f"malformed:{where}", f"{where} must be an object")]
+    errs = []
+    if require_version and (not isinstance(cap.get("version"), str) or not cap.get("version")):
+        errs.append((f"malformed:{where}.version",
+                     f"{where}.version must be a non-empty string"))
+    for field in ("env", "tools", "paths"):
+        v = cap.get(field)
+        if v is not None and (not isinstance(v, list)
+                              or not all(isinstance(x, str) and x for x in v)):
+            errs.append((f"malformed:{where}.{field}",
+                         f"{where}.{field} must be a list of non-empty strings"))
+    for p in _cap_strs(cap, "paths"):
+        # Declared paths must normalize to a safe relative path: absolute
+        # paths, backslashes and `..` segments are rejected outright, because a
+        # traversal inside a signed declaration could otherwise smuggle access
+        # past the declared root.
+        if _norm_cap_path(p) is None:
+            errs.append((f"malformed:{where}.paths",
+                         f"{where}.paths entry {p!r} is not a safe relative path: "
+                         f"absolute paths, backslashes and '..' segments are rejected"))
+            break
+    if cap.get("network") is not None and not isinstance(cap.get("network"), bool):
+        errs.append((f"malformed:{where}.network", f"{where}.network must be a boolean"))
+    ar = cap.get("admission_receipt")
+    if ar is not None and (not isinstance(ar, str) or not ar):
+        errs.append((f"malformed:{where}.admission_receipt",
+                     f"{where}.admission_receipt must be a non-empty string"))
+    return errs
+
+
+def _cap_allows(cap, kind: str, value, ceiling: bool = False) -> bool:
+    """Does one capability source allow this access? A declaration
+    (ceiling=False) is exhaustive: a dimension it does not declare allows
+    nothing, and network is denied unless declared true. A ceiling
+    (ceiling=True) constrains only the dimensions it declares."""
+    if not isinstance(cap, dict):
+        return ceiling
+    if kind == "network":
+        if "network" not in cap:
+            return ceiling
+        return cap["network"] is True
+    field = {"env": "env", "path": "paths", "tool": "tools"}[kind]
+    if field not in cap:
+        return ceiling
+    options = cap[field]
+    if not isinstance(options, list):
+        return False
+    if kind == "path":
+        value = _norm_cap_path(value)
+        if value is None:
+            # A traversal is not "undeclared", it is rejected outright: it can
+            # never be inside any declared root.
+            return False
+        return any(isinstance(p, str) and (pn := _norm_cap_path(p)) is not None
+                   and glob_match(pn, value) for p in options)
+    return isinstance(value, str) and value in _cap_strs(cap, field)
+
+
+def check_capability_use(declaration, kind: str, value=None) -> dict | None:
+    """Runtime enforcement hook for a least-privilege proxy (SPEC section 15).
+
+    `declaration` is the signed capability object in force for the acting
+    agent; `kind` is one of "env" (value: the variable name), "path" (value:
+    the file path), "tool" (value: the tool/API name) or "network". Returns
+    None when the access is inside the declaration, else a reason dict with
+    code `capability_not_declared`. A path that is absolute, contains a
+    backslash, or contains a `..` segment is rejected outright with code
+    `capability_path_unsafe`: no traversal can ever match a declared root.
+    With no declaration in force everything is denied: an undeclared env var,
+    path or tool is outside the (empty) declaration, and network egress is
+    denied by default.
+    """
+    cap = declaration if isinstance(declaration, dict) else {}
+    has_decl = isinstance(declaration, dict) and bool(declaration)
+
+    def deny(what: str) -> dict:
+        return {"state": "blocked", "code": "capability_not_declared",
+                "message": f"{what} is outside the signed capability declaration"
+                           + ("" if has_decl else "; no capability declaration is in force")}
+
+    if kind == "env":
+        if isinstance(value, str) and value in _cap_strs(cap, "env"):
+            return None
+        return deny(f"read of env var {value!r}")
+    if kind == "path":
+        if isinstance(value, str):
+            norm = _norm_cap_path(value)
+            if norm is None:
+                # Fail closed with a named code: a traversal is not merely
+                # "outside the declaration", it is an unsafe shape that can
+                # never match any declared root.
+                return {"state": "blocked", "code": "capability_path_unsafe",
+                        "message": f"file access to {value!r} is rejected outright: "
+                                   "capability paths must be relative and may not contain "
+                                   "'..' segments or backslashes"}
+            for p in _cap_strs(cap, "paths"):
+                pn = _norm_cap_path(p)
+                if pn is not None and glob_match(pn, norm):
+                    return None
+        return deny(f"file access to {value!r}")
+    if kind == "tool":
+        if isinstance(value, str) and value in _cap_strs(cap, "tools"):
+            return None
+        return deny(f"call to tool {value!r}")
+    if kind == "network":
+        if cap.get("network") is True:
+            return None
+        return deny("network egress (denied by default; declare \"network\": true)")
+    return deny(f"access of unknown capability kind {kind!r}")
+
+
+def _cap_within_ceiling(decl: dict, ceiling: dict) -> list:
+    """(code, message) problems when the packet's capability declaration
+    exceeds the receiver's capability ceiling: blocked /
+    capability_exceeds_receiver_policy. Authority may only narrow."""
+    problems = []
+    if ceiling.get("version") is not None and decl.get("version") != ceiling["version"]:
+        problems.append(("capability_exceeds_receiver_policy",
+                         f"capability declaration version {decl.get('version')!r} does not match "
+                         f"the receiver's required version {ceiling['version']!r}"))
+    for dim in ("env", "tools"):
+        if dim in ceiling:
+            extra = set(_cap_strs(decl, dim)) - set(_cap_strs(ceiling, dim))
+            if extra:
+                problems.append(("capability_exceeds_receiver_policy",
+                                 f"capability declaration claims {dim} the receiver never "
+                                 f"allows: {sorted(extra)}"))
+    if "paths" in ceiling:
+        uncovered = [p for p in _cap_strs(decl, "paths")
+                     if not any(_glob_covers(c, p) for c in _cap_strs(ceiling, "paths"))]
+        if uncovered:
+            problems.append(("capability_exceeds_receiver_policy",
+                             f"capability declaration claims paths outside the receiver's "
+                             f"ceiling: {uncovered}"))
+    if "network" in ceiling and ceiling.get("network") is not True and decl.get("network") is True:
+        problems.append(("capability_exceeds_receiver_policy",
+                         "capability declaration claims network egress, which the "
+                         "receiver's capability ceiling denies"))
+    return problems
+
+
+def _action_capability_problems(name: str, act: dict, packet_cap, role_cap, pol_cap) -> list:
+    """A planned action's declared intent against the capability sources in
+    force. Conventions (SPEC section 15): `params.env` lists env vars the
+    action reads, `params.paths` lists files it touches, `params.network: true`
+    declares egress. Anything outside the narrowed declaration is
+    `capability_not_declared` (blocked)."""
+    decls = [c for c in (packet_cap, role_cap) if isinstance(c, dict)]
+    ceiling = pol_cap if isinstance(pol_cap, dict) else None
+    if not decls and ceiling is None:
+        return []
+    sources = [(c, False) for c in decls] + ([(ceiling, True)] if ceiling is not None else [])
+
+    def denied(kind, value) -> bool:
+        return not all(_cap_allows(c, kind, value, ceiling=is_ceil) for c, is_ceil in sources)
+
+    problems = []
+    tool = act.get("tool")
+    if denied("tool", tool):
+        problems.append(("capability_not_declared",
+                         f"action '{name}' uses tool '{tool}', outside the signed "
+                         f"capability declaration"))
+    params = act.get("params") if isinstance(act.get("params"), dict) else {}
+    envs = params.get("env")
+    if isinstance(envs, list):
+        for env in envs:
+            if denied("env", env):
+                problems.append(("capability_not_declared",
+                                 f"action '{name}' reads env var {env!r}, outside the signed "
+                                 f"capability declaration"))
+    paths = params.get("paths")
+    if isinstance(paths, list):
+        for path in paths:
+            if isinstance(path, str) and _norm_cap_path(path) is None:
+                # Tripwire (see SPEC 15.1): the sender volunteers these params,
+                # but an outright-unsafe shape is rejected before matching.
+                problems.append(("capability_path_unsafe",
+                                 f"action '{name}' touches path {path!r}, which is rejected "
+                                 f"outright: capability paths must be relative and may not "
+                                 f"contain '..' segments or backslashes"))
+            elif denied("path", path):
+                problems.append(("capability_not_declared",
+                                 f"action '{name}' touches path {path!r}, outside the signed "
+                                 f"capability declaration"))
+    if params.get("network") is True and denied("network", None):
+        problems.append(("capability_not_declared",
+                         f"action '{name}' needs network egress, which is denied by default "
+                         f"(declare \"network\": true in the capability declaration)"))
+    return problems
+
+
+def _verify_topology(name: str, registry: dict | None, reasons: list) -> dict | None:
+    """Return the verified team topology, or None (reasons already failed).
+
+    Checks the registry defines it, its shape is sound, and its founder
+    signature verifies. The signature covers the name, version, roles, edges,
+    role capabilities and the role membership binding, so any topology change
+    requires re-signing."""
+    topos = registry.get("topologies") if isinstance(registry, dict) else None
+    topo = topos.get(name) if isinstance(topos, dict) else None
+    if not isinstance(topo, dict):
+        fail("invalid", "registry_malformed",
+             f"receiver policy names team topology '{name}', but the registry defines "
+             f"no such topology", reasons)
+        return None
+    problems = []
+    if not isinstance(topo.get("version"), str) or not topo["version"]:
+        problems.append("version must be a non-empty string")
+    roles = topo.get("roles")
+    if not isinstance(roles, list) or not roles \
+            or not all(isinstance(r, str) and r for r in roles):
+        problems.append("roles must be a non-empty list of non-empty strings")
+    edges = topo.get("edges")
+    if not isinstance(edges, list) or any(
+            not isinstance(e, list) or len(e) != 2
+            or not all(isinstance(x, str) and x for x in e) for e in edges):
+        problems.append("edges must be a list of [from_role, to_role] pairs")
+    elif isinstance(roles, list):
+        known = {r for r in roles if isinstance(r, str)}
+        bad = [e for e in edges if e[0] not in known or e[1] not in known]
+        if bad:
+            problems.append(f"edges name roles not in 'roles': {bad[:3]}")
+    rcaps = topo.get("role_capabilities", {})
+    if not isinstance(rcaps, dict):
+        problems.append("role_capabilities must be an object")
+    else:
+        for role, cap in rcaps.items():
+            for _code, msg in _capability_shape(cap, f"topology role_capabilities.{role}",
+                                                require_version=False):
+                problems.append(msg)
+            if isinstance(roles, list) and role not in roles:
+                problems.append(f"role_capabilities names unknown role '{role}'")
+    members = topo.get("members", {})
+    if not isinstance(members, dict):
+        problems.append("members must be an object mapping roles to lists of agent ids")
+    else:
+        for role, agents in members.items():
+            if not isinstance(role, str) or not role:
+                problems.append("members keys must be non-empty role names")
+                break
+            if not isinstance(agents, list) or not agents \
+                    or not all(isinstance(a, str) and a for a in agents):
+                problems.append(f"members[{role!r}] must be a non-empty list of agent ids")
+                break
+    if problems:
+        fail("invalid", "topology_malformed",
+             f"team topology '{name}' is malformed: {problems[0]}", reasons)
+        return None
+    if not isinstance(topo.get("signed_by"), str) or not isinstance(topo.get("sig"), str):
+        fail("invalid", "topology_signature_missing",
+             f"team topology '{name}' carries no founder signature; topology "
+             f"declarations must be signed", reasons)
+        return None
+    try:
+        sc = _crypto()
+    except ImportError as exc:
+        fail("invalid", "signature_unsupported",
+             f"synthe_crypto.py unusable: {exc}", reasons)
+        return None
+    signer = topo["signed_by"]
+    agent = (registry.get("agents", {}) or {}).get(signer) if isinstance(registry, dict) else None
+    if not isinstance(agent, dict) or agent.get("kind") != "human":
+        fail("invalid", "topology_signer_not_founder",
+             f"team topology '{name}' is signed by '{signer}', who is not a registered "
+             f"human founder; topologies must be signed by a founder", reasons)
+        return None
+    key = sc.find_key(registry, signer, topo.get("kid"))
+    if key is None:
+        fail("invalid", "topology_signature_invalid",
+             f"no Ed25519 key on record for topology signer '{signer}' "
+             f"(kid={topo.get('kid')})", reasons)
+        return None
+    try:
+        raw = sc.unb64u(topo["sig"])
+    except Exception:
+        raw = b""
+    if not sc.verify_bytes(key, sc.topology_signing_input(name, topo), raw):
+        fail("invalid", "topology_signature_invalid",
+             f"team topology '{name}' signature does not verify: the topology was changed "
+             f"after signing; re-sign it with a founder key", reasons)
+        return None
+    return topo
 
 
 def receiver_policy(registry: dict | None, receiver: str) -> dict | None:
@@ -533,6 +1303,9 @@ def receiver_policy(registry: dict | None, receiver: str) -> dict | None:
                     merged[k] = min(merged[k], v)
                 elif _is_number(merged[k]):
                     merged[k] = v  # a malformed layer is kept, so validation refuses it (fail closed)
+            elif k == "capability" and isinstance(v, dict):
+                # v0.6: a capability ceiling narrows like every other ceiling.
+                merged[k] = _merge_capability_ceiling(merged.get(k), v)
             else:
                 merged[k] = v
     return merged
@@ -625,6 +1398,14 @@ def _shape_errors(h: dict) -> list:
     str_list(auth.get("allowed_tools"), "authority.allowed_tools")
     str_list(auth.get("approval_required_for"), "authority.approval_required_for")
     str_list(acc.get("required_evidence"), "acceptance.required_evidence")
+    # v0.6: capability declaration and team roles (SPEC section 15)
+    if h.get("capability") is not None:
+        errs.extend(_capability_shape(h["capability"]))
+    for role_field in ("sender_role", "receiver_role"):
+        rv = h.get(role_field)
+        if rv is not None and (not isinstance(rv, str) or not rv):
+            errs.append((f"malformed:{role_field}",
+                         f"{role_field} must be a non-empty string"))
     for i, ref in enumerate(obj_list(inputs.get("artifact_refs"), "inputs.artifact_refs", ["path"])):
         if ref.get("sha256") is not None and not _is_sha256(ref.get("sha256")):
             errs.append((f"bad_sha256:inputs.artifact_refs[{i}]",
@@ -657,6 +1438,22 @@ def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
 
 
+# Functions this checker needs from synthe_crypto.py. An older copy next to a
+# newer checker must fail closed with a clear reason, not crash mid-check.
+_CRYPTO_REQUIRED = ("find_key", "usable_keys", "agent_kids", "kid_is_revoked",
+                    "topology_signing_input")
+
+
+def _crypto():
+    """Import synthe_crypto, or raise ImportError naming what is missing."""
+    import synthe_crypto as sc
+    missing = [name for name in _CRYPTO_REQUIRED if not hasattr(sc, name)]
+    if missing:
+        raise ImportError(f"synthe_crypto.py next to the checker is older than handoff_check.py "
+                          f"(missing {', '.join(missing)}); install matching versions")
+    return sc
+
+
 def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None,
                              policy: dict | None, reasons: list, info: dict) -> None:
     sig = packet.get("signature")
@@ -667,9 +1464,9 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
                  "receiver policy requires a signed packet; none present", reasons)
         return
     try:
-        import synthe_crypto as sc
-    except ImportError:
-        fail("invalid", "signature_unsupported", "synthe_crypto.py not found next to the checker", reasons)
+        sc = _crypto()
+    except ImportError as exc:
+        fail("invalid", "signature_unsupported", f"synthe_crypto.py unusable: {exc}", reasons)
         return
     if not isinstance(sig, dict) or not isinstance(sig.get("sig"), str):
         fail("invalid", "signature_malformed", "signature must be an object with a 'sig' string", reasons)
@@ -686,6 +1483,21 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
         fail("invalid", "signature_kid_required",
              f"'{signer}' has more than one key on record, so the signature must name its kid "
              f"(without one, a rotated-out key could still be picked)", reasons)
+        return
+    # Fail closed on a revoked kid even when the signature is otherwise valid.
+    ekid = sig.get("kid")
+    if ekid is None:
+        usable = sc.usable_keys(registry, signer)
+        ekid = usable[0] if len(usable) == 1 else None
+        if ekid is None:
+            # the only key(s) on record may all be revoked: still name the revocation
+            revoked = [k for k in sc.agent_kids(registry, signer)
+                       if sc.kid_is_revoked(registry, signer, k)]
+            ekid = revoked[0] if revoked else None
+    if ekid is not None and sc.kid_is_revoked(registry, signer, ekid):
+        fail("invalid", "signature_key_revoked",
+             f"packet signed with revoked key '{ekid}' of '{signer}': the revocation operator "
+             f"revoked this kid; rotate to a fresh key", reasons)
         return
     key = sc.find_key(registry, signer, sig.get("kid"))
     if key is None:
@@ -723,12 +1535,24 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
                          f"who is not a trusted approver for this receiver"))
         if appr.get("sig") is not None:
             ambiguous = False
+            revoked = False
             try:
                 import synthe_crypto as sc
                 # Ed25519 (passphrase key) or ES256 (Touch ID key): the registered key decides which.
                 ambiguous = (appr.get("kid") is None
                              and len(sc.usable_approval_keys(registry, appr.get("approver"))) > 1)
-                good = not ambiguous and sc.verify_approval(
+                # A revoked kid fails closed even when the signature verifies.
+                ekid = appr.get("kid")
+                if ekid is None:
+                    usable = sc.usable_approval_keys(registry, appr.get("approver"))
+                    ekid = usable[0] if len(usable) == 1 else None
+                    if ekid is None:
+                        revoked_all = [k for k in sc.agent_kids(registry, appr.get("approver"))
+                                       if sc.kid_is_revoked(registry, appr.get("approver"), k)]
+                        ekid = revoked_all[0] if revoked_all else None
+                revoked = (ekid is not None
+                           and sc.kid_is_revoked(registry, appr.get("approver"), ekid))
+                good = not ambiguous and not revoked and sc.verify_approval(
                     registry, appr.get("approver"), appr.get("kid"),
                     sc.approval_signing_input(appr, h), sc.unb64u(appr["sig"]))
             except Exception:
@@ -737,6 +1561,10 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
                 mine.append(("approval_kid_required",
                              f"approval for '{name}' names no kid, and approver "
                              f"'{appr.get('approver')}' has more than one key on record"))
+            elif revoked:
+                mine.append(("approval_key_revoked",
+                             f"approval for '{name}' is signed with revoked key '{ekid}' of approver "
+                             f"'{appr.get('approver')}': the revocation operator revoked this kid"))
             elif not good:
                 mine.append(("approval_signature_invalid",
                              f"approval for '{name}' carries a signature that does not verify "
@@ -784,7 +1612,9 @@ def _path_conflicts(ledger: dict, h: dict, key: str) -> list:
     if not mine:
         return out
     for other, entry in ledger.items():
-        if other == key or not isinstance(entry, dict) or entry_state(entry) != "RESERVED":
+        if other == key or _is_meta_key(other):
+            continue
+        if not isinstance(entry, dict) or entry_state(entry) != "RESERVED":
             continue
         if entry.get("to") not in (None, h.get("to")):
             continue
@@ -871,6 +1701,13 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
     for name in ("id", "idempotency_key", "trace_id", "from", "to", "purpose"):
         if not isinstance(h[name], str):
             fail("invalid", f"malformed:{name}", f"{name} must be a string", reasons)
+    # The "~" prefix is the reserved chain-metadata namespace ("~synthe"): no
+    # packet may claim it, or the header could be clobbered by an ACCEPT.
+    # ("_"-prefixed keys are ordinary idempotency keys; only "~" is reserved.)
+    if isinstance(h["idempotency_key"], str) and h["idempotency_key"].startswith("~"):
+        fail("invalid", "reserved_idempotency_key",
+             f"idempotency_key {h['idempotency_key']!r} starts with '~', which is reserved "
+             f"for ledger chain metadata ('{LEDGER_META_KEY}'); choose a different key", reasons)
     if as_receiver is not None and h.get("to") != as_receiver:
         fail("invalid", "receiver_mismatch",
              f"handoff is addressed to {h.get('to')!r}, not the authenticated receiver {as_receiver!r}", reasons)
@@ -912,6 +1749,17 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
         fail("invalid", "planned_actions_missing",
              "receiver policy requires planned_actions: authority cannot be checked "
              "against actions the sender did not declare", reasons)
+    # v0.6: capability declarations and team roles are optional unless the
+    # receiver's policy requires them (SPEC section 15).
+    if policy and policy.get("require_capability_declaration") and h.get("capability") is None:
+        fail("invalid", "capability_declaration_missing",
+             "receiver policy requires a signed capability declaration; the packet carries none",
+             reasons)
+    if policy and policy.get("require_topology") \
+            and (h.get("sender_role") is None or h.get("receiver_role") is None):
+        fail("invalid", "topology_declaration_missing",
+             "receiver policy requires sender_role and receiver_role; the packet declares "
+             "no team roles", reasons)
     if reasons:
         return False, reasons
 
@@ -994,6 +1842,74 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
     # 5. authority: planned actions vs tools / forbidden / approvals / budget,
     #    with the receiver policy as a ceiling the packet can only narrow.
     pol = policy or {}
+
+    # 5a. (v0.6) team topology (SPEC section 15): the (sender_role,
+    #     receiver_role) edge must be declared in the receiver's team topology,
+    #     whose founder signature is re-verified on every check. A receiver
+    #     role's declared capability narrows the packet further.
+    topo_name = pol.get("topology")
+    sender_role, receiver_role = h.get("sender_role"), h.get("receiver_role")
+    role_cap = None
+    if topo_name is not None and not isinstance(topo_name, str):
+        fail("invalid", "registry_malformed",
+             "receiver policy 'topology' must name a team topology (a string)", reasons)
+    elif topo_name is None and pol.get("require_topology"):
+        fail("invalid", "registry_malformed",
+             "receiver policy requires team topologies but names none: set the "
+             "'topology' policy key to a topology in the registry", reasons)
+    elif topo_name is not None:
+        topo = _verify_topology(topo_name, registry, reasons)
+        if topo is not None:
+            # Roles stay optional unless require_topology: with no roles the
+            # packet makes no routing claim, so there is no edge to verify.
+            if sender_role is not None or receiver_role is not None:
+                info["topology"] = topo_name
+                if [sender_role, receiver_role] not in topo.get("edges", []):
+                    fail("blocked", "topology_violation",
+                         f"handoff edge '{sender_role}' -> '{receiver_role}' is not in team "
+                         f"topology '{topo_name}'; handoffs on undeclared edges are rejected",
+                         reasons)
+                rcaps = topo.get("role_capabilities") or {}
+                if isinstance(receiver_role, str) and isinstance(rcaps.get(receiver_role), dict):
+                    role_cap = rcaps[receiver_role]
+                # v0.6.1: roles are bound to agent ids in the SIGNED topology
+                # (`members: {role: [agent ids]}`), because roles are otherwise
+                # sender-asserted labels: a sender could claim any role that
+                # has the edge they want. The packet's from/to (already
+                # signature-bound: the signer must equal `from`) must be
+                # members of the claimed roles. A topology with no binding for
+                # a claimed role fails closed: an unverifiable role claim is
+                # rejected, never silently passed.
+                members = topo.get("members") if isinstance(topo.get("members"), dict) else {}
+                for claimed, who, field in ((sender_role, h.get("from"), "sender_role"),
+                                            (receiver_role, h.get("to"), "receiver_role")):
+                    if isinstance(claimed, str) and who not in members.get(claimed, []):
+                        fail("blocked", "topology_role_unbound",
+                             f"handoff claims {field} '{claimed}' for agent '{who}', but "
+                             f"'{who}' is not bound to role '{claimed}' in team topology "
+                             f"'{topo_name}'; roles are bound to agent ids in the signed "
+                             f"topology, not asserted by the sender", reasons)
+    elif sender_role is not None or receiver_role is not None:
+        # The packet claims team roles but this receiver enforces no topology,
+        # so the edge cannot be verified: fail closed.
+        fail("blocked", "topology_violation",
+             "packet declares sender_role/receiver_role but this receiver's policy names "
+             "no team topology, so the handoff edge cannot be verified", reasons)
+
+    # 5b. (v0.6) capability ceiling (SPEC section 15): the packet's signed
+    #     declaration may only narrow what the receiver's policy allows.
+    packet_cap = h.get("capability")
+    pol_cap = pol.get("capability")
+    if pol_cap is not None:
+        shape = _capability_shape(pol_cap, "policy.capability", require_version=False)
+        if shape:
+            fail("invalid", "registry_malformed",
+                 f"receiver policy capability is malformed: {shape[0][1]}", reasons)
+            pol_cap = None
+    if isinstance(packet_cap, dict) and isinstance(pol_cap, dict):
+        for code, msg in _cap_within_ceiling(packet_cap, pol_cap):
+            fail("blocked", code, msg, reasons)
+
     forbidden = set(scope.get("forbidden", [])) | set(pol.get("forbidden", []))
     allowed = set(auth.get("allowed_tools", []))
     ceiling_tools = set(pol["allowed_tools"]) if "allowed_tools" in pol else None
@@ -1044,6 +1960,10 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
                 info.setdefault("approval_problems", {})[name] = [c for c, _ in problems]
             for code, msg in problems:
                 fail("blocked", code, msg, reasons)
+        # v0.6: the action's declared intent against the capability sources in
+        # force (packet declaration, receiver role capability, policy ceiling).
+        for code, msg in _action_capability_problems(name, act, packet_cap, role_cap, pol_cap):
+            fail("blocked", code, msg, reasons)
         for k in est:
             est[k] += float(act.get(f"est_{k}", 0) or 0)
     ceiling_budget = pol.get("budget") or {}
@@ -1134,6 +2054,8 @@ def _result(ok: bool, reasons: list, h: dict, info: dict) -> dict:
         out["defaults_applied"] = info["defaults_applied"]
     if info.get("signature") == "verified":
         out["signature"] = "verified"
+    if info.get("topology"):  # v0.6: the team topology that admitted this edge
+        out["topology"] = info["topology"]
     if info.get("approvals_deferred"):  # v0.5, only when the caller deferred them
         out["approvals_deferred"] = list(info["approvals_deferred"])
     return out
@@ -1164,7 +2086,7 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
         with LockedLedger(ledger_path) as locked:
             ledger = locked.ledger
             if ledger.get("_corrupt"):
-                return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+                return _ledger_seal_reject(ledger)
             ok, reasons = validate(packet, ledger=ledger, **kwargs)
             if not ok:
                 return _result(ok, reasons, h, info)
@@ -1204,7 +2126,7 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
             return out
     ledger = load_ledger(ledger_path) if ledger_path else {}
     if ledger.get("_corrupt"):
-        return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+        return _ledger_seal_reject(ledger)
     ok, reasons = validate(packet, ledger=ledger, **kwargs)
     return _result(ok, reasons, h, info)
 
@@ -1279,7 +2201,7 @@ def complete(packet, ledger_path: Path | None, claim_token: str | None = None,
     with LockedLedger(Path(ledger_path)) as locked:
         ledger = locked.ledger
         if ledger.get("_corrupt"):
-            return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+            return _ledger_seal_reject(ledger)
         entry = ledger.get(key)
         problem = _claim_problem(entry, h, claim_token, require_token)
         if problem:
@@ -1318,7 +2240,7 @@ def release(packet, ledger_path: Path | None, reserve_ttl_hours: float = 24.0,
     with LockedLedger(Path(ledger_path)) as locked:
         ledger = locked.ledger
         if ledger.get("_corrupt"):
-            return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+            return _ledger_seal_reject(ledger)
         entry = ledger.get(key)
         if not isinstance(entry, dict) or entry_state(entry) != "RESERVED":
             return _reject("invalid", "release_not_reserved",
@@ -1366,6 +2288,8 @@ def fenced(packet, ledger_path, claim_token: str, complete_on_success: bool = Tr
         raise FenceError(_reject("invalid", "missing_idempotency_key",
                                  "packet must contain a 'handoff' object with an idempotency_key"))
     with LockedLedger(Path(ledger_path)) as locked:
+        if locked.ledger.get("_corrupt"):
+            raise FenceError(_ledger_seal_reject(locked.ledger))
         entry = locked.ledger.get(h["idempotency_key"])
         problem = _claim_problem(entry, h, claim_token, require_token=True)
         if problem is None and entry_state(entry) != "RESERVED":
@@ -1400,7 +2324,7 @@ def fenced_effect(packet, ledger_path, claim_token: str, action: str, final_acti
                                  "packet must contain a 'handoff' object with an idempotency_key"))
     with LockedLedger(Path(ledger_path)) as locked:
         if locked.ledger.get("_corrupt"):
-            raise FenceError(_reject("invalid", "ledger_corrupt", "ledger file is not valid JSON"))
+            raise FenceError(_ledger_seal_reject(locked.ledger))
         entry = locked.ledger.get(h["idempotency_key"])
         problem = _claim_problem(entry, h, claim_token, require_token=True)
         if problem is None and entry_state(entry) != "RESERVED":
@@ -1430,12 +2354,150 @@ def fenced_effect(packet, ledger_path, claim_token: str, action: str, final_acti
         locked.dirty = True
 
 
+def init_ledger(path: Path):
+    """Operator command: ensure a sealed ledger chain exists at PATH.
+
+    Returns (ok, message). Missing file -> sealed genesis. Already sealed ->
+    idempotent no-op (the seal and anchor are verified first). Legacy
+    unsealed file -> adopted in place as a new genesis chain, entries
+    preserved, loudly logged (no manual migration step). Corrupt file, or an
+    out-of-cache anchor that forbids a fresh chain, -> refused: never
+    overwritten, never silently adopted.
+    """
+    path = Path(path)
+    if sqlite_ledger(path):
+        had_chain = False
+        if path.exists():
+            try:
+                conn = _sqlite_connect(path)
+                try:
+                    row = conn.execute("SELECT value FROM claims WHERE key = ?",
+                                       (LEDGER_META_KEY,)).fetchone()
+                finally:
+                    conn.close()
+                had_chain = bool(row and isinstance(json.loads(row[0]), dict)
+                                 and json.loads(row[0]).get("chain_head"))
+            except (OSError, sqlite3.DatabaseError, ValueError):
+                return False, f"refusing to initialize: ledger database at {path} is not readable"
+        with LockedLedger(path) as locked:
+            if locked.ledger.get("_corrupt"):
+                return (False,
+                        f"refusing to initialize: {locked.ledger.get('_corrupt_reason')}: "
+                        f"{locked.ledger.get('_corrupt_message')}")
+            locked.dirty = True  # persist the (possibly just adopted) seal
+        if had_chain:
+            return True, f"ledger already sealed at {path}; no-op"
+        return True, f"initialized sealed ledger chain at {path}"
+    existed = path.exists()
+    raw_sealed = False
+    if existed:
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return False, f"refusing to initialize: {path} is not valid JSON"
+        if not isinstance(raw, dict):
+            return False, f"refusing to initialize: {path} must contain a JSON object"
+        header = raw.get(LEDGER_META_KEY)
+        raw_sealed = isinstance(header, dict) and isinstance(header.get("chain_head"), str)
+    data = load_ledger(path)  # verifies seal + anchor, or adopts a legacy file
+    if data.get("_corrupt"):
+        return (False,
+                f"refusing to initialize: {data.get('_corrupt_reason')}: {data.get('_corrupt_message')}")
+    if raw_sealed:
+        seq = data[LEDGER_META_KEY]["chain_seq"]
+        return True, f"ledger already sealed at {path} (chain seq {seq}); no-op"
+    save_ledger(path, data)  # persists the genesis / adopted chain
+    n = len(_ledger_claims(data))
+    if existed:
+        return True, f"adopted {n} existing claim(s) at {path} into a new sealed chain"
+    return True, f"initialized new sealed ledger chain at {path} (genesis)"
+
+
+def ledger_head(path: Path) -> str:
+    """Return the "seq:head" anchor string for a sealed ledger, else "".
+
+    Used by the GitHub Action to publish the out-of-cache anchor. A missing,
+    unsealed, or corrupt ledger yields "" (nothing to anchor). The seal is
+    verified, but the anchor itself is NOT enforced here: publishing reads,
+    it does not gate.
+    """
+    path = Path(path)
+    try:
+        if sqlite_ledger(path):
+            if not path.exists():
+                return ""
+            conn = _sqlite_connect(path)
+            try:
+                rows = conn.execute("SELECT key, value FROM claims").fetchall()
+            finally:
+                conn.close()
+            data = {k: json.loads(v) for k, v in rows}
+        else:
+            if not path.exists():
+                return ""
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                return ""
+    except (OSError, ValueError, sqlite3.DatabaseError):
+        return ""
+    header = data.get(LEDGER_META_KEY)
+    if not isinstance(header, dict) or not isinstance(header.get("chain_head"), str):
+        return ""
+    ok, _code, _msg, header, _used_prev = verify_ledger_seal(data)
+    if not ok:
+        return ""
+    return f"{header['chain_seq']}:{header['chain_head']}"
+
+
 def exit_code(result: dict) -> int:
     return 0 if result.get("decision") in ("ACCEPT", "COMPLETED", "RELEASED") else 2
 
 
-def load_registry(path) -> tuple[dict | None, dict | None]:
-    """Return (registry, None) or (None, reject_result)."""
+GENESIS_PIN_FILENAME = "registry-genesis.key"
+GENESIS_PIN_ENV = "SYNTHE_REGISTRY_GENESIS_KEY"
+
+
+def resolve_genesis_pin(explicit=None):
+    """Return the configured genesis pin value, or None.
+
+    Precedence: explicit --registry-genesis-key flag > SYNTHE_REGISTRY_GENESIS_KEY
+    env var > registry-genesis.key file next to this checker file. The value is
+    either base64url of the 32-byte genesis Ed25519 public key or the 64-char
+    hex sha256 fingerprint of that key (parsed by synthe_crypto.genesis_pin_matches).
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get(GENESIS_PIN_ENV)
+    if env and env.strip():
+        return env
+    pin_file = Path(__file__).resolve().parent / GENESIS_PIN_FILENAME
+    try:
+        if pin_file.is_file():
+            return pin_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return None
+
+
+def load_registry(path, allow_unsigned=True, genesis_key=None) -> tuple[dict | None, dict | None]:
+    """Return (registry, None) or (None, reject_result).
+
+    The trust anchor is a genesis pin: the operator's genesis public key (or
+    its sha256 fingerprint) from --registry-genesis-key, the
+    SYNTHE_REGISTRY_GENESIS_KEY env var, or a registry-genesis.key file the
+    operator places next to the checker (nothing ships one).
+
+    - Pin configured: the registry MUST be signed, its rotation chain must
+      verify link by link back to the pinned genesis key, and the body
+      signature must verify under the chain's current key. Anything else
+      (unsigned, tampered, wrong genesis) fails closed with
+      registry_signature_invalid, whatever allow_unsigned says.
+    - No pin: a self-issued signature proves nothing, so the registry is
+      loaded as unsigned (today's behavior) unless allow_unsigned is False,
+      in which case it is rejected and the caller is told to pin a key.
+
+    The returned registry never contains the signature block itself.
+    """
     if not path:
         return None, None
     try:
@@ -1444,16 +2506,61 @@ def load_registry(path) -> tuple[dict | None, dict | None]:
         return None, _reject("invalid", "registry_unreadable", f"cannot read registry: {exc}")
     if not isinstance(reg, dict) or not isinstance(reg.get("agents", {}), dict):
         return None, _reject("invalid", "registry_malformed", "registry must be an object with an 'agents' object")
-    return reg, None
+    pin = resolve_genesis_pin(genesis_key)
+    if pin and pin.strip():
+        if "signature" not in reg:
+            return None, _reject(
+                "invalid", "registry_signature_invalid",
+                "a registry genesis key is pinned, so the registry must be signed, but it carries "
+                "no signature block: sign it with `synthe-sign sign-registry`")
+        try:
+            sc = _crypto()
+        except ImportError as exc:
+            return None, _reject("invalid", "registry_signature_invalid",
+                                 f"registry signature cannot be checked: {exc}")
+        ok, info = sc.verify_registry_signature(reg, genesis_pin=pin)
+        if not ok:
+            return None, _reject("invalid", "registry_signature_invalid",
+                                 f"registry signature rejected: {info}")
+        return {k: v for k, v in reg.items() if k != "signature"}, None
+    if not allow_unsigned:
+        return None, _reject(
+            "invalid", "registry_signature_invalid",
+            "a signed registry is required but no genesis key is pinned, so no signature can be "
+            "trusted: pin the operator's genesis key with --registry-genesis-key, the "
+            "SYNTHE_REGISTRY_GENESIS_KEY env var, or a registry-genesis.key file next to the checker")
+    return {k: v for k, v in reg.items() if k != "signature"}, None
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Handoff Contract validator (packet wire format v0.1; v0.2 claim ledger; "
                     "v0.3 receiver policy + signatures)")
-    ap.add_argument("packet", help="handoff packet JSON file")
+    ap.add_argument("packet", nargs="?",
+                    help="handoff packet JSON file (required unless --init-ledger or --ledger-head)")
     ap.add_argument("--registry", help="agent registry JSON (canonical ids, aliases, keys, policy)")
+    ap.add_argument("--require-signed-registry", action="store_true",
+                    help="refuse any registry that is not signed and verified against a pinned "
+                         "genesis key (needs --registry-genesis-key, SYNTHE_REGISTRY_GENESIS_KEY, "
+                         "or registry-genesis.key next to the checker)")
+    ap.add_argument("--registry-genesis-key",
+                    help="pin the registry's genesis operator key: base64url of the 32-byte "
+                         "Ed25519 public key, or its 64-char sha256 hex fingerprint. Overrides "
+                         "SYNTHE_REGISTRY_GENESIS_KEY and the registry-genesis.key file next to "
+                         "the checker. With a pin, the registry must be signed and verify back to "
+                         "this key. Without one, registries load unverified (a warning says so).")
     ap.add_argument("--ledger", help="idempotency ledger JSON file (created if absent)")
+    ap.add_argument("--init-ledger", metavar="PATH",
+                    help="operator: ensure a sealed ledger chain exists at PATH (missing -> sealed "
+                         "genesis; legacy unsealed -> adopted in place; already sealed -> no-op; "
+                         "corrupt or anchor-forbidden -> refused, never overwritten)")
+    ap.add_argument("--adopt-legacy", action="store_true",
+                    help="with --init-ledger: adopt an unsealed ledger as a new genesis chain even "
+                         "though SYNTHE_LEDGER_HMAC_KEY is set (only for a genuine pre-seal ledger)")
+    ap.add_argument("--ledger-head", metavar="PATH",
+                    help="print the 'seq:head' chain anchor for the ledger at PATH (empty when "
+                         "unsealed/missing/corrupt); used by the GitHub Action to publish the "
+                         "out-of-cache anchor")
     ap.add_argument("--workspace", help="workspace root for artifact existence/hash checks")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate only; do not record a RESERVED claim in the ledger")
@@ -1477,6 +2584,28 @@ def main(argv=None) -> int:
     ap.add_argument("--as-receiver", help="authenticated receiver identity; reject packets addressed elsewhere")
     args = ap.parse_args(argv)
 
+    if args.init_ledger:
+        saved = os.environ.get(LEDGER_ADOPT_LEGACY_ENV)
+        if args.adopt_legacy:
+            os.environ[LEDGER_ADOPT_LEGACY_ENV] = "1"
+        try:
+            ok, message = init_ledger(Path(args.init_ledger))
+        finally:
+            if saved is None:
+                os.environ.pop(LEDGER_ADOPT_LEGACY_ENV, None)
+            else:
+                os.environ[LEDGER_ADOPT_LEGACY_ENV] = saved
+        if ok:
+            print(message)
+            return 0
+        print(f"handoff_check: ERROR: {message}", file=sys.stderr)
+        return 2
+    if args.ledger_head:
+        print(ledger_head(Path(args.ledger_head)))
+        return 0
+    if not args.packet:
+        ap.error("the 'packet' argument is required (unless --init-ledger or --ledger-head)")
+
     try:
         packet = strict_loads(Path(args.packet).read_text())
     except StrictJSONError as exc:
@@ -1491,7 +2620,16 @@ def main(argv=None) -> int:
             result = release(packet, Path(args.ledger) if args.ledger else None,
                              reserve_ttl_hours=args.reserve_ttl_hours, force=args.force)
         else:
-            registry, err = load_registry(args.registry)
+            if args.registry and not (resolve_genesis_pin(args.registry_genesis_key) or "").strip() \
+                    and not args.require_signed_registry:
+                sys.stderr.write(
+                    "WARNING: no registry genesis key is pinned, so the agent registry is NOT "
+                    "verified: whoever can edit it decides who exists. Sign it with `synthe-sign "
+                    "sign-registry` and pin the key (--registry-genesis-key or "
+                    "SYNTHE_REGISTRY_GENESIS_KEY).\n")
+            registry, err = load_registry(args.registry,
+                                          allow_unsigned=not args.require_signed_registry,
+                                          genesis_key=args.registry_genesis_key)
             result = err or check(
                 packet, registry=registry,
                 ledger_path=Path(args.ledger) if args.ledger else None,

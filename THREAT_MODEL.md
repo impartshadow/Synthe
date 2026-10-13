@@ -23,7 +23,7 @@ UX guards, not the credential wall. The new Linux setup path still needs a clean
 | Registry (agents, keys, receiver policy) | `registry.json` | **Root of trust.** Whoever can edit it decides who exists and what's allowed |
 | Human approver keys | passphrase-sealed file, or Secure Enclave with a 0600 public metadata/handle file | Attacker who can use one can approve any gated action |
 | Agent signing keys | key files; custodial in the lab | Attacker can send handoffs as that agent |
-| Ledger | `ledger.json` (Action: `actions/cache`) | Deleting or resetting it re-enables duplicates |
+| Ledger | `ledger.json` (Action: `actions/cache` + `SYNTHE_LEDGER_ANCHOR` repo variable) | Deleting or resetting it re-enables duplicates -- unless the out-of-cache anchor is configured, in which case rollback/deletion fails closed |
 | Workspace bytes | `--workspace` root | Pins detect changes; they can't stop a changed file being read later |
 | Broker key and remote credentials | the broker's own user (`/var/db/synthe`, `/var/lib/synthe`) or container volume, 0600 | Sign receipts; push anywhere the token can |
 
@@ -38,6 +38,10 @@ UX guards, not the credential wall. The new Linux setup path still needs a clean
 | Forged or typed-in approval | approvals must carry a valid Ed25519 or ES256 signature from a registered, trusted approver key | `approval_unsigned`, `approval_signature_invalid`, `approver_not_trusted` |
 | Approval replayed onto another handoff | signature binds `idempotency_key`, `from`, `to` | `approval_signature_invalid` |
 | Same work executed twice | ledger claim (RESERVED → COMPLETED, file lock) | `duplicate_idempotency_key`, `idempotency_key_reserved` |
+| Stale cache restores an older ledger (rollback) | HMAC-sealed hash chain + monotonic seq checked against the out-of-cache anchor (repo variable) | `ledger_rollback` |
+| Forged or swapped-in ledger file | chain seal (HMAC when `SYNTHE_LEDGER_HMAC_KEY` is set); unsealed file under an anchor refused as downgrade | `ledger_corrupt`, `ledger_rollback` |
+| Ledger file deleted / total cache eviction | anchor expects the chain to continue; missing file fails closed | `ledger_rollback` (recover with one `ledger-bootstrap` run) |
+| Anchor unavailable when required | fail closed rather than run unanchored | `ledger_anchor_unavailable` |
 | Someone else closes your claim | completion bound to the packet digest + claim token (MCP) / connector identity (lab) | `completion_packet_mismatch`, `claim_token_invalid`, `claim_token_required` |
 | Slow receiver acts after its claim was released and redispatched | fencing epoch + `fenced()` execution boundary (model-checked, `formal/`) | `claim_token_invalid`, `completion_unknown_key` |
 | Stale or swapped inputs | SHA-256 pins against the workspace | `artifact_hash_mismatch`, `evidence_hash_mismatch` |
@@ -237,10 +241,35 @@ Content proposals are not delegated yet (they wait for a human).
    budgets are checked *before* the work. Nothing yet verifies what actually
    happened (roadmap: verify the diff on `--complete`). Budgets are checked on
    the sender's *estimates*, so a lying `est_usd` passes.
-4. **Whoever controls the registry.** It's an unsigned JSON file today. Signed
-   registry is a Phase 2 item, and should come early.
-5. **Leaked or usable keys.** There's no revocation yet. Rotate by adding a new `kid` and removing the
-   old one. Approver keys can be sealed under a passphrase (`synthe-sign keygen --encrypt`,
+4. **Whoever controls the registry file but not the operator key** (once a
+   genesis key is pinned). The registry can carry an Ed25519 operator
+   signature over its body, and operator-key rotation is a verifiable chain
+   (each new key is attested by the key it replaces; `synthe-sign
+   sign-registry` / `synthe-sign rotate-registry-key`). The trust anchor is a
+   genesis pin: the operator's genesis public key (or its sha256 fingerprint)
+   from `--registry-genesis-key`, `SYNTHE_REGISTRY_GENESIS_KEY`, or a
+   `registry-genesis.key` file the operator places next to the checker. With
+   a pin, every caller (the CLI and the broker, commit broker, MCP and A2A
+   daemons) requires a signed registry whose chain leads back to the pinned
+   key, and fails closed with `registry_signature_invalid` otherwise. Honest
+   limits: (a) with no pin configured, which is the default, the registry is
+   NOT verified (a self-issued signature proves nothing), so whoever can edit
+   it decides who exists; the CLI warns, and `--require-signed-registry`
+   turns that into a rejection; (b) the pin is trust-on-first-use: it must
+   reach the checker out of band, and whoever provisions it decides which
+   operator is trusted. Nothing in this repo ships a pin;
+   `examples/registry-genesis.pub` is the throwaway example key, for trying
+   the examples only.
+5. **Leaked or usable keys.** A leaked key is revoked, not just rotated out: the
+   registry's `revocation` section lists revoked (agent, kid) pairs, each record
+   signed by a designated revocation operator key, and every signature verification
+   (packets, approvals, broker receipts) fails closed on a revoked key
+   (`docs/KEY_REVOCATION.md`; `synthe-sign revoke-kid`). Rotating the operator
+   key retires its public key into `revocation.past_operators` (verify-only;
+   `synthe-sign rotate-operator`), so past revocations keep enforcing — a
+   rotation never un-revokes (and a hand-edited rotation still doesn't: records whose signer is gone keep enforcing and are reported). Deleting a revocation record from the file
+   (rollback) stays undetected until the registry is signed and pinned per
+   the signed-registry item (item 4). Approver keys can be sealed under a passphrase (`synthe-sign keygen --encrypt`,
    `synthe-sign protect`; scrypt + AES-256-GCM), unlocked only at a terminal; `synthe-approve` and
    `synthe-init` refuse plaintext approver keys. On supported Macs, Touch ID keeps an ES256 approval
    key in the Secure Enclave, but a compromised same-user process can still cause a biometric prompt.
@@ -258,6 +287,14 @@ Content proposals are not delegated yet (they wait for a human).
 9. **Effects outside `fenced()`.** The fencing guarantee covers only effects executed
    through it. A receiver that acts on a stale ACCEPT without the fence can still
    double-act after a release (`formal/README.md`, trace 2).
-10. **Ledger durability on CI.** `actions/cache` can be evicted. Fine for demos,
-   not an exactly-once store.
+10. **Ledger durability on CI.** `actions/cache` can be evicted. The v0.6 integrity
+   binding narrows this: every ledger write is HMAC-sealed into a hash chain, and the
+   Action keeps an out-of-cache anchor (the `SYNTHE_LEDGER_ANCHOR` repository variable)
+   that the restored ledger must match or extend -- so a stale restore, a forged file,
+   or a deleted ledger fails closed instead of silently resetting duplicate protection.
+   What remains: a *total* cache eviction still needs one deliberate `ledger-bootstrap`
+   run (documented in `github-action/README.md`); without the HMAC secret the seal is
+   tamper-evident, not tamper-proof; and two runs that restore the same snapshot still
+   need the `concurrency` group -- the anchor *detects* the divergence after the fact
+   (`ledger_diverged`) but cannot serialize the writers.
 

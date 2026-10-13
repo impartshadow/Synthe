@@ -183,6 +183,7 @@ def test_cli_keygen_approve_sign_verify(tmp_path):
         r["agents"][who]["keys"] = [entry]
         (tmp_path / "reg.json").write_text(json.dumps(r))
     r = reg()
+    r.pop("signature", None)  # hand-built unsigned fixture (no genesis pin: loads unverified)
     for who in ("cora", "rohan"):
         k = json.loads((tmp_path / f"{who}.json").read_text())
         r["agents"][who]["keys"] = [{"kid": k["kid"], "alg": "Ed25519", "public_key": sc.b64u(
@@ -200,7 +201,8 @@ def test_cli_keygen_approve_sign_verify(tmp_path):
                         tmp_path / "reg.json"], capture_output=True, text=True)
     assert v.returncode == 0, v.stdout
     res = subprocess.run([py, src / "handoff_check.py", tmp_path / "p.json", "--registry", tmp_path / "reg.json",
-                          "--workspace", V3 / "workspace", "--dry-run"], capture_output=True, text=True)
+                          "--workspace", V3 / "workspace", "--dry-run"],
+                         capture_output=True, text=True)
     assert json.loads(res.stdout)["decision"] == "ACCEPT", res.stdout
 
 

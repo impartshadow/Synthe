@@ -12,6 +12,17 @@
   sign     PACKET --key KEYFILE [--out FILE]
            Sender signs the handoff object. Signs exactly what the receiver
            will verify; any later edit to the handoff breaks the signature.
+  sign-registry    --registry REG.json --key OPKEY.json [--kid KID] [--out FILE] [--force]
+           Sign a registry with an operator key (genesis-sign, or re-sign after
+           editing the body; the rotation chain is preserved). --force re-signs
+           after a legitimate body edit (the stale body signature is not
+           verified; the chain still is). Defaults to signing the registry
+           file in place.
+  rotate-registry-key --registry REG.json --old-key OLD.json --new-key NEW.json
+           [--new-kid KID] [--out FILE]
+           The rotation ceremony: the current operator key attests the new key,
+           extending the verifiable chain; the body is re-signed by the new key.
+           Defaults to updating the registry file in place.
   approve  PACKET --key KEYFILE --action NAME [--expires-at TS] [--out FILE] [--detached]
            An approver (human or agent) signs an approval bound to this
            handoff's idempotency key, sender and receiver, and appends it to
@@ -25,11 +36,34 @@
            effect executor to receive later (v0.5).
   verify   PACKET --registry REGISTRY
            Check the packet signature and every signed approval; prints a
-           report. (Full validation is handoff_check.py's job.)
+           report. (Full validation is handoff_check.py's job.) A signature
+           from a revoked kid reports REVOKED and fails, even if it verifies.
+  revoke-kid --registry REGISTRY --agent ID --kid KID --operator-key KEYFILE
+           [--reason TEXT] [--revoked-at TS] [--out FILE]
+           The revocation operator signs a revocation record for one (agent,
+           kid) and appends it to the registry's revocation list. From then
+           on every signature verification fails closed on that key. The
+           operator key file must belong to the registry's designated
+           revocation operator (designated on first use). Refuses when the
+           kid is not on record, so a typo can't silently leave the leaked
+           key valid. Revocation is scoped to (agent, kid): another agent's
+           key with the same kid string is unaffected.
+  rotate-operator --registry REGISTRY --operator-key OLDKEYFILE
+           --new-operator-key NEWKEYFILE [--reason TEXT] [--out FILE]
+           Retire the designated revocation operator key and designate a new
+           one. The old public key is kept in revocation.past_operators
+           (verify-only), so revocation records it signed keep
+           authenticating: a routine rotation never un-revokes anything.
+  revocations --registry REGISTRY
+           List the designated operator, retired operator keys, the
+           authenticated revocations, and any revocation records that fail
+           authentication (forged or malformed: they revoke nothing, but
+           the operator should know).
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import sys
@@ -215,6 +249,17 @@ def sign_packet(packet: dict, key: dict) -> dict:
     return packet
 
 
+def sign_topology(name: str, topo: dict, key: dict) -> dict:
+    """Sign a team topology declaration (SPEC section 15) with a founder key.
+    The signature covers the name, version, roles, edges, role capabilities
+    and members, so any change to the topology requires re-signing. Returns
+    the topology object with `signed_by`, `kid` and `sig` attached."""
+    sig = sc.sign_bytes(key["_secret"], sc.topology_signing_input(name, topo))
+    topo = {k: v for k, v in topo.items() if k not in ("signed_by", "kid", "sig")}
+    topo.update(signed_by=key["agent"], kid=key["kid"], sig=sc.b64u(sig))
+    return topo
+
+
 def planned_params(h: dict, action: str):
     """The `params` of the planned action named (or using tool) `action`."""
     for act in h.get("planned_actions") or []:
@@ -292,6 +337,63 @@ def cmd_approve(a) -> int:
     return 0
 
 
+def cmd_sign_registry(a) -> int:
+    """Sign a registry file with an operator key. An unsigned registry gets a
+    genesis signature (a self-issued chain of length 1). An already-signed
+    registry is verified first, then re-signed with the same operator key,
+    preserving the rotation chain (use this after editing the body)."""
+    key = load_key(a.key)
+    reg = _load(a.registry)
+    try:
+        if isinstance(reg.get("signature"), dict):
+            kid = reg["signature"].get("kid")
+            if a.kid and a.kid != kid:
+                sys.stderr.write(f"note: ignoring --kid {a.kid!r}: re-sign keeps the chain's "
+                                 f"current kid {kid!r}\n")
+            ok, info = sc.verify_registry_signature(reg)
+            if not ok and not a.force:
+                sys.stderr.write(f"refusing to sign: current registry signature invalid: {info}\n"
+                                 f"  (If you edited the body legitimately, re-run with --force.)\n")
+                return 2
+            signed = sc.resign_registry(reg, key["_secret"], kid, force=a.force)
+            sys.stderr.write(f"re-signed registry with operator key {kid!r} "
+                             f"(chain length {len(signed['signature']['chain'])} preserved)"
+                             f"{' --force: prior body signature not verified' if a.force and not ok else ''}\n")
+        else:
+            kid = a.kid or key.get("kid") or "op-1"
+            signed = sc.sign_registry(reg, key["_secret"], kid)
+            sys.stderr.write(f"signed registry with new operator key {kid!r} (genesis chain)\n"
+                             f"  public key: {sc.b64u(sc.public_key(key['_secret']))}\n"
+                             f"  Distribute this public key to verifiers out of band.\n")
+    except ValueError as exc:
+        sys.stderr.write(f"sign-registry failed: {exc}\n")
+        return 2
+    _write(signed, a.out)
+    return 0
+
+
+def cmd_rotate_registry_key(a) -> int:
+    """The operator-key rotation ceremony: the current operator key attests the
+    new key, the attestation extends the chain, and the body is re-signed by the
+    new key. The existing chain and body signature are verified first."""
+    old = load_key(a.old_key)
+    new = load_key(a.new_key)
+    new_kid = a.new_kid or new.get("kid") or "op-2"
+    reg = _load(a.registry)
+    try:
+        rotated = sc.rotate_registry_key(reg, old["_secret"], new["_secret"], new_kid)
+    except ValueError as exc:
+        sys.stderr.write(f"rotation failed: {exc}\n")
+        return 2
+    chain = rotated["signature"]["chain"]
+    sys.stderr.write(f"rotated registry operator key to {new_kid!r} "
+                     f"(chain length {len(chain)}; supersedes {chain[-1]['supersedes']!r})\n")
+    for e in chain:
+        sys.stderr.write(f"  seq {e['seq']}: {e['kid']!r} {sc.b64u(sc.unb64u(e['public_key'])[:8])}...\n")
+    _write(rotated, a.out)
+    return 0
+
+
 def cmd_verify(a) -> int:
     packet, registry = _load(a.packet), _load(a.registry)
     h = packet.get("handoff", {})
@@ -299,22 +401,169 @@ def cmd_verify(a) -> int:
     ok = True
     sig = packet.get("signature")
     if isinstance(sig, dict):
-        key = sc.find_key(registry, sig.get("signer"), sig.get("kid"))
+        revoked = (sig.get("kid") is not None
+                   and sc.kid_is_revoked(registry, sig.get("signer"), sig.get("kid")))
+        key = None if revoked else sc.find_key(registry, sig.get("signer"), sig.get("kid"))
         good = (key is not None and sig.get("signer") == h.get("from")
                 and sc.verify_bytes(key, sc.packet_signing_input(h), sc.unb64u(sig.get("sig", ""))))
-        report["packet_signature"] = "verified" if good else "INVALID"
-        ok &= good
+        report["packet_signature"] = "REVOKED" if revoked else ("verified" if good else "INVALID")
+        ok &= good and not revoked
     for appr in (h.get("authority", {}) or {}).get("approvals", []) or []:
         if appr.get("sig") is None:
             report["approvals"].append({"action": appr.get("action"), "status": "unsigned"})
             continue
-        good = sc.verify_approval(registry, appr.get("approver"), appr.get("kid"),
-                                  sc.approval_signing_input(appr, h), sc.unb64u(appr["sig"]))
+        revoked = (appr.get("kid") is not None
+                   and sc.kid_is_revoked(registry, appr.get("approver"), appr.get("kid")))
+        good = (not revoked and sc.verify_approval(registry, appr.get("approver"), appr.get("kid"),
+                                  sc.approval_signing_input(appr, h), sc.unb64u(appr["sig"])))
         report["approvals"].append({"action": appr.get("action"), "approver": appr.get("approver"),
-                                    "status": "verified" if good else "INVALID"})
-        ok &= good
+                                    "status": "REVOKED" if revoked else ("verified" if good else "INVALID")})
+        ok &= good and not revoked
+    problems = sc.revocation_problems(registry)
+    if problems:
+        report["revocation_problems"] = problems
     print(json.dumps(report, indent=2))
-    return 0 if ok else 2
+    return 0 if ok and not problems else 2
+
+
+def _write_registry_atomic(path: str, registry: dict) -> None:
+    """Write the registry back atomically (tmp file + rename), so a crash
+    mid-write can't leave half a revocation list."""
+    target = Path(path)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(registry, indent=2) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+
+
+def cmd_revoke_kid(a) -> int:
+    registry = _load(a.registry)
+    if not isinstance(registry, dict) or not isinstance(registry.get("agents"), dict):
+        raise SystemExit("registry must be a JSON object with an 'agents' object")
+    opkey = load_key(a.operator_key)
+    op_agent, op_kid = opkey.get("agent"), opkey.get("kid")
+    if not op_agent or not op_kid:
+        raise SystemExit("operator key file must name its agent and kid")
+    sec = registry.get("revocation")
+    if sec is None:
+        sec = registry["revocation"] = {}
+    if not isinstance(sec, dict):
+        raise SystemExit("registry 'revocation' section is malformed")
+    designated = sec.get("operator")
+    if not isinstance(designated, dict) or not designated.get("agent"):
+        sec["operator"] = {"agent": op_agent, "kid": op_kid}
+        print(f"# no revocation operator was designated: designating {op_agent} / {op_kid}. "
+              f"Guard this key: whoever holds it can revoke any kid.",
+              file=sys.stderr)
+    elif designated.get("agent") != op_agent or designated.get("kid") != op_kid:
+        raise SystemExit(f"this key ({op_agent} / {op_kid}) is not the designated revocation "
+                         f"operator ({designated.get('agent')} / {designated.get('kid')}): refusing")
+    # Fail closed at issuance: a revoked operator key cannot sign new revocations.
+    if sc.kid_is_revoked(registry, op_agent, op_kid):
+        raise SystemExit(f"operator key '{op_kid}' of '{op_agent}' is itself revoked: rotate the "
+                         f"operator with `synthe-sign rotate-operator` before issuing revocations")
+    # The kid must actually be on record: a typo'd kid must not silently leave
+    # the leaked key valid while the operator believes it revoked.
+    entry = registry["agents"].get(a.agent) or {}
+    kids = [k.get("kid") for k in entry.get("keys", []) or [] if isinstance(k, dict)]
+    if a.kid not in kids:
+        raise SystemExit(f"no key '{a.kid}' registered for agent '{a.agent}' "
+                         f"(registered kids: {kids or 'none'}): refusing")
+    if sc.kid_is_revoked(registry, a.agent, a.kid):
+        print(f"# key '{a.kid}' of '{a.agent}' is already revoked: nothing to do", file=sys.stderr)
+        return 0
+    revoked_at = a.revoked_at or dt.datetime.now(dt.timezone.utc).isoformat()
+    record = sc.sign_revocation(
+        sc.make_revocation(a.agent, a.kid, revoked_at, a.reason or "", op_kid),
+        opkey["_secret"])
+    recs = sec.get("revoked_kids")
+    if not isinstance(recs, list):
+        recs = sec["revoked_kids"] = []
+    # Replace any earlier entry for the same (agent, kid) (e.g. an
+    # unauthenticated one someone wrote by hand); the new operator-signed
+    # record is authoritative. A different agent's same kid string is a
+    # different key and is left alone.
+    recs[:] = [r for r in recs
+               if not (isinstance(r, dict) and r.get("kid") == a.kid
+                       and r.get("agent") == a.agent)] + [record]
+    _write_registry_atomic(a.out or a.registry, registry)
+    print(f"# revoked kid '{a.kid}' of '{a.agent}' (operator {op_agent} / {op_kid})",
+          file=sys.stderr)
+    _write(record, None)
+    return 0
+
+
+def cmd_revocations(a) -> int:
+    registry = _load(a.registry)
+    report = {"operator": sc.revocation_operator(registry),
+              "past_operators": sc.revocation_past_operators(registry),
+              "revoked_kids": sc.authenticated_revocations(registry),
+              "problems": sc.revocation_problems(registry)}
+    print(json.dumps(report, indent=2))
+    return 0 if not report["problems"] else 2
+
+
+def cmd_rotate_operator(a) -> int:
+    """Retire the designated revocation operator key and designate a new one.
+
+    The old public key is kept in revocation.past_operators (verify-only),
+    so revocation records it signed keep authenticating: a routine rotation
+    must never un-revoke anything. The new key must be a registered Ed25519
+    key that is not itself revoked."""
+    registry = _load(a.registry)
+    if not isinstance(registry, dict) or not isinstance(registry.get("agents"), dict):
+        raise SystemExit("registry must be a JSON object with an 'agents' object")
+    oldkey = load_key(a.operator_key)
+    newkey = load_key(a.new_operator_key)
+    old_agent, old_kid = oldkey.get("agent"), oldkey.get("kid")
+    new_agent, new_kid = newkey.get("agent"), newkey.get("kid")
+    if not old_agent or not old_kid:
+        raise SystemExit("old operator key file must name its agent and kid")
+    if not new_agent or not new_kid:
+        raise SystemExit("new operator key file must name its agent and kid")
+    if (old_agent, old_kid) == (new_agent, new_kid):
+        raise SystemExit("old and new operator keys are the same: nothing to rotate")
+    sec = registry.get("revocation")
+    if not isinstance(sec, dict):
+        raise SystemExit("registry has no 'revocation' section to rotate")
+    designated = sec.get("operator")
+    if (not isinstance(designated, dict)
+            or designated.get("agent") != old_agent or designated.get("kid") != old_kid):
+        raise SystemExit(f"key ({old_agent} / {old_kid}) is not the designated revocation "
+                         f"operator ({(designated or {}).get('agent')} / "
+                         f"{(designated or {}).get('kid')}): refusing")
+    # The new key must be on record as a usable Ed25519 key, and not revoked.
+    _, new_raw = sc._raw_find_key_with_kid(registry, new_agent, new_kid)
+    if new_raw is None:
+        raise SystemExit(f"new operator key '{new_kid}' is not a registered Ed25519 key of "
+                         f"agent '{new_agent}': register it first, then rotate")
+    if sc.kid_is_revoked(registry, new_agent, new_kid):
+        raise SystemExit(f"new operator key '{new_kid}' of '{new_agent}' is revoked: refusing")
+    # Retire the old public key into past_operators (verify-only for old
+    # records). Prefer the registry's copy; fall back to the key file.
+    _, old_raw = sc._raw_find_key_with_kid(registry, old_agent, old_kid)
+    if old_raw is None:
+        old_raw = sc.public_key(oldkey["_secret"])
+    past = sec.get("past_operators")
+    if not isinstance(past, list):
+        past = sec["past_operators"] = []
+    if not any(isinstance(o, dict) and o.get("kid") == old_kid for o in past):
+        past.append({
+            "agent": old_agent, "kid": old_kid,
+            "public_key": sc.b64u(old_raw),
+            "retired_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "reason": a.reason or "operator key rotation",
+        })
+    sec["operator"] = {"agent": new_agent, "kid": new_kid}
+    _write_registry_atomic(a.out or a.registry, registry)
+    print(f"# rotated revocation operator: {old_agent} / {old_kid} -> "
+          f"{new_agent} / {new_kid}; old public key kept in "
+          f"revocation.past_operators so past revocations keep verifying",
+          file=sys.stderr)
+    return 0
 
 
 def main(argv=None) -> int:
@@ -348,9 +597,51 @@ def main(argv=None) -> int:
     v = sub.add_parser("verify")
     v.add_argument("packet")
     v.add_argument("--registry", required=True)
+    r = sub.add_parser("revoke-kid", help="operator: revoke one registered kid")
+    r.add_argument("--registry", required=True, help="registry JSON file (updated in place)")
+    r.add_argument("--agent", required=True, help="agent that owns the kid")
+    r.add_argument("--kid", required=True, help="kid to revoke")
+    r.add_argument("--operator-key", required=True, help="the revocation operator's key file")
+    r.add_argument("--reason", default="", help="why the key is revoked (audit trail)")
+    r.add_argument("--revoked-at", help="ISO-8601 timestamp (default: now, UTC)")
+    r.add_argument("--out", help="write the updated registry here instead of in place")
+    l = sub.add_parser("revocations", help="list the revocation operator and authenticated revocations")
+    l.add_argument("--registry", required=True)
+    ro = sub.add_parser("rotate-operator",
+                        help="operator: retire the designated revocation key and designate a new one")
+    ro.add_argument("--registry", required=True, help="registry JSON file (updated in place)")
+    ro.add_argument("--operator-key", required=True,
+                    help="the CURRENT designated revocation operator's key file")
+    ro.add_argument("--new-operator-key", required=True,
+                    help="the new operator's key file (must be a registered, unrevoked Ed25519 key)")
+    ro.add_argument("--reason", default="", help="why the operator key is being rotated (audit trail)")
+    ro.add_argument("--out", help="write the updated registry here instead of in place")
+    sr = sub.add_parser("sign-registry",
+                        help="sign a registry file with an operator key (genesis-sign or re-sign)")
+    sr.add_argument("--registry", required=True, help="registry JSON file to sign")
+    sr.add_argument("--key", required=True, help="operator key file (synthe-sign keygen output)")
+    sr.add_argument("--kid", help="operator key id (default: the key file's kid, else 'op-1')")
+    sr.add_argument("--force", action="store_true",
+                    help="re-sign after a legitimate body edit: skip verification of the "
+                         "stale body signature (the rotation chain is still verified)")
+    sr.add_argument("--out", help="write the signed registry here (default: overwrite --registry)")
+    rr = sub.add_parser("rotate-registry-key",
+                        help="rotate the registry operator key: old key attests the new key")
+    rr.add_argument("--registry", required=True, help="signed registry JSON file")
+    rr.add_argument("--old-key", required=True, help="current operator key file")
+    rr.add_argument("--new-key", required=True, help="new operator key file")
+    rr.add_argument("--new-kid", help="key id for the new operator key (default: key file's kid, else 'op-2')")
+    rr.add_argument("--out", help="write the rotated registry here (default: overwrite --registry)")
     a = ap.parse_args(argv)
+    if a.cmd == "sign-registry" and not a.out:
+        a.out = a.registry
+    if a.cmd == "rotate-registry-key" and not a.out:
+        a.out = a.registry
     return {"keygen": cmd_keygen, "sign": cmd_sign, "approve": cmd_approve,
-            "verify": cmd_verify, "protect": cmd_protect}[a.cmd](a)
+            "verify": cmd_verify, "protect": cmd_protect, "revoke-kid": cmd_revoke_kid,
+            "revocations": cmd_revocations, "rotate-operator": cmd_rotate_operator,
+            "sign-registry": cmd_sign_registry,
+            "rotate-registry-key": cmd_rotate_registry_key}[a.cmd](a)
 
 
 if __name__ == "__main__":
