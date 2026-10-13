@@ -95,7 +95,7 @@
     "sig": "OSBLvx7P1Utsvvvvy67vT46s8lE0MsKRAoXedrpgZcf391XdhdZQtmC9JQZaF4zY60EFj9tkdNiDNKN_KaUcDA"
    }
   },
-  "claim_token": null
+  "claim_token": "ct_v073_expiry_dependency_unknown"
  },
  "registry": {
   "agents": {
@@ -194,7 +194,8 @@
    "to": "builder",
    "depends_on": [
     "k-never-claimed"
-   ]
+   ],
+   "claim_token_sha256": "68a96138a57aa06d96d55e9cdc1759c8968bb1bc75f8a7e6f328c742b40b5101"
   }
  }
 }

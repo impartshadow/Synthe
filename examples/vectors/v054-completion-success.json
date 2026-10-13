@@ -1,6 +1,6 @@
 {
  "name": "completion-success",
- "description": "Complete with matching packet and ledger.",
+ "description": "Complete with matching packet, ledger, and the claim token the ACCEPT returned.",
  "entry": "complete",
  "packet": {
   "packet": {
@@ -92,7 +92,7 @@
     "sig": "1yvFZrxu8fDMl2CJAl8yC8_DE-OvT4NYRqTD6exkf1LeO5fHd76ruyhC2TfWK1ogQ4uCCbPCI8V4Ii1nK4hvBg"
    }
   },
-  "claim_token": null
+  "claim_token": "ct_v054_completion_success_token"
  },
  "registry": {
   "agents": {
@@ -186,6 +186,7 @@
    "state": "RESERVED",
    "handoff_id": "h-k-complete-1",
    "packet_sha256": "b238895bda4f8942ea57bdd48576445f77d5a1a91fc434aea05e53f5cbaff8a4",
+   "claim_token_sha256": "256ba4d3bfb8642782c60edcaa62079c1872e8d6f0277a48e3c8e42187cc255b",
    "to": "builder"
   }
  }

@@ -249,7 +249,12 @@ Content proposals are not delegated yet (they wait for a human).
 7. **Meaningless content.** The checker validates structure. A packet whose
    `purpose` is `"<one sentence>"` is structurally valid. (The lab refuses unfilled
    template placeholders; the core checker doesn't judge text.)
-8. **`state_revision`** is required but not yet compared against anything.
+8. ~~**`state_revision`** is required but not yet compared against anything.~~
+   **Resolved:** demoted to optional, informational-only (`schema`,
+   `handoff_check.py`, SPEC.md section 2). A required-but-unchecked field
+   trains senders to ignore required fields; no sound checkable meaning
+   exists within the checker's trust boundary, so ordering across handoffs
+   is handled by `depends_on` instead.
 9. **Effects outside `fenced()`.** The fencing guarantee covers only effects executed
    through it. A receiver that acts on a stale ACCEPT without the fence can still
    double-act after a release (`formal/README.md`, trace 2).
