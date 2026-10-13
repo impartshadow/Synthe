@@ -113,9 +113,11 @@ keeps an **out-of-cache anchor** -- the `SYNTHE_LEDGER_ANCHOR` repository
 variable holding the last published `"seq:head"` -- that the restored ledger
 must match or extend:
 
-1. **Fetch anchor** (new step, before the phase): reads the repository
-   variable via the API. A 404 means no anchor was ever published (first run):
-   the checker seals a genesis chain. Any other fetch failure fails the
+1. **Fetch anchor** (new step, before the phase): takes the anchor from the
+   `ledger-anchor` input (pass `${{ vars.SYNTHE_LEDGER_ANCHOR }}`, no token
+   needed), or reads the repository variable through the API with
+   `anchor-token`. Empty / 404 means no anchor was ever published (first
+   run): the checker seals a genesis chain. Any other fetch failure fails the
    workflow instead of running unanchored.
 2. The checker verifies the chain seal and the anchor on every load. Older
    (`ledger_rollback`), divergent (`ledger_diverged`), or missing
@@ -123,18 +125,30 @@ must match or extend:
 3. **Publish anchor** (new step, after the save): writes the new head back to
    the repository variable (`--ledger-head` prints it).
 
-To enable it, pass `anchor-token` (e.g. `${{ secrets.GITHUB_TOKEN }}`) and grant
-the caller workflow `permissions: actions: write` (needed to update the
-variable). For the seal to be unforgeable, also pass `ledger-hmac-key` from a
-CI secret (e.g. `${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}`); without it the seal
-detects accidental corruption only. Rotate the secret by setting the new value
-and keeping the old one available to the checker as
-`SYNTHE_LEDGER_HMAC_KEY_PREVIOUS` until every cached ledger has been re-sealed
-(the next save heals automatically).
+To enable it:
 
-Without `anchor-token`, rollback detection is disabled and the checker logs a
-warning (the seal still guards corruption); a pre-chain ledger is adopted in
-place as a new genesis chain -- entries preserved, no manual migration step.
+- Pass `ledger-anchor: ${{ vars.SYNTHE_LEDGER_ANCHOR }}` so the checker sees
+  the current anchor.
+- Pass `anchor-token` so the Action can publish the new head. **`GITHUB_TOKEN`
+  cannot write repository variables** (workflow permissions have no variables
+  scope), so use a fine-grained personal access token or a GitHub App token
+  with "Variables: read and write" on this repository, stored as a secret.
+- Pass `ledger-hmac-key` from a CI secret (e.g.
+  `${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}`). **Both the key and the anchor are
+  needed against someone who can write the ledger file:** without the key the
+  seal is a public checksum, so a forger can mint a chain with a higher
+  sequence number than the anchor; without the anchor, an older sealed
+  snapshot or a deleted file cannot be told from a legitimate one. Once the
+  key is set, an unsealed ledger is refused rather than adopted (adopt a
+  genuine pre-seal ledger once with `ledger-bootstrap: 'true'`). Rotate the
+  secret by setting the new value and keeping the old one available to the
+  checker as `SYNTHE_LEDGER_HMAC_KEY_PREVIOUS` until every cached ledger has
+  been re-sealed (the next save heals automatically).
+
+Without an anchor, rollback detection is disabled and the checker logs a
+warning (the seal still guards corruption). Without a key, a pre-chain ledger
+is adopted in place as a new genesis chain -- entries preserved, no manual
+migration step.
 
 **Cache eviction recovery.** `actions/cache` entries expire after 7 days of
 disuse. If the cache is totally evicted, the anchor still expects the old
@@ -163,7 +177,6 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write   # REQUIRED for the ledger anchor (SYNTHE_LEDGER_ANCHOR repo variable)
 
 jobs:
   handoff:
@@ -180,7 +193,8 @@ jobs:
           registry: agents/registry.json
           workspace: .
           phase: claim
-          anchor-token: ${{ secrets.GITHUB_TOKEN }}
+          ledger-anchor: ${{ vars.SYNTHE_LEDGER_ANCHOR }}
+          anchor-token: ${{ secrets.SYNTHE_ANCHOR_TOKEN }}   # PAT/App token with Variables: write
           ledger-hmac-key: ${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}
 
       # 2. THE EFFECT: the receiving agent does the actual work here.

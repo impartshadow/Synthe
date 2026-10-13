@@ -59,14 +59,24 @@ inputs:
       see github-action/README.md.
     required: false
     default: ''
+  ledger-anchor:
+    description: >-
+      The current out-of-cache anchor: pass ${{ vars.SYNTHE_LEDGER_ANCHOR }}.
+      The restored ledger chain must match or extend it, so a stale cache
+      restore or a deleted ledger fails closed. Reading it this way needs no
+      token. Empty means no anchor has been published yet (first run).
+    required: false
+    default: ''
   anchor-token:
     description: >-
-      Token used to read and publish the SYNTHE_LEDGER_ANCHOR repository
-      variable: the out-of-cache anchor the loaded ledger chain must match or
-      extend (rollback/deletion guard), e.g. ${{ secrets.GITHUB_TOKEN }}. The
-      caller workflow must grant `permissions: actions: write`. Without it,
-      rollback detection is disabled (the chain seal still guards corruption)
-      and a warning is logged.
+      Token that can write the SYNTHE_LEDGER_ANCHOR repository variable, used
+      to publish the new chain head after each run (and to read it when
+      ledger-anchor is not passed). GITHUB_TOKEN cannot do this: workflow
+      permissions have no repository-variables scope. Use a fine-grained
+      personal access token or a GitHub App token with "Variables: read and
+      write" on this repository, stored as a secret. Without it, rollback
+      detection is disabled (the chain seal still guards corruption) and a
+      warning is logged.
     required: false
     default: ''
   ledger-bootstrap:
@@ -116,12 +126,28 @@ runs:
     # fetch failure fails the workflow rather than running unanchored.
     # Skipped when the caller supplies their own ledger path or no token.
     - name: Fetch ledger anchor
-      if: inputs.ledger == '' && inputs.anchor-token != ''
+      if: inputs.ledger == '' && (inputs.anchor-token != '' || inputs.ledger-anchor != '')
       shell: bash
       env:
         ANCHOR_TOKEN: ${{ inputs.anchor-token }}
+        ANCHOR_VALUE: ${{ inputs.ledger-anchor }}
       run: |
         set -u
+        if [ -n "$ANCHOR_VALUE" ]; then
+          case "$ANCHOR_VALUE" in
+            *$'\n'*|*$'\r'*) echo "::error::ledger-anchor must be a single line"; exit 1 ;;
+          esac
+          {
+            echo "SYNTHE_LEDGER_ANCHOR=${ANCHOR_VALUE}"
+            echo "SYNTHE_LEDGER_ANCHOR_REQUIRED=1"
+          } >> "$GITHUB_ENV"
+          echo "Ledger anchor read from the ledger-anchor input; the restored ledger must match or extend it."
+          exit 0
+        fi
+        if [ -z "$ANCHOR_TOKEN" ]; then
+          echo "No ledger anchor published yet (ledger-anchor is empty); a genesis chain will be sealed."
+          exit 0
+        fi
         resp="$(mktemp)"
         code="$(curl -sS -o "$resp" -w '%{http_code}' \
           -H "Authorization: Bearer ${ANCHOR_TOKEN}" \
@@ -129,6 +155,9 @@ runs:
           "https://api.github.com/repos/${{ github.repository }}/actions/variables/SYNTHE_LEDGER_ANCHOR")"
         if [ "$code" = "200" ]; then
           value="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["value"])' "$resp")"
+          case "$value" in
+            *$'\n'*|*$'\r'*) echo "::error::SYNTHE_LEDGER_ANCHOR must be a single line"; exit 1 ;;
+          esac
           {
             echo "SYNTHE_LEDGER_ANCHOR=${value}"
             echo "SYNTHE_LEDGER_ANCHOR_REQUIRED=1"
@@ -190,7 +219,7 @@ runs:
     # Publish the new chain head as the out-of-cache anchor, so the next run
     # can tell a fresh cache restore from a stale one. Skipped when the
     # caller supplies their own ledger path or no token. Requires
-    # `permissions: actions: write` on the token (documented in README.md).
+    # a token with Variables: write (not GITHUB_TOKEN; see README.md).
     - name: Publish ledger anchor
       if: always() && inputs.ledger == '' && inputs.anchor-token != ''
       shell: bash

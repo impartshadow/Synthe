@@ -26,7 +26,7 @@ MARKER = "~synthe"
 @pytest.fixture(autouse=True)
 def clean_ledger_env(monkeypatch):
     """Every test starts with no anchor/key env; warnings reset."""
-    for var in (hc.LEDGER_HMAC_KEY_ENV, hc.LEDGER_HMAC_PREV_ENV,
+    for var in (hc.LEDGER_HMAC_KEY_ENV, hc.LEDGER_HMAC_PREV_ENV, hc.LEDGER_ADOPT_LEGACY_ENV,
                 hc.LEDGER_ANCHOR_ENV, hc.LEDGER_ANCHOR_REQUIRED_ENV,
                 hc.LEDGER_BOOTSTRAP_ENV):
         monkeypatch.delenv(var, raising=False)
@@ -514,3 +514,37 @@ def test_fenced_reports_anchor_reason(tmp_path, monkeypatch):
         with hc.fenced(p1, ledger, token):
             pass
     assert exc.value.verdict["reasons"][0]["code"] == "ledger_rollback"
+
+
+# ---- review fix: an HMAC key alone must not let a seal-stripped file through
+
+def test_keyed_ledger_refuses_unsealed_file(tmp_path, monkeypatch):
+    """With a key but no anchor, replacing a sealed ledger with an unsealed one
+    (the seal stripped, a COMPLETED claim dropped) used to be adopted and
+    re-sealed with the CI key. It must fail closed instead."""
+    monkeypatch.setenv(hc.LEDGER_HMAC_KEY_ENV, "ci-secret")
+    led = tmp_path / "ledger.json"
+    hc.save_ledger(led, {"k1": {"state": "COMPLETED"}, "k2": {"state": "COMPLETED"}})
+    led.write_text(json.dumps({"k1": {"state": "COMPLETED"}}))
+    data = hc.load_ledger(led)
+    assert data.get("_corrupt")
+    assert data.get("_corrupt_reason") == "ledger_corrupt"
+    assert json.loads(led.read_text()) == {"k1": {"state": "COMPLETED"}}  # never rewritten
+
+
+def test_keyed_ledger_adopts_unsealed_only_when_told(tmp_path, monkeypatch):
+    monkeypatch.setenv(hc.LEDGER_HMAC_KEY_ENV, "ci-secret")
+    led = tmp_path / "ledger.json"
+    led.write_text(json.dumps({"k1": {"state": "COMPLETED"}}))
+    assert hc.main(["--init-ledger", str(led)]) == 2
+    assert hc.main(["--init-ledger", str(led), "--adopt-legacy"]) == 0
+    assert hc.LEDGER_ADOPT_LEGACY_ENV not in os.environ  # one-shot, not sticky
+    data = hc.load_ledger(led)
+    assert not data.get("_corrupt") and "k1" in data
+
+
+def test_unkeyed_ledger_still_adopts_legacy_automatically(tmp_path):
+    led = tmp_path / "ledger.json"
+    led.write_text(json.dumps({"k1": {"state": "COMPLETED"}}))
+    data = hc.load_ledger(led)
+    assert not data.get("_corrupt") and "k1" in data

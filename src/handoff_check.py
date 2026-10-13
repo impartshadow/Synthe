@@ -384,6 +384,7 @@ LEDGER_HMAC_PREV_ENV = "SYNTHE_LEDGER_HMAC_KEY_PREVIOUS"
 LEDGER_ANCHOR_ENV = "SYNTHE_LEDGER_ANCHOR"  # "seq:head"
 LEDGER_ANCHOR_REQUIRED_ENV = "SYNTHE_LEDGER_ANCHOR_REQUIRED"
 LEDGER_BOOTSTRAP_ENV = "SYNTHE_LEDGER_BOOTSTRAP"
+LEDGER_ADOPT_LEGACY_ENV = "SYNTHE_LEDGER_ADOPT_LEGACY"
 
 _truthy = {"1", "true", "yes", "on"}
 
@@ -604,6 +605,26 @@ def _adopt_json_ledger(data: dict, path: Path) -> dict:
     return seal_ledger(data)
 
 
+def _unsealed_adoption_refusal(path: Path):
+    """None when an unsealed ledger may be adopted as a new genesis chain, else
+    a fail-closed corrupt marker. Without an HMAC key the seal is only a
+    checksum, so adoption is automatic (upgrade path). With a key, an unsealed
+    file is exactly what a forger who lacks the key would produce by stripping
+    the seal, so it is adopted only when the operator says so for this run."""
+    key, _prev = _hmac_keys()
+    if not key:
+        return None
+    if (os.environ.get(LEDGER_ADOPT_LEGACY_ENV, "").strip().lower() in _truthy
+            or os.environ.get(LEDGER_BOOTSTRAP_ENV, "").strip().lower() in _truthy):
+        return None
+    return _corrupt_marker(
+        "ledger_corrupt",
+        f"ledger {path} has no chain seal, but {LEDGER_HMAC_KEY_ENV} is set: an unsealed file may be "
+        "a forgery with its seal stripped, so it is not adopted automatically. If it is a genuine "
+        "pre-seal ledger, adopt it once with `handoff_check.py --init-ledger PATH --adopt-legacy` "
+        f"(or {LEDGER_ADOPT_LEGACY_ENV}=1, or the Action's ledger-bootstrap: 'true').")
+
+
 def _verify_json_ledger(data: dict, path: Path) -> dict:
     """Seal verification + anchor enforcement for a parsed JSON ledger.
     Returns the ledger dict, or a fail-closed corrupt marker."""
@@ -621,6 +642,9 @@ def _verify_json_ledger(data: dict, path: Path) -> dict:
     ok, code, message = check_ledger_anchor(exists=True, sealed=False)
     if not ok:
         return _corrupt_marker(code, message)
+    refusal = _unsealed_adoption_refusal(path)
+    if refusal:
+        return refusal
     return _adopt_json_ledger(data, path)
 
 
@@ -653,6 +677,10 @@ def _sqlite_verify_and_anchor(conn: sqlite3.Connection, path: Path, existed: boo
     ok, code, message = check_ledger_anchor(exists=existed, sealed=False)
     if not ok:
         return _corrupt_marker(code, message)
+    if existed:
+        refusal = _unsealed_adoption_refusal(path)
+        if refusal:
+            return refusal
     n = len(_ledger_claims(data))
     _ledger_warn(f"SQLite ledger {path}: no chain seal; adopting {n} existing claim(s) as a new "
                  "genesis chain (entries preserved).")
@@ -2526,6 +2554,9 @@ def main(argv=None) -> int:
                     help="operator: ensure a sealed ledger chain exists at PATH (missing -> sealed "
                          "genesis; legacy unsealed -> adopted in place; already sealed -> no-op; "
                          "corrupt or anchor-forbidden -> refused, never overwritten)")
+    ap.add_argument("--adopt-legacy", action="store_true",
+                    help="with --init-ledger: adopt an unsealed ledger as a new genesis chain even "
+                         "though SYNTHE_LEDGER_HMAC_KEY is set (only for a genuine pre-seal ledger)")
     ap.add_argument("--ledger-head", metavar="PATH",
                     help="print the 'seq:head' chain anchor for the ledger at PATH (empty when "
                          "unsealed/missing/corrupt); used by the GitHub Action to publish the "
@@ -2554,7 +2585,16 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.init_ledger:
-        ok, message = init_ledger(Path(args.init_ledger))
+        saved = os.environ.get(LEDGER_ADOPT_LEGACY_ENV)
+        if args.adopt_legacy:
+            os.environ[LEDGER_ADOPT_LEGACY_ENV] = "1"
+        try:
+            ok, message = init_ledger(Path(args.init_ledger))
+        finally:
+            if saved is None:
+                os.environ.pop(LEDGER_ADOPT_LEGACY_ENV, None)
+            else:
+                os.environ[LEDGER_ADOPT_LEGACY_ENV] = saved
         if ok:
             print(message)
             return 0
