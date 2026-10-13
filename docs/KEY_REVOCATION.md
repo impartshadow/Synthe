@@ -32,11 +32,13 @@ even when the signature itself is valid.
   *designated* kid: a signature from some other key of the same operator
   agent does not authenticate.
 - Each record in `revoked_kids` is signed by the operator over its exact
-  fields (domain `synthe/key-revocation/v1`), so revocations can't be forged.
-  Records that fail authentication are ignored for enforcement — a forged
-  entry can't revoke anyone and can't break verification — but they are
-  reported by `synthe-sign revocations` and in the `verify` report, so the
-  operator sees that someone wrote them.
+  fields (domain `synthe/key-revocation/v1`), so who issued a revocation is
+  provable. Enforcement fails closed: a record that fails authentication
+  (forged, or signed by an operator key that left the registry without being
+  retired) still revokes its (agent, kid). Honoring it costs nothing, because
+  whoever can write a record into the registry can already delete the key
+  outright. Such records are reported by `synthe-sign revocations` and in
+  the `verify` report (both exit 2), so the operator sees them.
 - `past_operators` keeps retired operator public keys. When the operator key
   is rotated, the old public key is retired here (verify-only), so records
   it signed keep authenticating: a routine rotation must never un-revoke
@@ -90,8 +92,10 @@ and the old one can't — but every revocation the old key signed keeps
 enforcing, because the old records still authenticate against the retired
 key. The new key must already be registered as an Ed25519 key and must not
 be revoked. Retiring without keeping the old public key (e.g. hand-editing
-the registry) silently un-revokes everything it signed; `revocations`
-reports that as a problem, but the enforcement is gone — use the ceremony.
+the registry) does not un-revoke anything: those records keep enforcing,
+but they no longer authenticate, so `revocations` reports each one until it
+is re-issued or the old key is retired into `past_operators`. Use the
+ceremony.
 
 ## What verification does
 

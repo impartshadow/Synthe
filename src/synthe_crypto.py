@@ -618,10 +618,9 @@ def _parse_ts(text):
 
 def verify_revocation_record(registry, record) -> bool:
     """True when `record` is well-formed and carries an authorized operator
-    signature over exactly these fields. Malformed or forged records are
-    simply not revocations: they neither revoke anything nor break
-    verification (a forged entry can't DoS anyone; see revocation_problems()
-    for the audit trail).
+    signature over exactly these fields. This proves who issued the record;
+    enforcement does not depend on it (enforced_revocations fails closed on
+    unauthenticated records, and revocation_problems() reports them).
 
     The signer must be the *designated* operator kid: a record signed by some
     other key of the operator agent does not authenticate, even if that key
@@ -679,8 +678,9 @@ def verify_revocation_record(registry, record) -> bool:
 
 def authenticated_revocations(registry) -> list:
     """The revocation records that verify against the designated operator or
-    a retired operator key (past_operators), in file order. Only these take
-    effect."""
+    a retired operator key (past_operators), in file order. These are the
+    records whose issuer is proven; enforcement also honors the rest (see
+    enforced_revocations)."""
     sec = revocation_section(registry)
     recs = (sec or {}).get("revoked_kids") or []
     if not isinstance(recs, list):
@@ -688,20 +688,37 @@ def authenticated_revocations(registry) -> list:
     return [r for r in recs if verify_revocation_record(registry, r)]
 
 
+def enforced_revocations(registry) -> list:
+    """Every well-formed revocation record (non-empty string agent and kid),
+    authenticated or not, in file order. Enforcement fails closed: a record
+    whose signature cannot be checked (forged, or signed by an operator key
+    that has since left the registry without being retired into
+    past_operators) still revokes. Honoring it costs nothing: whoever can
+    write a record into the registry can already delete the key outright.
+    Unauthenticated records are reported by revocation_problems()."""
+    sec = revocation_section(registry)
+    recs = (sec or {}).get("revoked_kids") or []
+    if not isinstance(recs, list):
+        return []
+    return [r for r in recs if isinstance(r, dict)
+            and isinstance(r.get("agent"), str) and r.get("agent")
+            and isinstance(r.get("kid"), str) and r.get("kid")]
+
+
 def revoked_key_map(registry) -> dict:
-    """(agent, kid) -> the latest authenticated revocation record for it.
+    """(agent, kid) -> the latest enforced revocation record for it.
 
     Revocation is scoped to the owning agent: kids are only unique per agent,
     so worker/k1 and boss/k1 are different keys and revoking one must never
     affect the other."""
     out = {}
-    for r in authenticated_revocations(registry):
+    for r in enforced_revocations(registry):
         out[(r["agent"], r["kid"])] = r
     return out
 
 
 def kid_is_revoked(registry, agent, kid) -> bool:
-    """True when `agent`'s `kid` has an authenticated revocation record.
+    """True when `agent`'s `kid` has a revocation record (see enforced_revocations).
     Consulted on every signature verification; a revoked key fails closed
     even if the signature is otherwise valid. A different agent's key with
     the same kid string is unaffected."""
@@ -712,8 +729,10 @@ def kid_is_revoked(registry, agent, kid) -> bool:
 def revocation_problems(registry) -> list:
     """Human-readable problems with the revocation section for the operator's
     audit trail: no operator designated, operator key not on record, or
-    records that fail authentication (forged or malformed: ignored for
-    enforcement, but someone wrote them and the operator should know)."""
+    records that fail authentication (forged, or signed by an operator key
+    that left the registry without being retired into past_operators). Those
+    records are still enforced (fail closed), but their issuer is unproven
+    and the operator should know."""
     sec = revocation_section(registry)
     if sec is None:
         return []
@@ -737,6 +756,7 @@ def revocation_problems(registry) -> list:
         if not verify_revocation_record(registry, r):
             agent = r.get("agent") if isinstance(r, dict) else None
             kid = r.get("kid") if isinstance(r, dict) else None
-            problems.append(f"revoked_kids[{i}] ({agent}/{kid}) fails authentication: ignored, "
-                            f"it revokes nothing")
+            problems.append(f"revoked_kids[{i}] ({agent}/{kid}) fails authentication: still enforced "
+                            f"(fail closed), but its issuer is unproven; re-issue it with "
+                            f"synthe-sign revoke-kid or retire the signing key into past_operators")
     return problems

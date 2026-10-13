@@ -839,10 +839,10 @@ def _verify_topology(name: str, registry: dict | None, reasons: list) -> dict | 
              f"declarations must be signed", reasons)
         return None
     try:
-        import synthe_crypto as sc
-    except ImportError:
+        sc = _crypto()
+    except ImportError as exc:
         fail("invalid", "signature_unsupported",
-             "synthe_crypto.py not found next to the checker", reasons)
+             f"synthe_crypto.py unusable: {exc}", reasons)
         return None
     signer = topo["signed_by"]
     agent = (registry.get("agents", {}) or {}).get(signer) if isinstance(registry, dict) else None
@@ -1042,6 +1042,22 @@ def _is_sha256(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
 
 
+# Functions this checker needs from synthe_crypto.py. An older copy next to a
+# newer checker must fail closed with a clear reason, not crash mid-check.
+_CRYPTO_REQUIRED = ("find_key", "usable_keys", "agent_kids", "kid_is_revoked",
+                    "topology_signing_input")
+
+
+def _crypto():
+    """Import synthe_crypto, or raise ImportError naming what is missing."""
+    import synthe_crypto as sc
+    missing = [name for name in _CRYPTO_REQUIRED if not hasattr(sc, name)]
+    if missing:
+        raise ImportError(f"synthe_crypto.py next to the checker is older than handoff_check.py "
+                          f"(missing {', '.join(missing)}); install matching versions")
+    return sc
+
+
 def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None,
                              policy: dict | None, reasons: list, info: dict) -> None:
     sig = packet.get("signature")
@@ -1052,9 +1068,9 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
                  "receiver policy requires a signed packet; none present", reasons)
         return
     try:
-        import synthe_crypto as sc
-    except ImportError:
-        fail("invalid", "signature_unsupported", "synthe_crypto.py not found next to the checker", reasons)
+        sc = _crypto()
+    except ImportError as exc:
+        fail("invalid", "signature_unsupported", f"synthe_crypto.py unusable: {exc}", reasons)
         return
     if not isinstance(sig, dict) or not isinstance(sig.get("sig"), str):
         fail("invalid", "signature_malformed", "signature must be an object with a 'sig' string", reasons)

@@ -355,7 +355,7 @@ def cmd_verify(a) -> int:
     if problems:
         report["revocation_problems"] = problems
     print(json.dumps(report, indent=2))
-    return 0 if ok else 2
+    return 0 if ok and not problems else 2
 
 
 def _write_registry_atomic(path: str, registry: dict) -> None:

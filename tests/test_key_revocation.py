@@ -87,16 +87,18 @@ def test_record_signed_by_non_operator_does_not_revoke(reg, keys):
     reg.setdefault("revocation", {"operator": {"agent": "ops", "kid": "ops-1"}})
     reg["revocation"].setdefault("revoked_kids", []).append(rec)
     assert not sc.verify_revocation_record(reg, rec)
-    assert not sc.kid_is_revoked(reg, "worker", "worker-1")  # forged: revokes nothing...
-    assert sc.revocation_problems(reg)  # ...but the operator is told someone wrote it
+    # Unauthenticated, but enforced anyway: a registry writer could delete the
+    # key outright, so honoring the record costs nothing (fail closed)...
+    assert sc.kid_is_revoked(reg, "worker", "worker-1")
+    assert sc.revocation_problems(reg)  # ...and the operator is told its issuer is unproven
 
 
-def test_no_operator_section_means_nothing_is_revoked(keys):
+def test_no_operator_designated_still_revokes_and_is_flagged(keys):
     reg = {"agents": {"worker": {"keys": [_entry(keys["worker"], "worker-1")]}}}
     rec = sc.sign_revocation(sc.make_revocation("worker", "worker-1", NOW, "x", "ops-1"),
                              keys["op"])
     reg["revocation"] = {"revoked_kids": [rec]}  # no operator designated
-    assert not sc.kid_is_revoked(reg, "worker", "worker-1")
+    assert sc.kid_is_revoked(reg, "worker", "worker-1")  # fail closed
     assert sc.revocation_problems(reg)
 
 
@@ -108,7 +110,8 @@ def test_record_signed_by_nondesignated_operator_key_is_rejected(reg, keys):
     reg.setdefault("revocation", {"operator": {"agent": "ops", "kid": "ops-1"}})
     reg["revocation"].setdefault("revoked_kids", []).append(rec)
     assert not sc.verify_revocation_record(reg, rec)
-    assert not sc.kid_is_revoked(reg, "worker", "worker-1")
+    assert sc.kid_is_revoked(reg, "worker", "worker-1")  # unauthenticated, enforced anyway
+    assert sc.revocation_problems(reg)
 
 
 def test_record_must_name_the_single_key_when_operator_kid_omitted(reg, keys):
@@ -250,14 +253,14 @@ def test_revocation_survives_operator_rotation_with_past_operators(reg, keys):
     assert sc.revocation_problems(reg) == []
 
 
-def test_rotation_without_past_operators_lapses_and_is_flagged(reg, keys):
-    # The sharp edge, documented: retiring the operator key without keeping
-    # its public key in past_operators silently un-revokes. At least the
-    # operator is told, loudly, via revocation_problems.
+def test_hand_edited_rotation_never_unrevokes(reg, keys):
+    # Retiring the operator key by hand, without keeping its public key in
+    # past_operators: the old record no longer authenticates, but the key it
+    # revoked stays revoked (fail closed) and the operator is told.
     revoke(reg, keys)
     assert sc.kid_is_revoked(reg, "worker", "worker-1")
     _rotate(reg, keys)
-    assert not sc.kid_is_revoked(reg, "worker", "worker-1")
+    assert sc.kid_is_revoked(reg, "worker", "worker-1")
     assert sc.revocation_problems(reg)
 
 
@@ -439,3 +442,27 @@ def test_rotate_operator_refuses_same_key(tmp_path, keys):
     with pytest.raises(SystemExit):
         ss.main(["rotate-operator", "--registry", str(regp),
                  "--operator-key", str(opkey), "--new-operator-key", str(opkey)])
+
+
+def test_stale_synthe_crypto_fails_closed_not_crash(reg, keys, monkeypatch):
+    # An older synthe_crypto.py next to a newer checker (no kid_is_revoked)
+    # must fail closed with a named reason, not raise AttributeError.
+    import types
+    stale = types.ModuleType("synthe_crypto")
+    for name in dir(sc):
+        if name != "kid_is_revoked":
+            setattr(stale, name, getattr(sc, name))
+    monkeypatch.setitem(sys.modules, "synthe_crypto", stale)
+    codes, _ = check_sig(signed_packet(keys), reg)
+    assert codes == ["signature_unsupported"]
+
+
+def test_verify_cli_exits_nonzero_on_unauthenticated_revocation(reg, keys, tmp_path, capsys):
+    packet = signed_packet(keys, kid="worker-1")
+    forged = sc.sign_revocation(sc.make_revocation("worker", "worker-9", NOW, "x", "ops-1"),
+                                keys["attacker"])
+    reg["revocation"] = {"operator": {"agent": "ops", "kid": "ops-1"}, "revoked_kids": [forged]}
+    (tmp_path / "p.json").write_text(json.dumps(packet))
+    (tmp_path / "r.json").write_text(json.dumps(reg))
+    assert ss.main(["verify", str(tmp_path / "p.json"), "--registry", str(tmp_path / "r.json")]) == 2
+    assert "revocation_problems" in capsys.readouterr().out

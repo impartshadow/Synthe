@@ -246,7 +246,7 @@ Content proposals are not delegated yet (they wait for a human).
    (`docs/KEY_REVOCATION.md`; `synthe-sign revoke-kid`). Rotating the operator
    key retires its public key into `revocation.past_operators` (verify-only;
    `synthe-sign rotate-operator`), so past revocations keep enforcing — a
-   rotation never un-revokes. Deleting a revocation record from the file
+   rotation never un-revokes (and a hand-edited rotation still doesn't: records whose signer is gone keep enforcing and are reported). Deleting a revocation record from the file
    (rollback) stays undetected until the registry is signed and pinned per
    the signed-registry item (item 4). Approver keys can be sealed under a passphrase (`synthe-sign keygen --encrypt`,
    `synthe-sign protect`; scrypt + AES-256-GCM), unlocked only at a terminal; `synthe-approve` and
