@@ -126,7 +126,10 @@ def packet(d: Path, keys, idem, branch, purpose, approve=True, depends_on=None):
         h["depends_on"] = depends_on
     p = {"handoff": h}
     if approve:
-        ss.approve_packet(p, keys["approver"], "push_branch", ts(days=7), ss.planned_params(h, "push_branch"))
+        # The packet names no budget; pin the receiver policy's defaults.budget --
+        # the effective budget the checker will apply.
+        ss.approve_packet(p, keys["approver"], "push_branch", ts(days=7), ss.planned_params(h, "push_branch"),
+                          policy=POLICY)
     return ss.sign_packet(p, keys["planner"])
 
 

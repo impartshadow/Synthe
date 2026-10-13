@@ -38,7 +38,11 @@ ALG = "Ed25519"
 ALG_ES256 = "ES256"
 APPROVAL_ALGS = (ALG, ALG_ES256)  # packets and receipts stay Ed25519
 PACKET_SIG_DOMAIN = "synthe/handoff-signature/v1"
-APPROVAL_SIG_DOMAIN = "synthe/approval-signature/v1"
+APPROVAL_SIG_DOMAIN = "synthe/approval-signature/v2"
+# Retired approval scheme: never signs anymore. Verified only so an approval
+# signed before the budget binding is rejected with
+# `approval_version_unsupported`, not a confusing `approval_signature_invalid`.
+APPROVAL_SIG_DOMAIN_V1 = "synthe/approval-signature/v1"
 RECEIPT_SIG_DOMAIN = "synthe/effect-receipt/v1"
 TOPOLOGY_SIG_DOMAIN = "synthe/topology-signature/v1"
 
@@ -246,9 +250,42 @@ def packet_signing_input(handoff: dict) -> bytes:
 
 
 def approval_signing_input(approval: dict, handoff: dict) -> bytes:
-    """Bytes an approver signs. The approval is bound to one handoff's
+    """Bytes an approver signs (v2). The approval is bound to one handoff's
     idempotency key and its sender/receiver, so it cannot be replayed onto a
-    different handoff."""
+    different handoff, and to the budget -- plus the approved action's cost
+    estimates -- the approver reviewed, so the spend it authorizes cannot be
+    stretched afterwards: the packet's budget may only come down under a v2
+    approval, never up (checked as `approval_budget_exceeded` /
+    `approval_estimates_exceeded`).
+
+    `budget` and `estimates` are pinned on the approval object itself (never
+    read off the handoff here), because the checker's copy of the handoff has
+    receiver defaults applied, and a detached approval is verified against a
+    stub handoff that carries no budget at all.
+    """
+    payload = {
+        "action": approval.get("action"),
+        "approver": approval.get("approver"),
+        "expires_at": approval.get("expires_at"),
+        "idempotency_key": handoff.get("idempotency_key"),
+        "from": handoff.get("from"),
+        "to": handoff.get("to"),
+        "budget": approval.get("budget"),
+        "estimates": approval.get("estimates"),
+    }
+    # v0.4: an approval may pin the exact effect parameters (branch, remote,
+    # recipients...). Only included when present, so approvals without pins
+    # verify unchanged.
+    if approval.get("params") is not None:
+        payload["params"] = approval.get("params")
+    return APPROVAL_SIG_DOMAIN.encode() + b"\n" + canonical_json(payload)
+
+
+def approval_signing_input_v1(approval: dict, handoff: dict) -> bytes:
+    """The retired v1 approval signing input. Never used to sign anything new:
+    only to recognize an approval signed before the budget binding, so the
+    checker rejects it with `approval_version_unsupported` instead of a
+    confusing `approval_signature_invalid`."""
     payload = {
         "action": approval.get("action"),
         "approver": approval.get("approver"),
@@ -257,12 +294,9 @@ def approval_signing_input(approval: dict, handoff: dict) -> bytes:
         "from": handoff.get("from"),
         "to": handoff.get("to"),
     }
-    # v0.4: an approval may pin the exact effect parameters (branch, remote,
-    # recipients...). Only included when present, so v0.3 approvals verify
-    # unchanged.
     if approval.get("params") is not None:
         payload["params"] = approval.get("params")
-    return APPROVAL_SIG_DOMAIN.encode() + b"\n" + canonical_json(payload)
+    return APPROVAL_SIG_DOMAIN_V1.encode() + b"\n" + canonical_json(payload)
 
 
 def receipt_signing_input(receipt: dict) -> bytes:

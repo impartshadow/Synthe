@@ -1421,6 +1421,19 @@ def _shape_errors(h: dict) -> list:
     for i, appr in enumerate(obj_list(auth.get("approvals"), "authority.approvals", ["action", "approver"])):
         if appr.get("params") is not None and not isinstance(appr.get("params"), dict):
             errs.append((f"malformed:authority.approvals[{i}].params", "params must be an object"))
+        for field, dims in (("budget", ("tokens", "usd", "minutes")),
+                            ("estimates", ("est_tokens", "est_usd", "est_minutes"))):
+            pinned = appr.get(field)
+            if pinned is None:
+                continue
+            if not isinstance(pinned, dict):
+                errs.append((f"malformed:authority.approvals[{i}].{field}", f"{field} must be an object"))
+                continue
+            for dim in dims:
+                v = pinned.get(dim)
+                if v is not None and (not _is_number(v) or v < 0):
+                    errs.append((f"malformed:authority.approvals[{i}].{field}",
+                                 f"{field}.{dim} must be a non-negative number"))
     for i, ev in enumerate(obj_list(acc.get("evidence"), "acceptance.evidence", ["kind"])):
         if ev.get("sha256") is not None and not _is_sha256(ev.get("sha256")):
             errs.append((f"bad_sha256:acceptance.evidence[{i}]",
@@ -1515,6 +1528,61 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
     info["signature"] = "verified"
 
 
+_APPROVAL_BUDGET_DIMS = ("tokens", "usd", "minutes")
+_APPROVAL_ESTIMATE_FIELDS = ("est_tokens", "est_usd", "est_minutes")
+
+
+def _approval_spend_ok(name: str, appr: dict, h: dict) -> list:
+    """The spend ceilings a verified approval carries. The packet's
+    `authority.budget` and the approved action's cost estimates must not exceed
+    what the approver pinned when signing: an approval for a $50 budget does
+    not cover a packet claiming $5000. Returns (code, message) problems.
+
+    Stance: a v2 approval that pins NO budget is REJECTED outright
+    (`approval_budget_missing`). It caps nothing, so it authorizes nothing --
+    treating it as an unlimited approval would let a defaults-supplied budget
+    of any size through. v2 signatures are only minted with a budget pin, so
+    an unpinned v2 approval is hand-built or predates the rule; either way it
+    fails closed here.
+    """
+    problems: list = []
+    approved_budget = appr.get("budget")
+    if not isinstance(approved_budget, dict):
+        problems.append(("approval_budget_missing",
+                         f"approval for '{name}' pins no budget: a v2 approval must "
+                         f"carry the budget ceiling it authorizes (it caps nothing "
+                         f"otherwise); have '{appr.get('approver')}' re-approve with a budget"))
+        return problems
+    packet_budget = (h.get("authority") or {}).get("budget") or {}
+    for dim in _APPROVAL_BUDGET_DIMS:
+        cap = approved_budget.get(dim)
+        if not _is_number(cap):
+            continue
+        val = packet_budget.get(dim)
+        if _is_number(val) and val > cap:
+            problems.append(("approval_budget_exceeded",
+                             f"approval for '{name}' caps {dim} at {cap:g}, "
+                             f"but the packet budgets {val:g}"))
+    approved_est = appr.get("estimates")
+    if isinstance(approved_est, dict):
+        planned = None
+        for act in h.get("planned_actions") or []:
+            if isinstance(act, dict) and name in (act.get("name"), act.get("tool")):
+                planned = act
+                break
+        if isinstance(planned, dict):
+            for field in _APPROVAL_ESTIMATE_FIELDS:
+                cap = approved_est.get(field)
+                if not _is_number(cap):
+                    continue
+                val = planned.get(field)
+                if _is_number(val) and val > cap:
+                    problems.append(("approval_estimates_exceeded",
+                                     f"approval for '{name}' caps {field} at {cap:g}, "
+                                     f"but the plan estimates {val:g}"))
+    return problems
+
+
 def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> list:
     """Return [] if any candidate approval is valid for `name`, else the
     (code, message) problems of the candidates."""
@@ -1536,6 +1604,7 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
         if appr.get("sig") is not None:
             ambiguous = False
             revoked = False
+            version_old = False
             try:
                 import synthe_crypto as sc
                 # Ed25519 (passphrase key) or ES256 (Touch ID key): the registered key decides which.
@@ -1552,9 +1621,20 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
                         ekid = revoked_all[0] if revoked_all else None
                 revoked = (ekid is not None
                            and sc.kid_is_revoked(registry, appr.get("approver"), ekid))
-                good = not ambiguous and not revoked and sc.verify_approval(
-                    registry, appr.get("approver"), appr.get("kid"),
-                    sc.approval_signing_input(appr, h), sc.unb64u(appr["sig"]))
+                good = False
+                if not ambiguous and not revoked:
+                    raw_sig = sc.unb64u(appr["sig"])
+                    good = sc.verify_approval(
+                        registry, appr.get("approver"), appr.get("kid"),
+                        sc.approval_signing_input(appr, h), raw_sig)
+                    if not good:
+                        # A signature that verifies under the retired v1 scheme
+                        # is an old approval: fail closed with an explicit
+                        # version code, never re-verified under the new
+                        # budget-binding semantics.
+                        version_old = sc.verify_approval(
+                            registry, appr.get("approver"), appr.get("kid"),
+                            sc.approval_signing_input_v1(appr, h), raw_sig)
             except Exception:
                 good = False
             if ambiguous:
@@ -1565,10 +1645,19 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
                 mine.append(("approval_key_revoked",
                              f"approval for '{name}' is signed with revoked key '{ekid}' of approver "
                              f"'{appr.get('approver')}': the revocation operator revoked this kid"))
+            elif version_old:
+                mine.append(("approval_version_unsupported",
+                             f"approval for '{name}' was signed under the retired v1 approval scheme, "
+                             f"before approvals bound the budget; have '{appr.get('approver')}' re-approve"))
             elif not good:
                 mine.append(("approval_signature_invalid",
                              f"approval for '{name}' carries a signature that does not verify "
                              f"for approver '{appr.get('approver')}' on this handoff"))
+            else:
+                # The signature is good, so its pins are the approver's word:
+                # the packet's budget and the approved action's cost estimates
+                # are ceilings the packet may only come down from, never up.
+                mine.extend(_approval_spend_ok(name, appr, h))
         elif need_sig:
             mine.append(("approval_unsigned",
                          f"approval for '{name}' is unsigned; receiver policy requires the "

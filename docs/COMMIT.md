@@ -292,6 +292,13 @@ it arrives.
    `synthe_submit_approval`): only the approver's signature makes it count. The broker verifies
    it like an embedded approval (registered key, signature over this handoff's key, sender and
    receiver, trusted approver, expiry), receipts it either way, and stores it append-only.
+   The approval pins the budget and cost estimates the approver reviewed: the packet's spend
+   may only come down afterwards, never up (`approval_budget_exceeded`,
+   `approval_estimates_exceeded`). The budget pin is mandatory and is the effective
+   budget (the approver's explicit `--budget`, else the packet's own budget, else the
+   receiver policy's `defaults.budget`): signing without one is refused, and a v2
+   approval carrying no pin is rejected outright (`approval_budget_missing`) -- it
+   caps nothing, so it authorizes nothing.
 4. **Commit.** The broker then re-runs the whole commit protocol for every staged proposal the
    approval covers: validation, the approval's pinned params, the fence, the live remote against
    the pinned tip, path inspection, compare-and-swap, confirmation. It writes the `executed`
@@ -499,8 +506,12 @@ remove it.
 | `source_path_not_allowed` | blocked | v0.5: a path on the agent's disk instead of a bundle, without `allow_path_sources` |
 | `bundle_too_large` | invalid | v0.5: the bundle exceeds `max_bundle_mb` |
 | `staged` | blocked | v0.5: not an error; the proposal is held until its approval or upstream arrives (listed with the codes it waits on) |
-| `approval_malformed` | invalid | v0.5: a detached approval is missing `action`, `approver`, `idempotency_key`, `from` or `to`, or its `params` isn't an object |
+| `approval_malformed` | invalid | v0.5: a detached approval is missing `action`, `approver`, `idempotency_key`, `from` or `to`, has no `budget` object, or its `params`/`budget`/`estimates` isn't an object |
 | `approval_unsigned` | blocked | a detached approval without a signature (also the v0.3 admission code) |
+| `approval_version_unsupported` | blocked | v2: the approval was signed under the retired v1 approval scheme, before approvals bound the budget; have the approver re-approve |
+| `approval_budget_missing` | blocked | v2: the approval pins no budget -- it caps nothing, so it authorizes nothing; have the approver re-approve with a budget |
+| `approval_budget_exceeded` | blocked | v2: the packet's `authority.budget` is above the budget the approval pins |
+| `approval_estimates_exceeded` | blocked | v2: the approved action's cost estimates are above what the approval pins |
 | `approval_duplicate` | duplicate | v0.5: this exact detached approval was already received |
 | `path_invalid` | invalid | v0.5: a content path (or a read path/prefix) breaks the path rules, two paths differ only in case, or a path would sit under an existing file |
 | `content_malformed` | invalid | v0.5: `files`/`delete`/`base_blobs` have the wrong shape, text isn't UTF-8 or holds a NUL, a path appears twice, a cited blob isn't 40-hex, or the target path isn't a regular file |

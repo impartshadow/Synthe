@@ -64,8 +64,9 @@ def speculative(w, idem):
 
 
 def approve(w, packet):
+    policy = (w.registry.get("agents") or {}).get("builder", {}).get("policy")
     a = ss.detached_approval(packet, w.keys["rishab"], PUSH, ts(dt.timedelta(hours=1)),
-                             ss.planned_params(packet["handoff"], PUSH))
+                             ss.planned_params(packet["handoff"], PUSH), policy=policy)
     return cm.submit_approval(w.cfg, a)
 
 

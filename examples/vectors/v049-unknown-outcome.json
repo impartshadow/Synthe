@@ -52,7 +52,12 @@
        "branch": "feature/x"
       },
       "kid": "rishab-1",
-      "sig": "mMyqDIop4ZZ8ddHsxNTEAvJeR80xLKhJaV00_ZDEBBAUpY19En8ILiLaaQbKwC6fGX5x2v_nGX58-yJ70MuqBQ"
+      "sig": "BSdNJaf1HzpknSr0IUoLsToLuAEpvl586p80rSieDR2V5ZcJKwGEBxOtlx48GNLBLpkMuhZvG0nkxtddsHGaCQ",
+      "budget": {
+       "tokens": 50000,
+       "usd": 5,
+       "minutes": 60
+      }
      }
     ]
    },
@@ -88,7 +93,7 @@
    "signer": "planner",
    "kid": "planner-1",
    "alg": "Ed25519",
-   "sig": "IfLEs-VG_FXAv3b15oN_u61HKpek5cBhfE6ShAi14eVhRMX8MtY6Mg4nnFub21u_I-dkXeWBdAOwiGJc_PTWAQ"
+   "sig": "ocPKuBjcVu1U3gwXD98uL_pqubqJTz8D2GF1gRZV-PrdHa0hDK9l1UCeSG936e2W8JZGgXowp4zGBIO_Xi0VAg"
   }
  },
  "registry": {
@@ -99,7 +104,7 @@
      {
       "kid": "planner-1",
       "alg": "Ed25519",
-      "public_key": "bOPqoRHeca9uPKT-1Ugh2MWaEU2Z9Xy-e6BWAuh1O7E"
+      "public_key": "m2I5ucXmlRjbfF0vOFcBVdCxku0HJRM0x6VECC8cE3o"
      }
     ]
    },
@@ -156,7 +161,7 @@
      {
       "kid": "rishab-1",
       "alg": "Ed25519",
-      "public_key": "DUNsWzTbdQaOkbi2BuE6cYBfyU8BhnHs7np9ghl-8cg"
+      "public_key": "cUtpMr9meQfiQoH6kx8WO4n-cK3p06rPt2yyY3TVFHg"
      }
     ]
    },

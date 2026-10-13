@@ -65,6 +65,9 @@ for n, k in keys.items():
                                       "public_key": sc.b64u(sc.public_key(k["_secret"]))}]
 dump(registry, "registry.json")
 
+# The receiver whose policy supplies the budget for the minimal packets below.
+CADDY_POLICY = registry["agents"]["caddy"]["policy"]
+
 # Minimal packet: everything the RECEIVER owns (owned_paths, output_schema,
 # budget) comes from caddy's policy defaults; the sender states only its facts.
 base = {"handoff": {
@@ -93,7 +96,10 @@ base = {"handoff": {
 def signed(pkt, approve=True):
     pkt = copy.deepcopy(pkt)
     if approve:
-        ss.approve_packet(pkt, keys["rohan"], "send_email", "2999-01-01T00:00:00Z")
+        # Minimal packet: the budget comes from caddy's policy defaults, which
+        # is exactly the effective budget the checker will apply -- pin that.
+        ss.approve_packet(pkt, keys["rohan"], "send_email", "2999-01-01T00:00:00Z",
+                          policy=CADDY_POLICY)
     return ss.sign_packet(pkt, keys["cora"])
 
 
@@ -106,7 +112,7 @@ p["handoff"]["purpose"] = "Email every customer"
 out["attack-tampered-after-signing"] = p
 
 p = copy.deepcopy(base)                                # mallory signs while claiming to be cora
-p = ss.approve_packet(p, keys["rohan"], "send_email", "2999-01-01T00:00:00Z")
+p = ss.approve_packet(p, keys["rohan"], "send_email", "2999-01-01T00:00:00Z", policy=CADDY_POLICY)
 sig = sc.sign_bytes(keys["mallory"]["_secret"], sc.packet_signing_input(p["handoff"]))
 p["signature"] = {"signer": "cora", "kid": "cora-test-1", "alg": sc.ALG, "sig": sc.b64u(sig)}
 out["attack-spoofed-sender"] = p
@@ -122,7 +128,7 @@ out["attack-forged-approval"] = signed(p, approve=False)
 
 other = copy.deepcopy(base)                            # rohan approved a DIFFERENT handoff
 other["handoff"]["idempotency_key"] = "cadros:verdict-pack:m1:rev-6"
-ss.approve_packet(other, keys["rohan"], "send_email", "2999-01-01T00:00:00Z")
+ss.approve_packet(other, keys["rohan"], "send_email", "2999-01-01T00:00:00Z", policy=CADDY_POLICY)
 p = copy.deepcopy(base)
 p["handoff"]["authority"]["approvals"] = other["handoff"]["authority"]["approvals"]
 out["attack-replayed-approval"] = signed(p, approve=False)

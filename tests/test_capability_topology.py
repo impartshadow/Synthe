@@ -44,7 +44,9 @@ def packet(key="k-cap", capability=None, sender_role=None, receiver_role=None,
         h["sender_role"] = sender_role
     if receiver_role is not None:
         h["receiver_role"] = receiver_role
-    ss.approve_packet(p, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR)
+    # Approvals bind a budget (approval signature v2); this packet names none.
+    ss.approve_packet(p, ss.load_key(KEYS / "rohan.key.json"), "send_email", FAR,
+                      budget={"tokens": 10**9, "usd": 10**6, "minutes": 10**6})
     return ss.sign_packet(p, ss.load_key(KEYS / f"{from_agent}.key.json"))
 
 
