@@ -102,11 +102,48 @@ def test_release_cli_and_legacy_entries(tmp_path):
     pfile.write_text(json.dumps(packet))
     assert hc.main([str(pfile), "--ledger", str(ledger), "--release"]) == 2      # fresh
     assert hc.main([str(pfile), "--ledger", str(ledger), "--release", "--force"]) == 0
-    # a v0.2 entry (no digest, no token) still completes by key + id
+    # a v0.2 entry (no digest, no token) can NO LONGER complete by key + id:
+    # the backward-compat downgrade is closed (invalid / legacy_claim_unbound)
     key = packet["handoff"]["idempotency_key"]
     ledger.write_text(json.dumps({key: {"state": "RESERVED", "handoff_id": packet["handoff"]["id"],
                                         "reserved_at": dt.datetime.now(dt.timezone.utc).isoformat()}}))
+    out = hc.complete(packet, ledger)
+    assert out["decision"] == "REJECT" and out["reasons"][0]["code"] == "legacy_claim_unbound"
+    # a legacy entry that is already COMPLETED keeps its no-op replay semantics
+    data = json.loads(ledger.read_text())
+    data[key]["state"] = "COMPLETED"
+    ledger.write_text(json.dumps(data))
     assert hc.complete(packet, ledger)["decision"] == "COMPLETED"
+
+
+def test_legacy_entry_without_token_never_completes_unbound(tmp_path):
+    """ITEM 6: a pre-v0.3.1 RESERVED entry (no claim_token_sha256) has no
+    silent downgrade path. complete() refuses with no token, with a wrong
+    token, and with require_token set; fenced() refuses too; and the entry
+    is left untouched (still RESERVED, not silently flipped)."""
+    ledger = tmp_path / "ledger.json"
+    packet, _, _ = claim(ledger)
+    key = packet["handoff"]["idempotency_key"]
+    ledger.write_text(json.dumps({key: {"state": "RESERVED",
+                                        "handoff_id": packet["handoff"]["id"],
+                                        "packet_sha256": hc.handoff_digest(packet["handoff"]),
+                                        "reserved_at": dt.datetime.now(dt.timezone.utc).isoformat()}}))
+    for kwargs in ({}, {"claim_token": "ct_whatever"},
+                   {"claim_token": "ct_whatever", "require_token": True},
+                   {"require_token": True}):
+        out = hc.complete(packet, ledger, **kwargs)
+        assert out["decision"] == "REJECT", kwargs
+        assert out["reasons"][0]["code"] == "legacy_claim_unbound", kwargs
+        assert "release" in out["reasons"][0]["message"].lower(), kwargs  # operator notice
+    with pytest.raises(hc.FenceError) as fe:
+        with hc.fenced(packet, ledger, "ct_whatever"):
+            pass
+    assert fe.value.verdict["reasons"][0]["code"] == "legacy_claim_unbound"
+    with pytest.raises(hc.FenceError) as fe2:
+        with hc.fenced_effect(packet, ledger, "ct_whatever", "send_email"):
+            pass
+    assert fe2.value.verdict["reasons"][0]["code"] == "legacy_claim_unbound"
+    assert json.loads(ledger.read_text())[key]["state"] == "RESERVED"
 
 
 def test_a2a_status_never_carries_the_claim_token(tmp_path):

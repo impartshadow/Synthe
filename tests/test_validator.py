@@ -131,6 +131,6 @@ def test_conflicting_idempotency_rejected():
 
 def test_missing_field_rejected():
     p = base_packet()
-    del p["handoff"]["inputs"]["state_revision"]
+    del p["handoff"]["inputs"]["artifact_refs"]
     ok, codes = run(p)
-    assert not ok and "missing_field:inputs.state_revision" in codes
+    assert not ok and "missing_field:inputs.artifact_refs" in codes

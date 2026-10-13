@@ -882,8 +882,9 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
     if reasons:
         return False, reasons
 
+    # inputs.state_revision is optional and informational (SPEC.md section 2):
+    # the checker cannot compare it against anything, so it is not required.
     nested = [
-        ("inputs.state_revision", h["inputs"].get("state_revision")),
         ("inputs.artifact_refs", h["inputs"].get("artifact_refs")),
         ("scope.owned_paths", scope.get("owned_paths")),
         ("scope.forbidden", scope.get("forbidden")),
@@ -1211,7 +1212,11 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
 def _claim_problem(entry, h: dict, claim_token: str | None, require_token: bool):
     """Why `h` (+ token) may NOT act on this ledger entry, or None. Shared by
     complete() and fenced(): only the claim's own packet, and its token
-    holder when tokens are in use, may complete it or run its effect."""
+    holder when tokens are in use, may complete it or run its effect.
+    Entries written before v0.3.1 carry no claim_token_sha256; a still-live
+    (RESERVED) one can never be completed, because there is no token to bind
+    the completion to. It is refused outright (no silent downgrade): release
+    it and re-claim to get a claim token."""
     key = h.get("idempotency_key")
     if entry is None or entry_state(entry) == "RELEASED":
         return _reject("invalid", "completion_unknown_key",
@@ -1226,6 +1231,16 @@ def _claim_problem(entry, h: dict, claim_token: str | None, require_token: bool)
                        f"this is not the packet that claimed idempotency_key '{key}' "
                        f"(digest differs); only the claimed packet can complete it")
     want = entry.get("claim_token_sha256")
+    if entry_state(entry) == "RESERVED" and not want:
+        # Backward-compat hole (closed): pre-v0.3.1 entries have no token
+        # hash, so any completion would skip token binding entirely. Refuse
+        # instead of silently downgrading; the operator path is --release
+        # (after the TTL) and re-claim, which issues a real claim token.
+        return _reject("invalid", "legacy_claim_unbound",
+                       f"idempotency_key '{key}' was claimed before claim tokens existed "
+                       f"(the ledger entry has no claim_token_sha256), so completion cannot "
+                       f"be bound to a token holder. Release the claim (--release) and re-claim "
+                       f"it to get a claim token, then complete.")
     if want and claim_token is not None:
         if not hmac.compare_digest(_token_hash(str(claim_token)), want):
             return _reject("conflicting", "claim_token_invalid",
@@ -1246,7 +1261,9 @@ def complete(packet, ledger_path: Path | None, claim_token: str | None = None,
     `claim_token` is given or `require_token` is set, only the holder of the
     token the ACCEPT returned. (v0.3 matched on key + id alone, so any agent
     that had seen the packet could close someone else's claim; a model check
-    found it.)
+    found it.) A still-RESERVED entry written before claim tokens existed
+    (no claim_token_sha256) is refused outright (`legacy_claim_unbound`):
+    there is no silent downgrade path that skips token binding.
     """
     h = packet.get("handoff") if isinstance(packet, dict) else None
     if not isinstance(h, dict) or not h.get("idempotency_key"):

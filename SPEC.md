@@ -52,7 +52,7 @@ approval or a tool.
 | `purpose` | yes | what the receiver must accomplish, in one sentence |
 | `on_failure` | yes* | `reject` / `retry_with_budget` / `escalate` / `request_human` |
 | `inputs.artifact_refs[]` | yes | `{path, sha256}`: files the receiver may read, pinned by full 64-hex SHA-256 |
-| `inputs.state_revision` | yes | the state the receiver must work from |
+| `inputs.state_revision` | no | informational only: the state the receiver works from, as the sender saw it when the packet was built. The checker does **not** compare it against anything — it carries no trust semantics and must not be treated as a guarantee of receiver-side state |
 | `scope.owned_paths` | yes* | what the receiver may touch (may be empty) |
 | `scope.forbidden` | yes* | actions the receiver must not take (may be empty) |
 | `authority.allowed_tools` | yes* | tools the receiver may call |
@@ -76,6 +76,18 @@ service must derive it from authenticated transport state, never packet data.
 
 Evidence kinds `code_text`, `verbatim_quote` and `legal_text` must carry
 `verbatim: true`. Under evidence verification they must also pin `sha256`.
+
+**Note on `inputs.state_revision`.** This field was required in early drafts but
+compared against nothing — a required field that means nothing trains everyone
+to ignore required fields, so it was demoted to optional and informational. A
+sound meaning would need the checker to compare it against an authoritative
+record of the receiver's workspace state; the checker is a pure function of
+(packet, registry, policy, ledger) and has no such record, and anything the
+receiver could supply about its own state is not checkable truth. Ordering
+across handoffs is handled by `depends_on` (idempotency keys that must be
+`COMPLETED` before this handoff's effects may commit). Senders MAY still set
+`state_revision` as a human-readable debugging hint (e.g. a timestamp or branch
+stamp); the checker ignores it.
 
 ## 3. The registry
 
@@ -212,8 +224,19 @@ handoff's digest) and the hash of a fresh **claim token**, and returns
 `claim: {epoch, token}` to the claimant only. Completion must present the exact claimed
 packet (`completion_packet_mismatch` otherwise). When a token is given, it must match
 (`claim_token_invalid`). The MCP server requires it (`claim_token_required`), because
-the sender holds the packet too. Entries written before v0.3.1 complete by key + id, as
-before.
+the sender holds the packet too.
+
+**No backward-compat downgrade (v0.3.1+).** Entries written before claim tokens
+existed carry no `claim_token_sha256`, so there is no token a completion could be
+bound to. A still-`RESERVED` legacy entry therefore cannot be completed at all:
+every completion path (`complete()`, `fenced()`, `fenced_effect()`, the commit
+broker) refuses it as `invalid` / `legacy_claim_unbound`, with an operator notice
+to release the claim (`--release`) and re-claim it, which issues a real claim
+token. Already-`COMPLETED` legacy entries keep their no-op replay semantics.
+Token-bound entries are a separate case: the CLI (`--complete` without
+`--claim-token`) and `complete()` called without a token still complete by
+key + packet digest, as above. Only the MCP server and the commit broker require
+the token.
 
 **Release and fencing.** Reconciling an `unknown` claim whose effect is *not* on record:
 `--release` (only after the TTL unless `--force`) marks it `RELEASED`, and the next claim
@@ -279,6 +302,7 @@ overlapping.
 `registry_malformed`, `ledger_corrupt`, `ledger_required`,
 `receiver_mismatch`,
 `missing_idempotency_key`, `completion_unknown_key`, `claim_token_required`,
+`legacy_claim_unbound`,
 `release_not_reserved`, `dependency_cycle` (v0.5; `malformed:depends_on` is a `malformed:<f>`),
 `duplicate_field:<f>`, `malformed:non_finite_number`, `signature_kid_required`, `ttl_exceeded` (unreleased)
 
