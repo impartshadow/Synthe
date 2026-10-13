@@ -239,8 +239,16 @@ Content proposals are not delegated yet (they wait for a human).
    the sender's *estimates*, so a lying `est_usd` passes.
 4. **Whoever controls the registry.** It's an unsigned JSON file today. Signed
    registry is a Phase 2 item, and should come early.
-5. **Leaked or usable keys.** There's no revocation yet. Rotate by adding a new `kid` and removing the
-   old one. Approver keys can be sealed under a passphrase (`synthe-sign keygen --encrypt`,
+5. **Leaked or usable keys.** A leaked key is revoked, not just rotated out: the
+   registry's `revocation` section lists revoked (agent, kid) pairs, each record
+   signed by a designated revocation operator key, and every signature verification
+   (packets, approvals, broker receipts) fails closed on a revoked key
+   (`docs/KEY_REVOCATION.md`; `synthe-sign revoke-kid`). Rotating the operator
+   key retires its public key into `revocation.past_operators` (verify-only;
+   `synthe-sign rotate-operator`), so past revocations keep enforcing — a
+   rotation never un-revokes. Deleting a revocation record from the file
+   (rollback) stays undetected until the registry is signed and pinned per
+   the signed-registry item (item 4). Approver keys can be sealed under a passphrase (`synthe-sign keygen --encrypt`,
    `synthe-sign protect`; scrypt + AES-256-GCM), unlocked only at a terminal; `synthe-approve` and
    `synthe-init` refuse plaintext approver keys. On supported Macs, Touch ID keeps an ES256 approval
    key in the Secure Enclave, but a compromised same-user process can still cause a biometric prompt.

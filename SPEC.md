@@ -365,7 +365,7 @@ only the packet.
 ## 13. Non-goals (v0.3)
 
 The checker makes no semantic judgment of deliverables, does not fetch URLs, and has no hosted service. It also does not handle
-multi-hop delegation chains or key revocation yet (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
+multi-hop delegation chains yet. Key revocation is built: see [`docs/KEY_REVOCATION.md`](docs/KEY_REVOCATION.md).
 
 ## 14. Mediated effects and receipts (v0.4)
 

@@ -398,6 +398,17 @@ def verify_receipts(path: Path, registry: dict | None, broker_id: str | None = N
             errors.append({"index": i, "seq": r.get("seq"),
                            "error": f"signed as {r.get('broker')!r}, not by this broker ({broker_id})"})
             ok = False
+        if (r.get("kid") is not None
+                and sc.kid_is_revoked(registry, r.get("broker"), r.get("kid"))):
+            # Fail closed: a revoked broker key's receipts are rejected even
+            # though their signatures verify. Scoped to (agent, kid): another
+            # agent's key with the same kid string is unaffected.
+            errors.append({"index": i, "seq": r.get("seq"),
+                           "error": f"broker key '{r.get('kid')}' of '{r.get('broker')}' is revoked"})
+            ok = False
+            report.append({**r, "verified": False})
+            prev = r
+            continue
         key = sc.find_key(registry, r.get("broker"), r.get("kid"))
         try:
             good = key is not None and sc.verify_bytes(key, sc.receipt_signing_input(r),

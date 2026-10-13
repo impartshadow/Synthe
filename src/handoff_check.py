@@ -687,6 +687,21 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
              f"'{signer}' has more than one key on record, so the signature must name its kid "
              f"(without one, a rotated-out key could still be picked)", reasons)
         return
+    # Fail closed on a revoked kid even when the signature is otherwise valid.
+    ekid = sig.get("kid")
+    if ekid is None:
+        usable = sc.usable_keys(registry, signer)
+        ekid = usable[0] if len(usable) == 1 else None
+        if ekid is None:
+            # the only key(s) on record may all be revoked: still name the revocation
+            revoked = [k for k in sc.agent_kids(registry, signer)
+                       if sc.kid_is_revoked(registry, signer, k)]
+            ekid = revoked[0] if revoked else None
+    if ekid is not None and sc.kid_is_revoked(registry, signer, ekid):
+        fail("invalid", "signature_key_revoked",
+             f"packet signed with revoked key '{ekid}' of '{signer}': the revocation operator "
+             f"revoked this kid; rotate to a fresh key", reasons)
+        return
     key = sc.find_key(registry, signer, sig.get("kid"))
     if key is None:
         fail("invalid", "signature_key_unknown",
@@ -723,12 +738,24 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
                          f"who is not a trusted approver for this receiver"))
         if appr.get("sig") is not None:
             ambiguous = False
+            revoked = False
             try:
                 import synthe_crypto as sc
                 # Ed25519 (passphrase key) or ES256 (Touch ID key): the registered key decides which.
                 ambiguous = (appr.get("kid") is None
                              and len(sc.usable_approval_keys(registry, appr.get("approver"))) > 1)
-                good = not ambiguous and sc.verify_approval(
+                # A revoked kid fails closed even when the signature verifies.
+                ekid = appr.get("kid")
+                if ekid is None:
+                    usable = sc.usable_approval_keys(registry, appr.get("approver"))
+                    ekid = usable[0] if len(usable) == 1 else None
+                    if ekid is None:
+                        revoked_all = [k for k in sc.agent_kids(registry, appr.get("approver"))
+                                       if sc.kid_is_revoked(registry, appr.get("approver"), k)]
+                        ekid = revoked_all[0] if revoked_all else None
+                revoked = (ekid is not None
+                           and sc.kid_is_revoked(registry, appr.get("approver"), ekid))
+                good = not ambiguous and not revoked and sc.verify_approval(
                     registry, appr.get("approver"), appr.get("kid"),
                     sc.approval_signing_input(appr, h), sc.unb64u(appr["sig"]))
             except Exception:
@@ -737,6 +764,10 @@ def _approval_ok(name: str, candidates: list, h: dict, registry, policy, at) -> 
                 mine.append(("approval_kid_required",
                              f"approval for '{name}' names no kid, and approver "
                              f"'{appr.get('approver')}' has more than one key on record"))
+            elif revoked:
+                mine.append(("approval_key_revoked",
+                             f"approval for '{name}' is signed with revoked key '{ekid}' of approver "
+                             f"'{appr.get('approver')}': the revocation operator revoked this kid"))
             elif not good:
                 mine.append(("approval_signature_invalid",
                              f"approval for '{name}' carries a signature that does not verify "
