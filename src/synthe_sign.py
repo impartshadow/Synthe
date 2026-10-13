@@ -12,6 +12,17 @@
   sign     PACKET --key KEYFILE [--out FILE]
            Sender signs the handoff object. Signs exactly what the receiver
            will verify; any later edit to the handoff breaks the signature.
+  sign-registry    --registry REG.json --key OPKEY.json [--kid KID] [--out FILE] [--force]
+           Sign a registry with an operator key (genesis-sign, or re-sign after
+           editing the body; the rotation chain is preserved). --force re-signs
+           after a legitimate body edit (the stale body signature is not
+           verified; the chain still is). Defaults to signing the registry
+           file in place.
+  rotate-registry-key --registry REG.json --old-key OLD.json --new-key NEW.json
+           [--new-kid KID] [--out FILE]
+           The rotation ceremony: the current operator key attests the new key,
+           extending the verifiable chain; the body is re-signed by the new key.
+           Defaults to updating the registry file in place.
   approve  PACKET --key KEYFILE --action NAME [--expires-at TS] [--out FILE] [--detached]
            An approver (human or agent) signs an approval bound to this
            handoff's idempotency key, sender and receiver, and appends it to
@@ -326,6 +337,63 @@ def cmd_approve(a) -> int:
     return 0
 
 
+def cmd_sign_registry(a) -> int:
+    """Sign a registry file with an operator key. An unsigned registry gets a
+    genesis signature (a self-issued chain of length 1). An already-signed
+    registry is verified first, then re-signed with the same operator key,
+    preserving the rotation chain (use this after editing the body)."""
+    key = load_key(a.key)
+    reg = _load(a.registry)
+    try:
+        if isinstance(reg.get("signature"), dict):
+            kid = reg["signature"].get("kid")
+            if a.kid and a.kid != kid:
+                sys.stderr.write(f"note: ignoring --kid {a.kid!r}: re-sign keeps the chain's "
+                                 f"current kid {kid!r}\n")
+            ok, info = sc.verify_registry_signature(reg)
+            if not ok and not a.force:
+                sys.stderr.write(f"refusing to sign: current registry signature invalid: {info}\n"
+                                 f"  (If you edited the body legitimately, re-run with --force.)\n")
+                return 2
+            signed = sc.resign_registry(reg, key["_secret"], kid, force=a.force)
+            sys.stderr.write(f"re-signed registry with operator key {kid!r} "
+                             f"(chain length {len(signed['signature']['chain'])} preserved)"
+                             f"{' --force: prior body signature not verified' if a.force and not ok else ''}\n")
+        else:
+            kid = a.kid or key.get("kid") or "op-1"
+            signed = sc.sign_registry(reg, key["_secret"], kid)
+            sys.stderr.write(f"signed registry with new operator key {kid!r} (genesis chain)\n"
+                             f"  public key: {sc.b64u(sc.public_key(key['_secret']))}\n"
+                             f"  Distribute this public key to verifiers out of band.\n")
+    except ValueError as exc:
+        sys.stderr.write(f"sign-registry failed: {exc}\n")
+        return 2
+    _write(signed, a.out)
+    return 0
+
+
+def cmd_rotate_registry_key(a) -> int:
+    """The operator-key rotation ceremony: the current operator key attests the
+    new key, the attestation extends the chain, and the body is re-signed by the
+    new key. The existing chain and body signature are verified first."""
+    old = load_key(a.old_key)
+    new = load_key(a.new_key)
+    new_kid = a.new_kid or new.get("kid") or "op-2"
+    reg = _load(a.registry)
+    try:
+        rotated = sc.rotate_registry_key(reg, old["_secret"], new["_secret"], new_kid)
+    except ValueError as exc:
+        sys.stderr.write(f"rotation failed: {exc}\n")
+        return 2
+    chain = rotated["signature"]["chain"]
+    sys.stderr.write(f"rotated registry operator key to {new_kid!r} "
+                     f"(chain length {len(chain)}; supersedes {chain[-1]['supersedes']!r})\n")
+    for e in chain:
+        sys.stderr.write(f"  seq {e['seq']}: {e['kid']!r} {sc.b64u(sc.unb64u(e['public_key'])[:8])}...\n")
+    _write(rotated, a.out)
+    return 0
+
+
 def cmd_verify(a) -> int:
     packet, registry = _load(a.packet), _load(a.registry)
     h = packet.get("handoff", {})
@@ -548,10 +616,32 @@ def main(argv=None) -> int:
                     help="the new operator's key file (must be a registered, unrevoked Ed25519 key)")
     ro.add_argument("--reason", default="", help="why the operator key is being rotated (audit trail)")
     ro.add_argument("--out", help="write the updated registry here instead of in place")
+    sr = sub.add_parser("sign-registry",
+                        help="sign a registry file with an operator key (genesis-sign or re-sign)")
+    sr.add_argument("--registry", required=True, help="registry JSON file to sign")
+    sr.add_argument("--key", required=True, help="operator key file (synthe-sign keygen output)")
+    sr.add_argument("--kid", help="operator key id (default: the key file's kid, else 'op-1')")
+    sr.add_argument("--force", action="store_true",
+                    help="re-sign after a legitimate body edit: skip verification of the "
+                         "stale body signature (the rotation chain is still verified)")
+    sr.add_argument("--out", help="write the signed registry here (default: overwrite --registry)")
+    rr = sub.add_parser("rotate-registry-key",
+                        help="rotate the registry operator key: old key attests the new key")
+    rr.add_argument("--registry", required=True, help="signed registry JSON file")
+    rr.add_argument("--old-key", required=True, help="current operator key file")
+    rr.add_argument("--new-key", required=True, help="new operator key file")
+    rr.add_argument("--new-kid", help="key id for the new operator key (default: key file's kid, else 'op-2')")
+    rr.add_argument("--out", help="write the rotated registry here (default: overwrite --registry)")
     a = ap.parse_args(argv)
+    if a.cmd == "sign-registry" and not a.out:
+        a.out = a.registry
+    if a.cmd == "rotate-registry-key" and not a.out:
+        a.out = a.registry
     return {"keygen": cmd_keygen, "sign": cmd_sign, "approve": cmd_approve,
             "verify": cmd_verify, "protect": cmd_protect, "revoke-kid": cmd_revoke_kid,
-            "revocations": cmd_revocations, "rotate-operator": cmd_rotate_operator}[a.cmd](a)
+            "revocations": cmd_revocations, "rotate-operator": cmd_rotate_operator,
+            "sign-registry": cmd_sign_registry,
+            "rotate-registry-key": cmd_rotate_registry_key}[a.cmd](a)
 
 
 if __name__ == "__main__":

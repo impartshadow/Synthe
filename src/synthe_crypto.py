@@ -42,6 +42,10 @@ APPROVAL_SIG_DOMAIN = "synthe/approval-signature/v1"
 RECEIPT_SIG_DOMAIN = "synthe/effect-receipt/v1"
 TOPOLOGY_SIG_DOMAIN = "synthe/topology-signature/v1"
 
+REGISTRY_SIG_DOMAIN = "synthe/registry-signature/v1"
+REGISTRY_ROTATION_DOMAIN = "synthe/registry-rotation/v1"
+REGISTRY_SIGNATURE_BLOCK = "signature"  # top-level key holding the registry's signature
+
 
 # --------------------------------------------------------------------------
 # encoding helpers
@@ -506,8 +510,8 @@ def verify_approval(registry: dict | None, approver, kid, msg: bytes, sig: bytes
 #
 # Rotating the operator key must retire the old public key into
 # `past_operators` (the `synthe-sign rotate-operator` ceremony does this),
-# otherwise records it signed stop authenticating and the keys they revoked
-# silently come back to life. Retired keys verify old records only; they can
+# otherwise records it signed stop authenticating. They still revoke (fail
+# closed: enforced_revocations) and revocation_problems() reports them. Retired keys verify old records only; they can
 # never issue new revocations.
 #
 # What this does NOT do: it can't detect a revocation record being *removed*
@@ -760,3 +764,254 @@ def revocation_problems(registry) -> list:
                             f"(fail closed), but its issuer is unproven; re-issue it with "
                             f"synthe-sign revoke-kid or retire the signing key into past_operators")
     return problems
+
+# Signed agent registry
+#
+# A registry file may carry a top-level "signature" block:
+#
+#   {"agents": {...},
+#    "signature": {"alg": "Ed25519", "kid": "op-2",
+#                  "sig": "<operator signs REGISTRY_SIG_DOMAIN + canonical(body)>",
+#                  "chain": [ {"seq": 0, "kid": "op-1", "public_key": "<b64u>",
+#                              "sig": "<op-1 self-issues the genesis attestation>"},
+#                             {"seq": 1, "kid": "op-2", "public_key": "<b64u>",
+#                              "supersedes": "op-1",
+#                              "sig": "<op-1 signs REGISTRY_ROTATION_DOMAIN + canonical(attestation)>"},
+#                             ... ]}}
+#
+# The chain makes key rotation verifiable: every operator key change is an
+# attestation signed by the key it replaces, linked back to a genesis
+# self-issuance. The loader verifies the whole chain, then verifies the body
+# signature under the chain's current key, so rotating the key does not break
+# verification of history and a tampered chain fails closed.
+#
+# Trust anchor honesty: the genesis entry is self-issued (anyone can mint
+# one), so the FIRST time you accept a registry you must get the genesis
+# operator key out of band (trust on first use). After that, every rotation
+# is cryptographically bound to its predecessor: an attacker who steals the
+# registry file but not the operator private key cannot add agents, remove
+# agents, or rotate to their own key without detection.
+
+def registry_body(reg: dict) -> dict:
+    """The registry payload the signature covers: everything but the signature block."""
+    return {k: v for k, v in reg.items() if k != REGISTRY_SIGNATURE_BLOCK}
+
+
+def registry_signing_input(reg: dict) -> bytes:
+    """Bytes the operator signs: domain tag + canonical JSON of the registry body."""
+    return REGISTRY_SIG_DOMAIN.encode() + b"\n" + canonical_json(registry_body(reg))
+
+
+def rotation_signing_input(attestation: dict) -> bytes:
+    """Bytes an outgoing operator key signs to authorize its replacement."""
+    body = {k: v for k, v in attestation.items() if k != "sig"}
+    return REGISTRY_ROTATION_DOMAIN.encode() + b"\n" + canonical_json(body)
+
+
+def _decode_b64u_field(value, what: str) -> bytes:
+    try:
+        return unb64u(value)
+    except Exception:
+        raise ValueError(f"bad base64url in {what}")
+
+
+def _parse_genesis_pin(value: str):
+    """Parse a genesis pin value into ("pubkey", 32-byte-key) or
+    ("fingerprint", 32-byte-sha256-digest). Accepts the base64url encoding of
+    the 32-byte genesis Ed25519 public key, or the 64-char hex sha256
+    fingerprint of that key. Comment lines (#...) and blank lines are ignored
+    so the value can come straight from a registry-genesis.key file. Raises
+    ValueError on anything else."""
+    text = "\n".join(
+        line for line in value.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ).strip()
+    if not text:
+        raise ValueError("genesis pin is empty")
+    if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
+        return ("fingerprint", bytes.fromhex(text))
+    try:
+        raw = unb64u(text)
+    except Exception:
+        raise ValueError(
+            "genesis pin is neither base64url of a 32-byte Ed25519 public key "
+            "nor a 64-char hex sha256 fingerprint of one")
+    if len(raw) != 32:
+        raise ValueError("genesis pin public key is not 32 bytes")
+    return ("pubkey", raw)
+
+
+def genesis_pin_matches(pin_value: str, genesis_pub: bytes) -> bool:
+    """True when the genesis public key matches the pin (raw key or sha256
+    fingerprint form). Raises ValueError when the pin value is unparseable."""
+    kind, val = _parse_genesis_pin(pin_value)
+    if kind == "pubkey":
+        return val == genesis_pub
+    return hashlib.sha256(genesis_pub).digest() == val
+
+
+def _verify_chain(chain):
+    """Verify the rotation chain link by link. Returns (True, (key, kid)) or
+    (False, reason). The genesis entry is self-issued; each later attestation
+    must be signed by the key it supersedes."""
+    prev_key = None
+    prev_kid = None
+    seen_kids = set()
+    for i, entry in enumerate(chain):
+        where = f"signature.chain[{i}]"
+        if not isinstance(entry, dict):
+            return False, f"{where} is malformed", None
+        if entry.get("seq") != i:
+            return False, f"{where}.seq must be {i}", None
+        kid = entry.get("kid")
+        if not isinstance(kid, str) or not kid:
+            return False, f"{where}.kid must be a non-empty string", None
+        if kid in seen_kids:
+            return False, f"{where}.kid {kid!r} already appears in the rotation chain", None
+        seen_kids.add(kid)
+        try:
+            pub = _decode_b64u_field(entry.get("public_key"), f"{where}.public_key")
+        except ValueError as exc:
+            return False, str(exc), None
+        if len(pub) != 32:
+            return False, f"{where}.public_key is not a 32-byte Ed25519 key", None
+        try:
+            att_sig = _decode_b64u_field(entry.get("sig"), f"{where}.sig")
+        except ValueError as exc:
+            return False, str(exc), None
+        if i == 0:
+            # Genesis: self-issued. Proves the issuer holds the private key;
+            # the operator must still distribute this key out of band.
+            anchor, why = pub, "genesis attestation is not self-signed"
+        else:
+            if entry.get("supersedes") != prev_kid:
+                return False, f"{where}.supersedes must name the previous key {prev_kid!r}", None
+            anchor, why = prev_key, f"rotation attestation not signed by the previous key {prev_kid!r}"
+        if not verify_bytes(anchor, rotation_signing_input(entry), att_sig):
+            return False, why, None
+        prev_key, prev_kid = pub, kid
+    return True, "", (prev_key, prev_kid)
+
+
+def verify_registry_signature(reg: dict, genesis_pin: str | None = None):
+    """Verify a signed registry's chain and body signature.
+
+    Returns (True, {"kid": current_kid, "chain_length": n}) or
+    (False, "<human-readable reason>"). A missing signature block is a
+    failure here too: the loader turns it into the registry_signature_invalid
+    rejection unless the operator explicitly allowed unsigned registries.
+
+    genesis_pin (base64url of the 32-byte genesis public key, or its 64-char
+    hex sha256 fingerprint) closes the trust-anchor hole: without it any
+    self-consistent chain verifies, so the pin is what binds "this registry"
+    to "the operator we trust". A registry whose genesis key does not match
+    the pin is rejected even if every signature in it verifies.
+    """
+    sig = reg.get(REGISTRY_SIGNATURE_BLOCK)
+    if not isinstance(sig, dict):
+        return False, "registry has no 'signature' block: it is unsigned"
+    if sig.get("alg") != ALG:
+        return False, f"unsupported or missing registry signature alg {sig.get('alg')!r} (only Ed25519)"
+    chain = sig.get("chain")
+    if not isinstance(chain, list) or not chain:
+        return False, "'signature.chain' must be a non-empty list of key attestations"
+    ok, reason, current = _verify_chain(chain)
+    if not ok:
+        return False, reason
+    prev_key, prev_kid = current
+    if genesis_pin is not None:
+        try:
+            genesis_pub = unb64u(chain[0]["public_key"])
+        except Exception:
+            return False, "genesis attestation public_key is not valid base64url"
+        try:
+            pin_ok = genesis_pin_matches(genesis_pin, genesis_pub)
+        except ValueError as exc:
+            return False, f"bad genesis pin: {exc}"
+        if not pin_ok:
+            return False, ("genesis operator key does not match the pinned genesis key "
+                           "(--registry-genesis-key / SYNTHE_REGISTRY_GENESIS_KEY / "
+                           "registry-genesis.key): this registry was signed by someone else")
+    if sig.get("kid") != prev_kid:
+        return False, "signature.kid does not match the chain's current key"
+    try:
+        body_sig = _decode_b64u_field(sig.get("sig"), "signature.sig")
+    except ValueError as exc:
+        return False, str(exc)
+    if not verify_bytes(prev_key, registry_signing_input(reg), body_sig):
+        return False, "registry body signature does not verify under the current operator key"
+    return True, {"kid": prev_kid, "chain_length": len(chain)}
+
+
+def sign_registry(reg: dict, secret: bytes, kid: str) -> dict:
+    """Genesis-sign a registry: returns a new dict with a signature block whose
+    chain is a single self-issued attestation for (kid, secret). Any existing
+    signature block is replaced."""
+    if len(secret) != 32:
+        raise ValueError("Ed25519 private key must be 32 bytes")
+    if not isinstance(kid, str) or not kid:
+        raise ValueError("kid must be a non-empty string")
+    body = registry_body(reg)
+    genesis = {"seq": 0, "kid": kid, "public_key": b64u(public_key(secret))}
+    genesis["sig"] = b64u(sign_bytes(secret, rotation_signing_input(genesis)))
+    block = {"alg": ALG, "kid": kid, "chain": [genesis]}
+    block["sig"] = b64u(sign_bytes(secret, registry_signing_input(body)))
+    return {**body, "signature": block}
+
+
+def resign_registry(reg: dict, secret: bytes, kid: str | None = None, force: bool = False) -> dict:
+    """Re-sign an already-signed registry after editing its body, preserving the
+    rotation chain. The key must be the chain's current operator key. By default
+    the existing signature is verified first, so a tampered registry cannot be
+    laundered by re-signing; pass force=True when the body was legitimately
+    edited (the old body signature is then expected to be stale, but the chain
+    itself must still verify)."""
+    sig = reg.get(REGISTRY_SIGNATURE_BLOCK)
+    if not isinstance(sig, dict):
+        raise ValueError("registry has no signature block: use sign_registry for a genesis signature")
+    chain = sig.get("chain")
+    if not isinstance(chain, list) or not chain:
+        raise ValueError("signature chain is missing or empty")
+    if not force:
+        ok, info = verify_registry_signature(reg)
+        if not ok:
+            raise ValueError(f"cannot re-sign: current registry signature invalid: {info}")
+    else:
+        ok, reason, _ = _verify_chain(chain)
+        if not ok:
+            raise ValueError(f"cannot re-sign: rotation chain invalid: {reason}")
+    if public_key(secret) != unb64u(chain[-1]["public_key"]):
+        raise ValueError("re-signing key is not the registry's current operator key")
+    kid = kid or sig.get("kid") or chain[-1].get("kid")
+    body = registry_body(reg)
+    block = {"alg": ALG, "kid": kid, "chain": chain}
+    block["sig"] = b64u(sign_bytes(secret, registry_signing_input(body)))
+    return {**body, "signature": block}
+
+
+def rotate_registry_key(reg: dict, old_secret: bytes, new_secret: bytes, new_kid: str) -> dict:
+    """The rotation ceremony: the current operator key attests the new key, the
+    attestation is appended to the chain, and the body is re-signed by the new
+    key. The existing chain and body signature are verified first, so the
+    ceremony fails closed on a tampered registry or a wrong old key."""
+    ok, info = verify_registry_signature(reg)
+    if not ok:
+        raise ValueError(f"cannot rotate: current registry signature invalid: {info}")
+    if len(new_secret) != 32:
+        raise ValueError("Ed25519 private key must be 32 bytes")
+    if not isinstance(new_kid, str) or not new_kid:
+        raise ValueError("new_kid must be a non-empty string")
+    chain = reg["signature"]["chain"]
+    old_entry = chain[-1]
+    if public_key(old_secret) != unb64u(old_entry["public_key"]):
+        raise ValueError("old key does not match the registry's current operator key")
+    if any(e.get("kid") == new_kid for e in chain):
+        raise ValueError(f"kid {new_kid!r} already appears in the rotation chain")
+    attestation = {"seq": len(chain), "kid": new_kid,
+                   "public_key": b64u(public_key(new_secret)),
+                   "supersedes": old_entry["kid"]}
+    attestation["sig"] = b64u(sign_bytes(old_secret, rotation_signing_input(attestation)))
+    body = registry_body(reg)
+    block = {"alg": ALG, "kid": new_kid, "chain": [*chain, attestation]}
+    block["sig"] = b64u(sign_bytes(new_secret, registry_signing_input(body)))
+    return {**body, "signature": block}

@@ -104,6 +104,16 @@ stamp); the checker ignores it.
 One JSON file, fixed by the operator. It decides who exists, which keys they
 sign with, and what each receiver will accept.
 
+**Signed registry (optional).** The registry may carry a top-level `signature`
+block: an Ed25519 operator signature over the rest of the file plus a rotation
+chain back to a genesis key (`synthe-sign sign-registry`,
+`synthe-sign rotate-registry-key`). It is enforced only when a genesis key is
+pinned (`--registry-genesis-key`, `SYNTHE_REGISTRY_GENESIS_KEY`, or a
+`registry-genesis.key` file next to the checker). With a pin, an unsigned,
+tampered or differently-rooted registry fails with `registry_signature_invalid`
+in every caller. Without one, the registry loads unverified (the CLI warns;
+`--require-signed-registry` rejects instead).
+
 ```json
 {
   "policy": { ... },                      // optional: applies to every receiver
@@ -338,7 +348,7 @@ overlapping.
 `bad_expires_at`, `artifact_path_escapes_workspace`, `evidence_not_verbatim`,
 `verbatim_evidence_unpinned`, `evidence_path_escapes_workspace`,
 `workspace_required`, `packet_unreadable`, `registry_unreadable`,
-`registry_malformed`, `ledger_corrupt`, `ledger_required`,
+`registry_malformed`, `registry_signature_invalid`, `ledger_corrupt`, `ledger_required`,
 `receiver_mismatch`,
 `missing_idempotency_key`, `completion_unknown_key`, `claim_token_required`,
 `legacy_claim_unbound`,

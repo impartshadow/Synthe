@@ -1558,7 +1558,9 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
                        "proposal needs the claim token returned with the handoff's ACCEPT")
         receipt["effect"] = {"action": action, **{k: params.get(k) for k in ("remote", "branch", "commit")}}
 
-        registry, err = hc.load_registry(str(cfg.registry_path))
+        # Signed registry: enforced once a genesis key is pinned
+        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+        registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
         if err:
             raise Deny("invalid", err["reasons"][0]["code"], err["reasons"][0]["message"])
         extra = load_approvals(cfg, h)
@@ -1684,7 +1686,9 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
                 # Revocation cannot race a push after returning successfully.
                 if lane:
                     def authorize(paths):
-                        current_registry, error = hc.load_registry(str(cfg.registry_path))
+                        # Signed registry: enforced once a genesis key is pinned
+                        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+                        current_registry, error = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
                         if error:
                             raise Deny("invalid", "registry_unreadable", "registry unavailable at dispatch")
                         valid, why = hc.validate(packet, registry=current_registry, ledger={}, workspace=cfg.workspace,
@@ -1820,7 +1824,9 @@ def _staged_ready(cfg: BrokerConfig, rec: dict) -> bool:
     while it still waits for its approval or its upstream."""
     packet, action = rec["packet"], rec["action"]
     h = packet["handoff"]
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         return True
     plan = [a for a in h.get("planned_actions") or [] if isinstance(a, dict) and a.get("name") == action]
@@ -1945,7 +1951,9 @@ def submit_approval(cfg: BrokerConfig, approval, origin: dict | None = None) -> 
             "state": "blocked", "code": "approval_unsigned",
             "message": "a detached approval must carry the approver's signature (anyone could write an unsigned one)"}]),
             "commits": []}
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         return {"receipt": finish("approval_rejected", err["reasons"]), "commits": []}
     if a["to"] not in (registry.get("agents") or {}):
@@ -1998,7 +2006,9 @@ def submit_delegate(cfg: BrokerConfig, doc, origin: dict | None = None, escalate
         receipt["delegate"]["note"] = receipt["delegate"]["note"][:500]
     receipt["handoff"] = {k: x.get(k) for k in ("idempotency_key", "from", "to") if isinstance(x.get(k), str)}
     rejected = "escalation_rejected" if escalate else "delegate_approval_rejected"
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         return {"receipt": finish(rejected, err["reasons"]), "commits": []}
     staged = None
@@ -2033,7 +2043,9 @@ def delegate_grant(cfg: BrokerConfig, staged_id) -> dict:
         rec = copy.deepcopy((box["data"].get(key) or {}).get(action))
     if rec is None:
         raise Deny("invalid", "staged_unknown", f"no staged proposal {staged_id!r}")
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         raise Deny("invalid", err["reasons"][0]["code"], err["reasons"][0]["message"])
     h = rec["packet"]["handoff"]
@@ -2079,7 +2091,9 @@ UI_FILE = _ui_file()
 
 
 def console_state(cfg: BrokerConfig) -> dict:
-    registry, _ = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, _ = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     chain = verify_receipts(cfg.receipts_path, registry, cfg.broker_id)
     ledger = hc.load_ledger(cfg.ledger_path) if cfg.ledger_path else {}
     claims = []
@@ -2220,7 +2234,9 @@ def cmd_push(a) -> int:
 
 def cmd_receipts(a) -> int:
     cfg = BrokerConfig(a.config)
-    registry, err = hc.load_registry(str(cfg.registry_path))
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
     if err:
         print(json.dumps(err, indent=2))
         return 2

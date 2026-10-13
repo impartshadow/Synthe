@@ -230,7 +230,9 @@ class Broker:
             return {"ok": False, "error": {"code": "broker_error", "message": f"{type(exc).__name__}: {exc}"}}
 
     def _registry(self):
-        registry, err = hc.load_registry(str(self.cfg.registry_path))
+        # Signed registry: enforced once a genesis key is pinned
+        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+        registry, err = hc.load_registry(str(self.cfg.registry_path), allow_unsigned=True)
         if err:
             raise Refused(err["reasons"][0]["code"], err["reasons"][0]["message"])
         return registry
@@ -353,7 +355,9 @@ class Broker:
 
     def op_lane_template_draft(self, args, isolation):
         import synthe_lane_templates as lanes
-        registry, err = hc.load_registry(str(self.cfg.registry_path))
+        # Signed registry: enforced once a genesis key is pinned
+        # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+        registry, err = hc.load_registry(str(self.cfg.registry_path), allow_unsigned=True)
         receiver = args.get("receiver")
         if err or not lanes.enabled(self.cfg, receiver):
             raise Refused("template_scope", "lane templates are not enabled for this receiver")

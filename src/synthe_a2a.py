@@ -157,7 +157,9 @@ def main(argv=None):
     if a.cmd == "card-extension":
         print(json.dumps(agent_card_extension(), indent=2))
         return 0
-    registry, err = hc.load_registry(a.registry)
+    # Signed registry: enforced once a genesis key is pinned
+    # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+    registry, err = hc.load_registry(a.registry, allow_unsigned=True)
     if not err:
         try:
             message = hc.strict_loads(Path(a.message).read_text())

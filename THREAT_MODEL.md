@@ -237,8 +237,25 @@ Content proposals are not delegated yet (they wait for a human).
    budgets are checked *before* the work. Nothing yet verifies what actually
    happened (roadmap: verify the diff on `--complete`). Budgets are checked on
    the sender's *estimates*, so a lying `est_usd` passes.
-4. **Whoever controls the registry.** It's an unsigned JSON file today. Signed
-   registry is a Phase 2 item, and should come early.
+4. **Whoever controls the registry file but not the operator key** (once a
+   genesis key is pinned). The registry can carry an Ed25519 operator
+   signature over its body, and operator-key rotation is a verifiable chain
+   (each new key is attested by the key it replaces; `synthe-sign
+   sign-registry` / `synthe-sign rotate-registry-key`). The trust anchor is a
+   genesis pin: the operator's genesis public key (or its sha256 fingerprint)
+   from `--registry-genesis-key`, `SYNTHE_REGISTRY_GENESIS_KEY`, or a
+   `registry-genesis.key` file the operator places next to the checker. With
+   a pin, every caller (the CLI and the broker, commit broker, MCP and A2A
+   daemons) requires a signed registry whose chain leads back to the pinned
+   key, and fails closed with `registry_signature_invalid` otherwise. Honest
+   limits: (a) with no pin configured, which is the default, the registry is
+   NOT verified (a self-issued signature proves nothing), so whoever can edit
+   it decides who exists; the CLI warns, and `--require-signed-registry`
+   turns that into a rejection; (b) the pin is trust-on-first-use: it must
+   reach the checker out of band, and whoever provisions it decides which
+   operator is trusted. Nothing in this repo ships a pin;
+   `examples/registry-genesis.pub` is the throwaway example key, for trying
+   the examples only.
 5. **Leaked or usable keys.** A leaked key is revoked, not just rotated out: the
    registry's `revocation` section lists revoked (agent, kid) pairs, each record
    signed by a designated revocation operator key, and every signature verification

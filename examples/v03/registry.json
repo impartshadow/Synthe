@@ -85,5 +85,18 @@
     "lebron-crown": {
       "alias_of": "lebron"
     }
+  },
+  "signature": {
+    "alg": "Ed25519",
+    "kid": "example-key",
+    "chain": [
+      {
+        "seq": 0,
+        "kid": "example-key",
+        "public_key": "l2hhlEtIWydQUlkmKwmLQ27fTM2i7WpgIfrE02AfuWY",
+        "sig": "eZrcW6Wf5M_ttNStnBEJ3Q9PzJuvJSBQR_maxAhfQVIENHq8Hkm6RYb9-Tld9N14MiGd2BQ_HbC627NlFwGhCA"
+      }
+    ],
+    "sig": "bJdxNiCME9rhR2cJGe1txJQC6sJEMRbKPITNf_3XKyTXDrQQGejIny6SMlKdjiugCWo2W8U2pMh16L9WgR0lDg"
   }
 }

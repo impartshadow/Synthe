@@ -1951,8 +1951,51 @@ def exit_code(result: dict) -> int:
     return 0 if result.get("decision") in ("ACCEPT", "COMPLETED", "RELEASED") else 2
 
 
-def load_registry(path) -> tuple[dict | None, dict | None]:
-    """Return (registry, None) or (None, reject_result)."""
+GENESIS_PIN_FILENAME = "registry-genesis.key"
+GENESIS_PIN_ENV = "SYNTHE_REGISTRY_GENESIS_KEY"
+
+
+def resolve_genesis_pin(explicit=None):
+    """Return the configured genesis pin value, or None.
+
+    Precedence: explicit --registry-genesis-key flag > SYNTHE_REGISTRY_GENESIS_KEY
+    env var > registry-genesis.key file next to this checker file. The value is
+    either base64url of the 32-byte genesis Ed25519 public key or the 64-char
+    hex sha256 fingerprint of that key (parsed by synthe_crypto.genesis_pin_matches).
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get(GENESIS_PIN_ENV)
+    if env and env.strip():
+        return env
+    pin_file = Path(__file__).resolve().parent / GENESIS_PIN_FILENAME
+    try:
+        if pin_file.is_file():
+            return pin_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return None
+
+
+def load_registry(path, allow_unsigned=True, genesis_key=None) -> tuple[dict | None, dict | None]:
+    """Return (registry, None) or (None, reject_result).
+
+    The trust anchor is a genesis pin: the operator's genesis public key (or
+    its sha256 fingerprint) from --registry-genesis-key, the
+    SYNTHE_REGISTRY_GENESIS_KEY env var, or a registry-genesis.key file the
+    operator places next to the checker (nothing ships one).
+
+    - Pin configured: the registry MUST be signed, its rotation chain must
+      verify link by link back to the pinned genesis key, and the body
+      signature must verify under the chain's current key. Anything else
+      (unsigned, tampered, wrong genesis) fails closed with
+      registry_signature_invalid, whatever allow_unsigned says.
+    - No pin: a self-issued signature proves nothing, so the registry is
+      loaded as unsigned (today's behavior) unless allow_unsigned is False,
+      in which case it is rejected and the caller is told to pin a key.
+
+    The returned registry never contains the signature block itself.
+    """
     if not path:
         return None, None
     try:
@@ -1961,7 +2004,30 @@ def load_registry(path) -> tuple[dict | None, dict | None]:
         return None, _reject("invalid", "registry_unreadable", f"cannot read registry: {exc}")
     if not isinstance(reg, dict) or not isinstance(reg.get("agents", {}), dict):
         return None, _reject("invalid", "registry_malformed", "registry must be an object with an 'agents' object")
-    return reg, None
+    pin = resolve_genesis_pin(genesis_key)
+    if pin and pin.strip():
+        if "signature" not in reg:
+            return None, _reject(
+                "invalid", "registry_signature_invalid",
+                "a registry genesis key is pinned, so the registry must be signed, but it carries "
+                "no signature block: sign it with `synthe-sign sign-registry`")
+        try:
+            sc = _crypto()
+        except ImportError as exc:
+            return None, _reject("invalid", "registry_signature_invalid",
+                                 f"registry signature cannot be checked: {exc}")
+        ok, info = sc.verify_registry_signature(reg, genesis_pin=pin)
+        if not ok:
+            return None, _reject("invalid", "registry_signature_invalid",
+                                 f"registry signature rejected: {info}")
+        return {k: v for k, v in reg.items() if k != "signature"}, None
+    if not allow_unsigned:
+        return None, _reject(
+            "invalid", "registry_signature_invalid",
+            "a signed registry is required but no genesis key is pinned, so no signature can be "
+            "trusted: pin the operator's genesis key with --registry-genesis-key, the "
+            "SYNTHE_REGISTRY_GENESIS_KEY env var, or a registry-genesis.key file next to the checker")
+    return {k: v for k, v in reg.items() if k != "signature"}, None
 
 
 def main(argv=None) -> int:
@@ -1970,6 +2036,16 @@ def main(argv=None) -> int:
                     "v0.3 receiver policy + signatures)")
     ap.add_argument("packet", help="handoff packet JSON file")
     ap.add_argument("--registry", help="agent registry JSON (canonical ids, aliases, keys, policy)")
+    ap.add_argument("--require-signed-registry", action="store_true",
+                    help="refuse any registry that is not signed and verified against a pinned "
+                         "genesis key (needs --registry-genesis-key, SYNTHE_REGISTRY_GENESIS_KEY, "
+                         "or registry-genesis.key next to the checker)")
+    ap.add_argument("--registry-genesis-key",
+                    help="pin the registry's genesis operator key: base64url of the 32-byte "
+                         "Ed25519 public key, or its 64-char sha256 hex fingerprint. Overrides "
+                         "SYNTHE_REGISTRY_GENESIS_KEY and the registry-genesis.key file next to "
+                         "the checker. With a pin, the registry must be signed and verify back to "
+                         "this key. Without one, registries load unverified (a warning says so).")
     ap.add_argument("--ledger", help="idempotency ledger JSON file (created if absent)")
     ap.add_argument("--workspace", help="workspace root for artifact existence/hash checks")
     ap.add_argument("--dry-run", action="store_true",
@@ -2008,7 +2084,16 @@ def main(argv=None) -> int:
             result = release(packet, Path(args.ledger) if args.ledger else None,
                              reserve_ttl_hours=args.reserve_ttl_hours, force=args.force)
         else:
-            registry, err = load_registry(args.registry)
+            if args.registry and not (resolve_genesis_pin(args.registry_genesis_key) or "").strip() \
+                    and not args.require_signed_registry:
+                sys.stderr.write(
+                    "WARNING: no registry genesis key is pinned, so the agent registry is NOT "
+                    "verified: whoever can edit it decides who exists. Sign it with `synthe-sign "
+                    "sign-registry` and pin the key (--registry-genesis-key or "
+                    "SYNTHE_REGISTRY_GENESIS_KEY).\n")
+            registry, err = load_registry(args.registry,
+                                          allow_unsigned=not args.require_signed_registry,
+                                          genesis_key=args.registry_genesis_key)
             result = err or check(
                 packet, registry=registry,
                 ledger_path=Path(args.ledger) if args.ledger else None,
