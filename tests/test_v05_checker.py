@@ -113,9 +113,11 @@ def test_dependency_is_checked_at_commit_unknown_incomplete_then_ok(tmp_path):
     assert "dependency_unknown" in codes(hc.complete(p, lp, claim_token=token))
     ledger = json.loads(lp.read_text())
     ledger["k-up"] = {"state": "RESERVED", "to": "caddy"}
+    hc.seal_ledger(ledger)  # re-seal after the out-of-band edit (v2 integrity)
     lp.write_text(json.dumps(ledger))
     assert "dependency_incomplete" in codes(hc.complete(p, lp, claim_token=token))
     ledger["k-up"]["state"] = "COMPLETED"
+    hc.seal_ledger(ledger)  # re-seal after the out-of-band edit (v2 integrity)
     lp.write_text(json.dumps(ledger))
     assert hc.complete(p, lp, claim_token=token)["decision"] == "COMPLETED"
 

@@ -244,6 +244,17 @@ class SQLiteLedger(dict):
             self.conn.execute("INSERT INTO claims(key, value) VALUES (?, ?) "
                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                               (key, json.dumps(dict.__getitem__(self, key), sort_keys=True, separators=(",", ":"))))
+        # Re-seal the chain over the full table (one scan): the header row is
+        # written in the same transaction. Skipped when the current seal
+        # already covers these exact rows (e.g. nothing changed since adopt).
+        rows = self.conn.execute("SELECT key, value FROM claims").fetchall()
+        data = {k: json.loads(v) for k, v in rows}
+        if not _seal_is_current(data, data.get(LEDGER_META_KEY)):
+            seal_ledger(data)
+            self.conn.execute("INSERT INTO claims(key, value) VALUES (?, ?) "
+                              "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                              (LEDGER_META_KEY, json.dumps(data[LEDGER_META_KEY],
+                                                           sort_keys=True, separators=(",", ":"))))
         self.dirty_keys.clear()
 
 
@@ -255,20 +266,38 @@ def load_ledger(path: Path) -> dict:
             conn = _sqlite_connect(Path(path))
             conn.execute("SELECT key FROM claims LIMIT 1").fetchone()
             conn.close()
+            # SQLite stays lazy: the seal + anchor are verified when the
+            # ledger is locked for mutation (LockedLedger.__enter__); see
+            # _sqlite_verify_and_anchor. Read-only callers get raw rows.
             return SQLiteLedger(Path(path))
         except (OSError, sqlite3.DatabaseError):
-            return {"_corrupt": True}
+            return _corrupt_marker("ledger_corrupt", "ledger database is not readable")
     if path and path.exists():
         try:
-            return json.loads(path.read_text()) or {}
+            data = json.loads(path.read_text())
         except json.JSONDecodeError:
-            return {"_corrupt": True}
+            return _corrupt_marker("ledger_corrupt", "ledger file is not valid JSON")
+        if not isinstance(data, dict):
+            return _corrupt_marker("ledger_corrupt", "ledger file must contain a JSON object")
+        return _verify_json_ledger(data, path)
+    # Missing file: a fresh chain starts here -- unless an out-of-cache
+    # anchor says a chain already exists (rollback/deletion guard).
+    ok, code, message = check_ledger_anchor(exists=False, sealed=False)
+    if not ok:
+        return _corrupt_marker(code, message)
     return {}
 
 
 def save_ledger(path: Path, ledger: dict) -> None:
     """Write the ledger atomically: temp file in the same dir + os.replace,
-    so a concurrent reader never observes a torn file."""
+    so a concurrent reader never observes a torn file. Every save (re-)seals
+    the chain -- skipped only when the current seal already covers these
+    exact entries -- so every persisted state is verifiable. Never persists
+    a fail-closed corrupt marker."""
+    if not isinstance(ledger, dict) or ledger.get("_corrupt"):
+        raise ValueError("refusing to persist a corrupt ledger")
+    if not _seal_is_current(ledger, ledger.get(LEDGER_META_KEY)):
+        seal_ledger(ledger)
     if path and sqlite_ledger(path):
         try:
             conn = _sqlite_connect(Path(path))
@@ -297,12 +326,342 @@ def migrate_ledger(source: Path, destination: Path) -> dict:
         raise FileExistsError(destination)
     ledger = load_ledger(source)
     if ledger.get("_corrupt"):
-        raise ValueError("source ledger is corrupt")
+        raise ValueError(f"source ledger is corrupt: {ledger.get('_corrupt_reason')}: "
+                         f"{ledger.get('_corrupt_message')}")
     save_ledger(destination, ledger)
     copied = load_ledger(destination)
-    if copied.get("_corrupt") or dict(copied.items()) != ledger:
+    if copied.get("_corrupt") or _ledger_claims(copied) != _ledger_claims(ledger):
         raise ValueError("ledger migration verification failed")
-    return {"source": str(source), "destination": str(destination), "entries": len(ledger)}
+    return {"source": str(source), "destination": str(destination),
+            "entries": len(_ledger_claims(ledger))}
+
+
+# ---------------------------------------------------------------------------
+# Ledger integrity binding (v2): HMAC-sealed hash chain + out-of-cache anchor.
+#
+# Every ledger write seals a chain header under the reserved top-level key
+# "~synthe" -- the ONE reserved namespace for chain metadata in the ledger
+# file (idempotency keys may not start with "~"; see validate()). The header's
+# chain_head is a hash-chain link over (chain_seq, chain_prev, entries):
+#
+#   head_n = MAC("synthe-ledger-chain/v2" || seq_n || head_{n-1} || canonical(entries_n))
+#
+# MAC is HMAC-SHA256 keyed by the SYNTHE_LEDGER_HMAC_KEY environment variable
+# when set -- a CI secret is the intended home -- and plain SHA-256 otherwise.
+# Without the key the seal detects accidental corruption (bit-rot, hand
+# edits, truncation, torn writes) but NOT forgery by someone who can write the
+# file; the header records chain_keyed so a keyed seal and an unkeyed seal are
+# never mixed (mixing fails closed as ledger_corrupt). Key rotation is
+# supported via SYNTHE_LEDGER_HMAC_KEY_PREVIOUS: verification accepts either
+# key, sealing always uses the current one, so a rotation heals on next save.
+#
+# Rollback -- a stale cache restoring an older snapshot, a forged empty
+# ledger, a deleted file -- is not detectable from the file alone, so the
+# chain also carries a monotonic chain_seq that is checked against an anchor
+# stored OUTSIDE the cache: the SYNTHE_LEDGER_ANCHOR environment variable
+# ("seq:head"), which the GitHub Action populates from the
+# SYNTHE_LEDGER_ANCHOR repository variable before each run and republishes
+# after it. A loaded ledger must match or extend the anchor; anything older,
+# divergent, or missing fails closed with a named reason code.
+#
+# When no anchor is configured (local runs, tests, first run), the checker
+# degrades gracefully: the seal is still verified (corruption detection), a
+# legacy unsealed ledger is adopted in place as a new genesis chain -- no
+# manual --adopt-legacy step -- and a warning notes that rollback is not
+# provable. Set SYNTHE_LEDGER_ANCHOR_REQUIRED=1 (the Action does this whenever
+# it fetched an anchor) to make a missing/unreadable anchor fail closed as
+# ledger_anchor_unavailable instead. SYNTHE_LEDGER_BOOTSTRAP=1 skips anchor
+# enforcement for one run (the documented recovery after a total cache
+# eviction); the chain restarts and the anchor is republished.
+# ---------------------------------------------------------------------------
+
+LEDGER_CHAIN_FORMAT = "synthe-ledger-chain/v2"
+LEDGER_META_KEY = "~synthe"  # the ONE reserved namespace for chain metadata keys
+LEDGER_GENESIS_PREV = "synthe-ledger-genesis"
+
+LEDGER_HMAC_KEY_ENV = "SYNTHE_LEDGER_HMAC_KEY"
+LEDGER_HMAC_PREV_ENV = "SYNTHE_LEDGER_HMAC_KEY_PREVIOUS"
+LEDGER_ANCHOR_ENV = "SYNTHE_LEDGER_ANCHOR"  # "seq:head"
+LEDGER_ANCHOR_REQUIRED_ENV = "SYNTHE_LEDGER_ANCHOR_REQUIRED"
+LEDGER_BOOTSTRAP_ENV = "SYNTHE_LEDGER_BOOTSTRAP"
+
+_truthy = {"1", "true", "yes", "on"}
+
+_warned: set[str] = set()
+
+
+def _ledger_warn(message: str) -> None:
+    """Stderr warning, once per distinct message per process (the checker is
+    usually one CLI invocation, so operators still see it every run)."""
+    if message not in _warned:
+        _warned.add(message)
+        print(f"handoff_check: WARNING: {message}", file=sys.stderr)
+
+
+def _is_meta_key(key) -> bool:
+    """Chain-metadata namespace: reserved, never an idempotency claim."""
+    return isinstance(key, str) and key.startswith("~")
+
+
+def _ledger_claims(ledger: dict) -> dict:
+    """The claim entries of a ledger: everything except the chain header."""
+    return {k: v for k, v in ledger.items() if k != LEDGER_META_KEY}
+
+
+def _corrupt_marker(code: str, message: str) -> dict:
+    """Fail-closed ledger stand-in: every operation path checks `_corrupt`
+    and reports the specific reason via _ledger_seal_reject()."""
+    return {"_corrupt": True, "_corrupt_reason": code, "_corrupt_message": message}
+
+
+def _ledger_seal_reject(ledger: dict) -> dict:
+    code = ledger.get("_corrupt_reason") or "ledger_corrupt"
+    message = ledger.get("_corrupt_message") or "ledger file is not valid JSON"
+    return _reject("invalid", code, message)
+
+
+def _hmac_keys() -> tuple[bytes | None, bytes | None]:
+    """(current, previous) HMAC keys from the environment; None when unset."""
+    cur = os.environ.get(LEDGER_HMAC_KEY_ENV)
+    prev = os.environ.get(LEDGER_HMAC_PREV_ENV)
+    return (cur.encode() if cur else None, prev.encode() if prev else None)
+
+
+def _canonical_entries(entries: dict) -> bytes:
+    return json.dumps(entries, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode()
+
+
+def ledger_chain_link(seq: int, prev_head: str, entries: dict,
+                      key: bytes | None) -> str:
+    """One hash-chain link. Keyed (HMAC-SHA256) when a key is configured,
+    plain SHA-256 otherwise. The previous head is bound into the link, so
+    editing it invalidates the seal."""
+    msg = b"|".join((LEDGER_CHAIN_FORMAT.encode(), str(seq).encode(),
+                      prev_head.encode(), _canonical_entries(entries)))
+    if key is not None:
+        return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    return hashlib.sha256(msg).hexdigest()
+
+
+def seal_ledger(ledger: dict, *, created_by: str = "synthe") -> dict:
+    """(Re-)seal a ledger dict in place: bump chain_seq, link chain_prev to
+    the previous head, recompute chain_head. Unknown "~synthe" fields (e.g.
+    written by other tooling) are preserved. Returns the ledger."""
+    if not isinstance(ledger, dict) or ledger.get("_corrupt"):
+        raise ValueError("refusing to seal a corrupt ledger")
+    entries = _ledger_claims(ledger)
+    old = ledger.get(LEDGER_META_KEY)
+    old = old if isinstance(old, dict) else {}
+    try:
+        seq = int(old.get("chain_seq") or 0) + 1
+    except (TypeError, ValueError):
+        seq = 1
+    prev = old.get("chain_head") or LEDGER_GENESIS_PREV
+    key, _prev_key = _hmac_keys()
+    head = ledger_chain_link(seq, prev, entries, key)
+    header = dict(old)
+    header.update({
+        "chain_format": LEDGER_CHAIN_FORMAT,
+        "chain_seq": seq,
+        "chain_prev": prev,
+        "chain_head": head,
+        "chain_keyed": key is not None,
+        "sealed_at": now_utc().isoformat(),
+        "sealed_by": created_by,
+    })
+    ledger[LEDGER_META_KEY] = header
+    return ledger
+
+
+def verify_ledger_seal(ledger: dict):
+    """Verify the chain seal of a ledger dict that carries a "~synthe"
+    header with chain fields. Returns (ok, code, message, header,
+    used_prev_key). Callers must have established that chain fields exist;
+    a header without them is unsealed (legacy), not corrupt."""
+    header = ledger.get(LEDGER_META_KEY)
+    if not isinstance(header, dict):
+        return False, "ledger_corrupt", "chain header '~synthe' is malformed", {}, False
+    seq, prev, head = header.get("chain_seq"), header.get("chain_prev"), header.get("chain_head")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        return False, "ledger_corrupt", "chain header has a malformed chain_seq", header, False
+    if not isinstance(prev, str) or not prev or not isinstance(head, str) or not head:
+        return False, "ledger_corrupt", "chain header has a malformed chain link", header, False
+    key, prev_key = _hmac_keys()
+    keyed_env = key is not None
+    if bool(header.get("chain_keyed", False)) != keyed_env:
+        return (False, "ledger_corrupt",
+                "chain seal key state does not match the environment "
+                f"(header says keyed={bool(header.get('chain_keyed', False))}, "
+                f"environment {'has' if keyed_env else 'has no'} {LEDGER_HMAC_KEY_ENV}); "
+                "refusing to mix keyed and unkeyed seals", header, False)
+    entries = _ledger_claims(ledger)
+    expected = ledger_chain_link(seq, prev, entries, key)
+    used_prev = False
+    if not hmac.compare_digest(expected, head) and keyed_env and prev_key:
+        expected = ledger_chain_link(seq, prev, entries, prev_key)
+        used_prev = hmac.compare_digest(expected, head)
+    if not hmac.compare_digest(expected, head):
+        return (False, "ledger_corrupt",
+                "chain seal mismatch: the ledger file was edited, truncated, "
+                "or forged outside the checker (or the HMAC key changed without "
+                f"{LEDGER_HMAC_PREV_ENV})", header, False)
+    return True, "", "", header, used_prev
+
+
+def _seal_is_current(ledger: dict, header) -> bool:
+    """True when the ledger's seal already covers its exact entries with the
+    environment's current key state (so save_ledger can skip the reseal). A
+    seal made with the previous rotation key counts as stale: it verifies,
+    but the next save re-seals with the current key."""
+    if not isinstance(header, dict) or not isinstance(header.get("chain_head"), str):
+        return False
+    ok, _code, _msg, _hdr, used_prev = verify_ledger_seal(ledger)
+    return ok and not used_prev
+
+
+def _parse_anchor(raw: str):
+    """Parse a "seq:head" anchor; None when malformed."""
+    seq_s, sep, head = raw.partition(":")
+    if not sep or not head:
+        return None
+    try:
+        seq = int(seq_s)
+    except ValueError:
+        return None
+    if isinstance(seq, bool) or seq < 1:
+        return None
+    return seq, head
+
+
+def _read_anchor():
+    """Return (status, anchor, required, bootstrap).
+
+    status is "ok" (anchor usable), "absent" (not configured), or "malformed"
+    (set but unparseable -- treated as unavailable). required mirrors
+    SYNTHE_LEDGER_ANCHOR_REQUIRED (the Action sets it whenever it fetched an
+    anchor); bootstrap mirrors SYNTHE_LEDGER_BOOTSTRAP (one-run recovery)."""
+    raw = os.environ.get(LEDGER_ANCHOR_ENV, "").strip()
+    anchor = _parse_anchor(raw) if raw else None
+    status = "ok" if anchor else ("malformed" if raw else "absent")
+    required = os.environ.get(LEDGER_ANCHOR_REQUIRED_ENV, "").strip().lower() in _truthy
+    bootstrap = os.environ.get(LEDGER_BOOTSTRAP_ENV, "").strip().lower() in _truthy
+    return status, anchor, required, bootstrap
+
+
+def check_ledger_anchor(*, exists: bool, sealed: bool, seq: int = 0, head: str = ""):
+    """Enforce the out-of-cache anchor. A present anchor must be matched or
+    extended by the loaded chain; anything older, divergent, or missing fails
+    closed. Returns (ok, code, message)."""
+    status, anchor, required, bootstrap = _read_anchor()
+    if bootstrap:
+        _ledger_warn(f"{LEDGER_BOOTSTRAP_ENV}=1: anchor enforcement skipped for this run; "
+                     "the chain restarts here and the anchor will be republished.")
+        return True, "", ""
+    if status == "ok":
+        aseq, ahead = anchor
+        if not exists:
+            return (False, "ledger_rollback",
+                    f"ledger file is missing but an out-of-cache anchor exists (chain seq {aseq}); "
+                    "refusing to start a fresh chain -- this looks like a total cache eviction or a "
+                    f"deleted ledger. Re-run once with {LEDGER_BOOTSTRAP_ENV}=1 to re-bootstrap "
+                    "the chain deliberately.")
+        if not sealed:
+            return (False, "ledger_rollback",
+                    f"ledger has no verifiable chain seal but an out-of-cache anchor exists "
+                    f"(chain seq {aseq}); an unsealed file cannot extend a sealed chain -- refusing "
+                    "as a downgrade (possible forged or stale-cache file).")
+        if seq < aseq:
+            return (False, "ledger_rollback",
+                    f"ledger chain seq {seq} is behind the out-of-cache anchor seq {aseq}; the "
+                    "cache likely restored a stale snapshot. Refusing to forget newer claims.")
+        if seq == aseq and not hmac.compare_digest(head, ahead):
+            return (False, "ledger_diverged",
+                    f"ledger chain seq {seq} matches the anchor but the head differs: two writers "
+                    "sealed different states at the same sequence number. Refusing; reconcile "
+                    "outside the checker (the Action requires a `concurrency` group for safety).")
+        return True, "", ""
+    # Anchor unavailable.
+    if required:
+        detail = "is set but malformed" if status == "malformed" else "is not set"
+        return (False, "ledger_anchor_unavailable",
+                f"anchoring is required ({LEDGER_ANCHOR_REQUIRED_ENV}=1) but {LEDGER_ANCHOR_ENV} "
+                f"{detail}; refusing to run without the out-of-cache anchor.")
+    if exists and sealed:
+        _ledger_warn(f"no out-of-cache anchor configured ({LEDGER_ANCHOR_ENV}); chain seal "
+                     "verified, but rollback to an older snapshot is not provable in this mode.")
+    # Unsealed + no anchor: the caller adopts the ledger as a new genesis
+    # chain and logs the details itself.
+    return True, "", ""
+
+
+def _adopt_json_ledger(data: dict, path: Path) -> dict:
+    """Seal a legacy (unsealed) JSON ledger in place as a new genesis chain,
+    preserving every claim. Loudly logged; no manual migration step."""
+    n = len(_ledger_claims(data))
+    _ledger_warn(f"ledger {path} has no chain seal; adopting {n} existing claim(s) as a new "
+                 "genesis chain (entries preserved).")
+    return seal_ledger(data)
+
+
+def _verify_json_ledger(data: dict, path: Path) -> dict:
+    """Seal verification + anchor enforcement for a parsed JSON ledger.
+    Returns the ledger dict, or a fail-closed corrupt marker."""
+    header = data.get(LEDGER_META_KEY)
+    has_chain = isinstance(header, dict) and isinstance(header.get("chain_head"), str)
+    if has_chain:
+        ok, code, message, header, _used_prev = verify_ledger_seal(data)
+        if not ok:
+            return _corrupt_marker(code, message)
+        ok, code, message = check_ledger_anchor(exists=True, sealed=True,
+                                                seq=header["chain_seq"], head=header["chain_head"])
+        if not ok:
+            return _corrupt_marker(code, message)
+        return data
+    ok, code, message = check_ledger_anchor(exists=True, sealed=False)
+    if not ok:
+        return _corrupt_marker(code, message)
+    return _adopt_json_ledger(data, path)
+
+
+def _sqlite_verify_and_anchor(conn: sqlite3.Connection, path: Path, existed: bool):
+    """Verify the chain seal + anchor for a SQLite ledger inside the caller's
+    transaction. Returns None when the ledger may be used, else a fail-closed
+    corrupt marker. A legacy (unsealed) table is adopted: the genesis header
+    row is written immediately so the chain is sealed from this point on."""
+    try:
+        rows = conn.execute("SELECT key, value FROM claims").fetchall()
+    except sqlite3.DatabaseError:
+        return _corrupt_marker("ledger_corrupt", "ledger database is not readable")
+    data: dict = {}
+    for k, v in rows:
+        try:
+            data[k] = json.loads(v)
+        except ValueError:
+            return _corrupt_marker("ledger_corrupt", f"ledger row {k!r} is not valid JSON")
+    header = data.get(LEDGER_META_KEY)
+    has_chain = isinstance(header, dict) and isinstance(header.get("chain_head"), str)
+    if has_chain:
+        ok, code, message, header, _used_prev = verify_ledger_seal(data)
+        if not ok:
+            return _corrupt_marker(code, message)
+        ok, code, message = check_ledger_anchor(exists=True, sealed=True,
+                                                seq=header["chain_seq"], head=header["chain_head"])
+        if not ok:
+            return _corrupt_marker(code, message)
+        return None
+    ok, code, message = check_ledger_anchor(exists=existed, sealed=False)
+    if not ok:
+        return _corrupt_marker(code, message)
+    n = len(_ledger_claims(data))
+    _ledger_warn(f"SQLite ledger {path}: no chain seal; adopting {n} existing claim(s) as a new "
+                 "genesis chain (entries preserved).")
+    ledger = seal_ledger(dict(data))
+    conn.execute("INSERT INTO claims(key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (LEDGER_META_KEY, json.dumps(ledger[LEDGER_META_KEY],
+                                              sort_keys=True, separators=(",", ":"))))
+    return None
 
 
 def entry_state(entry: dict) -> str:
@@ -346,15 +705,19 @@ class LockedLedger:
     def __enter__(self) -> "LockedLedger":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if sqlite_ledger(self.path):
+            existed = self.path.exists()
             try:
                 self._conn = _sqlite_connect(self.path)
                 self._conn.execute("BEGIN IMMEDIATE")
-                self.ledger = SQLiteLedger(self.path, self._conn)
+                # Verify the chain seal + out-of-cache anchor before yielding;
+                # a legacy table is adopted (genesis header row written here).
+                marker = _sqlite_verify_and_anchor(self._conn, self.path, existed)
+                self.ledger = marker if marker is not None else SQLiteLedger(self.path, self._conn)
             except (OSError, sqlite3.DatabaseError):
                 if self._conn is not None:
                     self._conn.close()
                     self._conn = None
-                self.ledger = {"_corrupt": True}
+                self.ledger = _corrupt_marker("ledger_corrupt", "ledger database is not readable")
             return self
         self._fh = open(self.path.with_name(self.path.name + ".lock"), "a+")
         try:
@@ -362,16 +725,21 @@ class LockedLedger:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except ImportError:
             pass  # Windows: best-effort, atomic replace still applies
+        # load_ledger verifies the chain seal + anchor (or adopts a legacy
+        # file); a fail-closed marker is never saved back (see __exit__).
         self.ledger = load_ledger(self.path)
         return self
 
     def __exit__(self, *exc) -> bool:
         try:
             if self._conn is not None:
-                if self.dirty:
-                    self.ledger.flush()
-                self._conn.commit()
-            elif self.dirty:
+                if self.ledger.get("_corrupt"):
+                    self._conn.rollback()  # never persist a failed verification
+                else:
+                    if self.dirty:
+                        self.ledger.flush()  # flush() re-seals the chain
+                    self._conn.commit()
+            elif self.dirty and not self.ledger.get("_corrupt"):
                 save_ledger(self.path, self.ledger)
         finally:
             if self._conn is not None:
@@ -1216,7 +1584,9 @@ def _path_conflicts(ledger: dict, h: dict, key: str) -> list:
     if not mine:
         return out
     for other, entry in ledger.items():
-        if other == key or not isinstance(entry, dict) or entry_state(entry) != "RESERVED":
+        if other == key or _is_meta_key(other):
+            continue
+        if not isinstance(entry, dict) or entry_state(entry) != "RESERVED":
             continue
         if entry.get("to") not in (None, h.get("to")):
             continue
@@ -1303,6 +1673,13 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
     for name in ("id", "idempotency_key", "trace_id", "from", "to", "purpose"):
         if not isinstance(h[name], str):
             fail("invalid", f"malformed:{name}", f"{name} must be a string", reasons)
+    # The "~" prefix is the reserved chain-metadata namespace ("~synthe"): no
+    # packet may claim it, or the header could be clobbered by an ACCEPT.
+    # ("_"-prefixed keys are ordinary idempotency keys; only "~" is reserved.)
+    if isinstance(h["idempotency_key"], str) and h["idempotency_key"].startswith("~"):
+        fail("invalid", "reserved_idempotency_key",
+             f"idempotency_key {h['idempotency_key']!r} starts with '~', which is reserved "
+             f"for ledger chain metadata ('{LEDGER_META_KEY}'); choose a different key", reasons)
     if as_receiver is not None and h.get("to") != as_receiver:
         fail("invalid", "receiver_mismatch",
              f"handoff is addressed to {h.get('to')!r}, not the authenticated receiver {as_receiver!r}", reasons)
@@ -1681,7 +2058,7 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
         with LockedLedger(ledger_path) as locked:
             ledger = locked.ledger
             if ledger.get("_corrupt"):
-                return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+                return _ledger_seal_reject(ledger)
             ok, reasons = validate(packet, ledger=ledger, **kwargs)
             if not ok:
                 return _result(ok, reasons, h, info)
@@ -1721,7 +2098,7 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
             return out
     ledger = load_ledger(ledger_path) if ledger_path else {}
     if ledger.get("_corrupt"):
-        return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+        return _ledger_seal_reject(ledger)
     ok, reasons = validate(packet, ledger=ledger, **kwargs)
     return _result(ok, reasons, h, info)
 
@@ -1796,7 +2173,7 @@ def complete(packet, ledger_path: Path | None, claim_token: str | None = None,
     with LockedLedger(Path(ledger_path)) as locked:
         ledger = locked.ledger
         if ledger.get("_corrupt"):
-            return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+            return _ledger_seal_reject(ledger)
         entry = ledger.get(key)
         problem = _claim_problem(entry, h, claim_token, require_token)
         if problem:
@@ -1835,7 +2212,7 @@ def release(packet, ledger_path: Path | None, reserve_ttl_hours: float = 24.0,
     with LockedLedger(Path(ledger_path)) as locked:
         ledger = locked.ledger
         if ledger.get("_corrupt"):
-            return _reject("invalid", "ledger_corrupt", "ledger file is not valid JSON")
+            return _ledger_seal_reject(ledger)
         entry = ledger.get(key)
         if not isinstance(entry, dict) or entry_state(entry) != "RESERVED":
             return _reject("invalid", "release_not_reserved",
@@ -1883,6 +2260,8 @@ def fenced(packet, ledger_path, claim_token: str, complete_on_success: bool = Tr
         raise FenceError(_reject("invalid", "missing_idempotency_key",
                                  "packet must contain a 'handoff' object with an idempotency_key"))
     with LockedLedger(Path(ledger_path)) as locked:
+        if locked.ledger.get("_corrupt"):
+            raise FenceError(_ledger_seal_reject(locked.ledger))
         entry = locked.ledger.get(h["idempotency_key"])
         problem = _claim_problem(entry, h, claim_token, require_token=True)
         if problem is None and entry_state(entry) != "RESERVED":
@@ -1917,7 +2296,7 @@ def fenced_effect(packet, ledger_path, claim_token: str, action: str, final_acti
                                  "packet must contain a 'handoff' object with an idempotency_key"))
     with LockedLedger(Path(ledger_path)) as locked:
         if locked.ledger.get("_corrupt"):
-            raise FenceError(_reject("invalid", "ledger_corrupt", "ledger file is not valid JSON"))
+            raise FenceError(_ledger_seal_reject(locked.ledger))
         entry = locked.ledger.get(h["idempotency_key"])
         problem = _claim_problem(entry, h, claim_token, require_token=True)
         if problem is None and entry_state(entry) != "RESERVED":
@@ -1945,6 +2324,101 @@ def fenced_effect(packet, ledger_path, claim_token: str, action: str, final_acti
             entry["state"] = "COMPLETED"
             entry["completed_at"] = now_utc().isoformat()
         locked.dirty = True
+
+
+def init_ledger(path: Path):
+    """Operator command: ensure a sealed ledger chain exists at PATH.
+
+    Returns (ok, message). Missing file -> sealed genesis. Already sealed ->
+    idempotent no-op (the seal and anchor are verified first). Legacy
+    unsealed file -> adopted in place as a new genesis chain, entries
+    preserved, loudly logged (no manual migration step). Corrupt file, or an
+    out-of-cache anchor that forbids a fresh chain, -> refused: never
+    overwritten, never silently adopted.
+    """
+    path = Path(path)
+    if sqlite_ledger(path):
+        had_chain = False
+        if path.exists():
+            try:
+                conn = _sqlite_connect(path)
+                try:
+                    row = conn.execute("SELECT value FROM claims WHERE key = ?",
+                                       (LEDGER_META_KEY,)).fetchone()
+                finally:
+                    conn.close()
+                had_chain = bool(row and isinstance(json.loads(row[0]), dict)
+                                 and json.loads(row[0]).get("chain_head"))
+            except (OSError, sqlite3.DatabaseError, ValueError):
+                return False, f"refusing to initialize: ledger database at {path} is not readable"
+        with LockedLedger(path) as locked:
+            if locked.ledger.get("_corrupt"):
+                return (False,
+                        f"refusing to initialize: {locked.ledger.get('_corrupt_reason')}: "
+                        f"{locked.ledger.get('_corrupt_message')}")
+            locked.dirty = True  # persist the (possibly just adopted) seal
+        if had_chain:
+            return True, f"ledger already sealed at {path}; no-op"
+        return True, f"initialized sealed ledger chain at {path}"
+    existed = path.exists()
+    raw_sealed = False
+    if existed:
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return False, f"refusing to initialize: {path} is not valid JSON"
+        if not isinstance(raw, dict):
+            return False, f"refusing to initialize: {path} must contain a JSON object"
+        header = raw.get(LEDGER_META_KEY)
+        raw_sealed = isinstance(header, dict) and isinstance(header.get("chain_head"), str)
+    data = load_ledger(path)  # verifies seal + anchor, or adopts a legacy file
+    if data.get("_corrupt"):
+        return (False,
+                f"refusing to initialize: {data.get('_corrupt_reason')}: {data.get('_corrupt_message')}")
+    if raw_sealed:
+        seq = data[LEDGER_META_KEY]["chain_seq"]
+        return True, f"ledger already sealed at {path} (chain seq {seq}); no-op"
+    save_ledger(path, data)  # persists the genesis / adopted chain
+    n = len(_ledger_claims(data))
+    if existed:
+        return True, f"adopted {n} existing claim(s) at {path} into a new sealed chain"
+    return True, f"initialized new sealed ledger chain at {path} (genesis)"
+
+
+def ledger_head(path: Path) -> str:
+    """Return the "seq:head" anchor string for a sealed ledger, else "".
+
+    Used by the GitHub Action to publish the out-of-cache anchor. A missing,
+    unsealed, or corrupt ledger yields "" (nothing to anchor). The seal is
+    verified, but the anchor itself is NOT enforced here: publishing reads,
+    it does not gate.
+    """
+    path = Path(path)
+    try:
+        if sqlite_ledger(path):
+            if not path.exists():
+                return ""
+            conn = _sqlite_connect(path)
+            try:
+                rows = conn.execute("SELECT key, value FROM claims").fetchall()
+            finally:
+                conn.close()
+            data = {k: json.loads(v) for k, v in rows}
+        else:
+            if not path.exists():
+                return ""
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                return ""
+    except (OSError, ValueError, sqlite3.DatabaseError):
+        return ""
+    header = data.get(LEDGER_META_KEY)
+    if not isinstance(header, dict) or not isinstance(header.get("chain_head"), str):
+        return ""
+    ok, _code, _msg, header, _used_prev = verify_ledger_seal(data)
+    if not ok:
+        return ""
+    return f"{header['chain_seq']}:{header['chain_head']}"
 
 
 def exit_code(result: dict) -> int:
@@ -2034,7 +2508,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Handoff Contract validator (packet wire format v0.1; v0.2 claim ledger; "
                     "v0.3 receiver policy + signatures)")
-    ap.add_argument("packet", help="handoff packet JSON file")
+    ap.add_argument("packet", nargs="?",
+                    help="handoff packet JSON file (required unless --init-ledger or --ledger-head)")
     ap.add_argument("--registry", help="agent registry JSON (canonical ids, aliases, keys, policy)")
     ap.add_argument("--require-signed-registry", action="store_true",
                     help="refuse any registry that is not signed and verified against a pinned "
@@ -2047,6 +2522,14 @@ def main(argv=None) -> int:
                          "the checker. With a pin, the registry must be signed and verify back to "
                          "this key. Without one, registries load unverified (a warning says so).")
     ap.add_argument("--ledger", help="idempotency ledger JSON file (created if absent)")
+    ap.add_argument("--init-ledger", metavar="PATH",
+                    help="operator: ensure a sealed ledger chain exists at PATH (missing -> sealed "
+                         "genesis; legacy unsealed -> adopted in place; already sealed -> no-op; "
+                         "corrupt or anchor-forbidden -> refused, never overwritten)")
+    ap.add_argument("--ledger-head", metavar="PATH",
+                    help="print the 'seq:head' chain anchor for the ledger at PATH (empty when "
+                         "unsealed/missing/corrupt); used by the GitHub Action to publish the "
+                         "out-of-cache anchor")
     ap.add_argument("--workspace", help="workspace root for artifact existence/hash checks")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate only; do not record a RESERVED claim in the ledger")
@@ -2069,6 +2552,19 @@ def main(argv=None) -> int:
                          "check pinned sha256 hashes (also enabled by registry policy)")
     ap.add_argument("--as-receiver", help="authenticated receiver identity; reject packets addressed elsewhere")
     args = ap.parse_args(argv)
+
+    if args.init_ledger:
+        ok, message = init_ledger(Path(args.init_ledger))
+        if ok:
+            print(message)
+            return 0
+        print(f"handoff_check: ERROR: {message}", file=sys.stderr)
+        return 2
+    if args.ledger_head:
+        print(ledger_head(Path(args.ledger_head)))
+        return 0
+    if not args.packet:
+        ap.error("the 'packet' argument is required (unless --init-ledger or --ledger-head)")
 
     try:
         packet = strict_loads(Path(args.packet).read_text())

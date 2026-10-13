@@ -112,6 +112,7 @@ def test_parallel_reclaim_denied_then_epoch2_after_release(tmp_path, race_world)
         if isinstance(entry, dict):
             entry["reserved_at"] = (dt.datetime.now(dt.timezone.utc)
                                     - dt.timedelta(hours=48)).isoformat()
+    hc.seal_ledger(data)  # re-seal after the out-of-band edit (v2 integrity)
     ledger_path.write_text(_json.dumps(data))
     rel = hc.release(packet, ledger_path)
     assert rel["decision"] == "RELEASED", rel

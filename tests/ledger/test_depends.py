@@ -111,6 +111,7 @@ def test_released_upstream_keeps_downstream_blocked(dep_world):
     for entry in data.values():
         if isinstance(entry, dict):
             entry["reserved_at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)).isoformat()
+    hc.seal_ledger(data)  # re-seal after the out-of-band edit (v2 integrity)
     ledger.write_text(_json.dumps(data))
     rel = hc.release(pb, ledger)
     assert rel["decision"] == "RELEASED"

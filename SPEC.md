@@ -325,6 +325,38 @@ after the last) rule out a common path; a glob without wildcards is matched exac
 comparison is case-insensitive. A live claim recorded before v0.5 (no paths) counts as
 overlapping.
 
+**Integrity binding (v0.6): sealed chain + out-of-cache anchor.** Every ledger write
+seals a chain header under the reserved top-level key `"~synthe"` -- the ONE reserved
+namespace for chain metadata (idempotency keys may not start with `~`;
+`reserved_idempotency_key`). The header carries a monotonic `chain_seq` and a `chain_head`
+that hash-chains the previous head and the full entry set:
+
+`head_n = MAC("synthe-ledger-chain/v2" || seq_n || head_{n-1} || canonical(entries_n))`
+
+MAC is HMAC-SHA256 keyed by the `SYNTHE_LEDGER_HMAC_KEY` environment variable when set
+(a CI secret is the intended home), else plain SHA-256. Without the key the seal detects
+accidental corruption (bit-rot, hand edits, truncation) but NOT forgery by a file-holder;
+the header records `chain_keyed`, and a keyed seal loaded without the key (or vice versa)
+fails closed as `ledger_corrupt`. Key rotation: `SYNTHE_LEDGER_HMAC_KEY_PREVIOUS` is
+accepted for verification; sealing always uses the current key.
+
+Rollback -- a stale cache restoring an older snapshot, a forged empty ledger, a deleted
+file -- is caught by the monotonic `chain_seq` checked against an anchor stored OUTSIDE
+the cache: the `SYNTHE_LEDGER_ANCHOR` environment variable (`"seq:head"`), which the
+GitHub Action populates from the `SYNTHE_LEDGER_ANCHOR` repository variable before each
+run and republishes after it. A loaded ledger must match or extend the anchor:
+older (`ledger_rollback`), same-seq-different-head (`ledger_diverged`), or missing file
+(`ledger_rollback`) all fail closed. When anchoring is required
+(`SYNTHE_LEDGER_ANCHOR_REQUIRED=1`, set by the Action whenever it fetched an anchor)
+but the anchor is unavailable, the checker fails closed as `ledger_anchor_unavailable`.
+With no anchor configured (local runs, first run), the seal is still verified and a
+legacy unsealed ledger is adopted in place as a new genesis chain -- entries preserved,
+no manual migration step -- with a warning that rollback is not provable in that mode.
+`SYNTHE_LEDGER_BOOTSTRAP=1` skips anchor enforcement for one run (the documented
+recovery after a total cache eviction). The one legal operator (re-)initialization is
+`handoff_check.py --init-ledger PATH` (missing -> sealed genesis; sealed -> no-op;
+legacy -> adopted; corrupt or anchor-forbidden -> refused, never overwritten).
+
 ## 9. Failure states
 
 | State | Meaning | Who acts |
@@ -353,7 +385,9 @@ overlapping.
 `missing_idempotency_key`, `completion_unknown_key`, `claim_token_required`,
 `legacy_claim_unbound`,
 `release_not_reserved`, `dependency_cycle` (v0.5; `malformed:depends_on` is a `malformed:<f>`),
-`duplicate_field:<f>`, `malformed:non_finite_number`, `signature_kid_required`, `ttl_exceeded` (unreleased)
+`duplicate_field:<f>`, `malformed:non_finite_number`, `signature_kid_required`, `ttl_exceeded` (unreleased),
+`reserved_idempotency_key`, `ledger_rollback`, `ledger_diverged`,
+`ledger_anchor_unavailable` (v0.6 integrity binding; `ledger_corrupt` also covers seal mismatches)
 
 **blocked:** `tool_not_allowed`, `tool_not_allowed_by_receiver`,
 `forbidden_action`, `approval_missing`, `approval_expired`,

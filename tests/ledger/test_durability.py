@@ -65,11 +65,11 @@ def test_corrupt_ledger_refuses_everything_cleanly(dur_world):
     assert ledger.read_text() == "this is not json {{{ garbage"
 
 
-@pytest.mark.xfail(strict=True, reason="T2.6: fenced() on corrupt ledger raises completion_unknown_key instead of ledger_corrupt")
 def test_fenced_on_corrupt_ledger_reports_ledger_corrupt(dur_world):
-    """FINDING: fenced() skips the _corrupt check that check/complete/release/
-    fenced_effect all perform, so a corrupt ledger surfaces as the misleading
-    `completion_unknown_key` instead of `ledger_corrupt`."""
+    """FINDING (fixed by the v2 integrity binding): fenced() used to skip the
+    _corrupt check that check/complete/release/fenced_effect all perform, so a
+    corrupt ledger surfaced as the misleading `completion_unknown_key` instead
+    of `ledger_corrupt`. fenced() now fails closed with the specific reason."""
     w = dur_world
     packet = w.packet()
     ledger = w.tmp / "ledger.json"

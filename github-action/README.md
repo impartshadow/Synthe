@@ -102,6 +102,47 @@ against v0.2. The missing piece is ordering: your workflow must
 serialize the runs that share a ledger. GitHub provides that as a
 workflow-level `concurrency` group.
 
+### Ledger integrity: sealed chain + out-of-cache anchor (v0.6)
+
+Cache chaining alone cannot tell a *fresh* restore from a *stale* one: an
+older snapshot, a forged empty file, or a deleted ledger all used to load as
+valid, silently forgetting claims. Every ledger write is now sealed into a
+hash chain under the reserved `"~synthe"` header (each head binds the previous
+head, a monotonic sequence number, and the full entry set), and the Action
+keeps an **out-of-cache anchor** -- the `SYNTHE_LEDGER_ANCHOR` repository
+variable holding the last published `"seq:head"` -- that the restored ledger
+must match or extend:
+
+1. **Fetch anchor** (new step, before the phase): reads the repository
+   variable via the API. A 404 means no anchor was ever published (first run):
+   the checker seals a genesis chain. Any other fetch failure fails the
+   workflow instead of running unanchored.
+2. The checker verifies the chain seal and the anchor on every load. Older
+   (`ledger_rollback`), divergent (`ledger_diverged`), or missing
+   (`ledger_rollback`) ledgers fail closed with named reason codes.
+3. **Publish anchor** (new step, after the save): writes the new head back to
+   the repository variable (`--ledger-head` prints it).
+
+To enable it, pass `anchor-token` (e.g. `${{ secrets.GITHUB_TOKEN }}`) and grant
+the caller workflow `permissions: actions: write` (needed to update the
+variable). For the seal to be unforgeable, also pass `ledger-hmac-key` from a
+CI secret (e.g. `${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}`); without it the seal
+detects accidental corruption only. Rotate the secret by setting the new value
+and keeping the old one available to the checker as
+`SYNTHE_LEDGER_HMAC_KEY_PREVIOUS` until every cached ledger has been re-sealed
+(the next save heals automatically).
+
+Without `anchor-token`, rollback detection is disabled and the checker logs a
+warning (the seal still guards corruption); a pre-chain ledger is adopted in
+place as a new genesis chain -- entries preserved, no manual migration step.
+
+**Cache eviction recovery.** `actions/cache` entries expire after 7 days of
+disuse. If the cache is totally evicted, the anchor still expects the old
+chain and the run fails closed with `ledger_rollback`. Recover deliberately:
+run once with `ledger-bootstrap: 'true'` -- anchor enforcement is skipped for
+that run, a fresh genesis chain is sealed, and the anchor is republished.
+(This is also the recovery if the ledger file is deleted.)
+
 ### Required caller workflow shape
 
 ```yaml
@@ -122,6 +163,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write   # REQUIRED for the ledger anchor (SYNTHE_LEDGER_ANCHOR repo variable)
 
 jobs:
   handoff:
@@ -138,6 +180,8 @@ jobs:
           registry: agents/registry.json
           workspace: .
           phase: claim
+          anchor-token: ${{ secrets.GITHUB_TOKEN }}
+          ledger-hmac-key: ${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}
 
       # 2. THE EFFECT: the receiving agent does the actual work here.
       - name: Do the work

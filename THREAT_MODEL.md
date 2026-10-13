@@ -23,7 +23,7 @@ UX guards, not the credential wall. The new Linux setup path still needs a clean
 | Registry (agents, keys, receiver policy) | `registry.json` | **Root of trust.** Whoever can edit it decides who exists and what's allowed |
 | Human approver keys | passphrase-sealed file, or Secure Enclave with a 0600 public metadata/handle file | Attacker who can use one can approve any gated action |
 | Agent signing keys | key files; custodial in the lab | Attacker can send handoffs as that agent |
-| Ledger | `ledger.json` (Action: `actions/cache`) | Deleting or resetting it re-enables duplicates |
+| Ledger | `ledger.json` (Action: `actions/cache` + `SYNTHE_LEDGER_ANCHOR` repo variable) | Deleting or resetting it re-enables duplicates -- unless the out-of-cache anchor is configured, in which case rollback/deletion fails closed |
 | Workspace bytes | `--workspace` root | Pins detect changes; they can't stop a changed file being read later |
 | Broker key and remote credentials | the broker's own user (`/var/db/synthe`, `/var/lib/synthe`) or container volume, 0600 | Sign receipts; push anywhere the token can |
 
@@ -38,6 +38,10 @@ UX guards, not the credential wall. The new Linux setup path still needs a clean
 | Forged or typed-in approval | approvals must carry a valid Ed25519 or ES256 signature from a registered, trusted approver key | `approval_unsigned`, `approval_signature_invalid`, `approver_not_trusted` |
 | Approval replayed onto another handoff | signature binds `idempotency_key`, `from`, `to` | `approval_signature_invalid` |
 | Same work executed twice | ledger claim (RESERVED → COMPLETED, file lock) | `duplicate_idempotency_key`, `idempotency_key_reserved` |
+| Stale cache restores an older ledger (rollback) | HMAC-sealed hash chain + monotonic seq checked against the out-of-cache anchor (repo variable) | `ledger_rollback` |
+| Forged or swapped-in ledger file | chain seal (HMAC when `SYNTHE_LEDGER_HMAC_KEY` is set); unsealed file under an anchor refused as downgrade | `ledger_corrupt`, `ledger_rollback` |
+| Ledger file deleted / total cache eviction | anchor expects the chain to continue; missing file fails closed | `ledger_rollback` (recover with one `ledger-bootstrap` run) |
+| Anchor unavailable when required | fail closed rather than run unanchored | `ledger_anchor_unavailable` |
 | Someone else closes your claim | completion bound to the packet digest + claim token (MCP) / connector identity (lab) | `completion_packet_mismatch`, `claim_token_invalid`, `claim_token_required` |
 | Slow receiver acts after its claim was released and redispatched | fencing epoch + `fenced()` execution boundary (model-checked, `formal/`) | `claim_token_invalid`, `completion_unknown_key` |
 | Stale or swapped inputs | SHA-256 pins against the workspace | `artifact_hash_mismatch`, `evidence_hash_mismatch` |
@@ -283,6 +287,14 @@ Content proposals are not delegated yet (they wait for a human).
 9. **Effects outside `fenced()`.** The fencing guarantee covers only effects executed
    through it. A receiver that acts on a stale ACCEPT without the fence can still
    double-act after a release (`formal/README.md`, trace 2).
-10. **Ledger durability on CI.** `actions/cache` can be evicted. Fine for demos,
-   not an exactly-once store.
+10. **Ledger durability on CI.** `actions/cache` can be evicted. The v0.6 integrity
+   binding narrows this: every ledger write is HMAC-sealed into a hash chain, and the
+   Action keeps an out-of-cache anchor (the `SYNTHE_LEDGER_ANCHOR` repository variable)
+   that the restored ledger must match or extend -- so a stale restore, a forged file,
+   or a deleted ledger fails closed instead of silently resetting duplicate protection.
+   What remains: a *total* cache eviction still needs one deliberate `ledger-bootstrap`
+   run (documented in `github-action/README.md`); without the HMAC secret the seal is
+   tamper-evident, not tamper-proof; and two runs that restore the same snapshot still
+   need the `concurrency` group -- the anchor *detects* the divergence after the fact
+   (`ledger_diverged`) but cannot serialize the writers.
 
