@@ -487,12 +487,386 @@ def parse_utc(value) -> tuple[dt.datetime | None, str | None]:
 _LIST_SETS = ("forbidden", "approval_required_for", "forbidden_paths")  # restrictions: union
 _LIST_CEILINGS = ("allowed_tools", "trusted_approvers")    # grants: intersection
 _FLAGS = ("require_signatures", "require_signed_approvals", "verify_evidence",
-          "require_planned_actions", "exclusive_paths")
+          "require_planned_actions", "exclusive_paths",
+          "require_capability_declaration", "require_topology")  # v0.6
 _MINIMUMS = ("max_ttl_hours",)                              # ceilings on time: the smallest wins
 
 
 def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _cap_strs(cap: dict, field: str) -> list:
+    """The string entries of a capability list dimension (robust to malformed
+    entries: the shape check reports those, this just never crashes)."""
+    v = cap.get(field)
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def _norm_cap_path(p) -> str | None:
+    """Normalize a capability path for matching. Returns the normalized
+    relative path, or None when the path is rejected outright: absolute paths,
+    backslashes, and `..` segments are never allowed (fail closed) — no
+    normalized path may escape its declared root. `.` and empty segments are
+    dropped; glob tokens (`*`, `?`, `**`) survive as segments."""
+    if not isinstance(p, str) or not p:
+        return None
+    if p.startswith("/") or "\\" in p:
+        return None
+    segs = []
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            return None
+        segs.append(seg)
+    return "/".join(segs) or None
+
+
+def _glob_covers(covering: str, covered: str) -> bool:
+    """Is every path matching `covered` also matched by `covering`? Sound but
+    conservative: equality always holds; a wildcard-free covering path covers
+    itself and paths beneath it (directory semantics); a `/**`-suffixed
+    covering glob covers anything whose literal prefix sits under it; anything
+    else must match exactly. Both sides are normalized first (absolute paths,
+    backslashes and `..` segments are rejected outright), so a traversal like
+    `src/../secrets` can never be "covered" by `src`. Used to decide whether a
+    declared path narrows a ceiling path; unsure means not covered (fail closed)."""
+    covering = _norm_cap_path(covering)
+    covered = _norm_cap_path(covered)
+    if covering is None or covered is None:
+        return False
+    if covering == covered:
+        return True
+    if covering == "**":
+        return True
+    if not any(w for w, _ in _glob_tokens(covering)):
+        return covered.startswith(covering + "/")
+    if covering.endswith("/**"):
+        prefix = covering[:-3]
+        # literal prefix of `covered`: the text before its first wildcard
+        lit_parts = []
+        for wild, text in _glob_tokens(covered):
+            if wild:
+                break
+            lit_parts.append(text)
+        lit = "".join(lit_parts)
+        return lit == prefix or lit.startswith(prefix + "/")
+    return False
+
+
+def _merge_capability_ceiling(cur: dict | None, new: dict) -> dict:
+    """Narrow two capability ceilings (authority may only narrow): env/tools
+    intersect, network ANDs, paths keep only the new paths covered by a
+    current path, and a version pin follows the later layer."""
+    if not isinstance(cur, dict):
+        return copy.deepcopy(new)
+    merged = copy.deepcopy(cur)
+    for dim in ("env", "tools"):
+        if dim in new:
+            have = set(_cap_strs(merged, dim)) if dim in merged else None
+            want = set(_cap_strs(new, dim))
+            merged[dim] = sorted(want if have is None else (have & want))
+    if "network" in new:
+        merged["network"] = bool(new["network"]) and bool(merged.get("network", True))
+    if "paths" in new:
+        if "paths" in merged:
+            merged["paths"] = [p for p in _cap_strs(new, "paths")
+                               if any(_glob_covers(c, p) for c in _cap_strs(merged, "paths"))]
+        else:
+            merged["paths"] = list(_cap_strs(new, "paths"))
+    if "version" in new:
+        merged["version"] = new["version"]
+    return merged
+
+
+def _capability_shape(cap, where: str = "capability", require_version: bool = True) -> list:
+    """Element-level shape of a capability object. Returns (code, message)
+    pairs; the caller decides the state (invalid for packets, registry_malformed
+    for policy ceilings, topology_malformed for role capabilities)."""
+    if not isinstance(cap, dict):
+        return [(f"malformed:{where}", f"{where} must be an object")]
+    errs = []
+    if require_version and (not isinstance(cap.get("version"), str) or not cap.get("version")):
+        errs.append((f"malformed:{where}.version",
+                     f"{where}.version must be a non-empty string"))
+    for field in ("env", "tools", "paths"):
+        v = cap.get(field)
+        if v is not None and (not isinstance(v, list)
+                              or not all(isinstance(x, str) and x for x in v)):
+            errs.append((f"malformed:{where}.{field}",
+                         f"{where}.{field} must be a list of non-empty strings"))
+    for p in _cap_strs(cap, "paths"):
+        # Declared paths must normalize to a safe relative path: absolute
+        # paths, backslashes and `..` segments are rejected outright, because a
+        # traversal inside a signed declaration could otherwise smuggle access
+        # past the declared root.
+        if _norm_cap_path(p) is None:
+            errs.append((f"malformed:{where}.paths",
+                         f"{where}.paths entry {p!r} is not a safe relative path: "
+                         f"absolute paths, backslashes and '..' segments are rejected"))
+            break
+    if cap.get("network") is not None and not isinstance(cap.get("network"), bool):
+        errs.append((f"malformed:{where}.network", f"{where}.network must be a boolean"))
+    ar = cap.get("admission_receipt")
+    if ar is not None and (not isinstance(ar, str) or not ar):
+        errs.append((f"malformed:{where}.admission_receipt",
+                     f"{where}.admission_receipt must be a non-empty string"))
+    return errs
+
+
+def _cap_allows(cap, kind: str, value, ceiling: bool = False) -> bool:
+    """Does one capability source allow this access? A declaration
+    (ceiling=False) is exhaustive: a dimension it does not declare allows
+    nothing, and network is denied unless declared true. A ceiling
+    (ceiling=True) constrains only the dimensions it declares."""
+    if not isinstance(cap, dict):
+        return ceiling
+    if kind == "network":
+        if "network" not in cap:
+            return ceiling
+        return cap["network"] is True
+    field = {"env": "env", "path": "paths", "tool": "tools"}[kind]
+    if field not in cap:
+        return ceiling
+    options = cap[field]
+    if not isinstance(options, list):
+        return False
+    if kind == "path":
+        value = _norm_cap_path(value)
+        if value is None:
+            # A traversal is not "undeclared", it is rejected outright: it can
+            # never be inside any declared root.
+            return False
+        return any(isinstance(p, str) and (pn := _norm_cap_path(p)) is not None
+                   and glob_match(pn, value) for p in options)
+    return isinstance(value, str) and value in _cap_strs(cap, field)
+
+
+def check_capability_use(declaration, kind: str, value=None) -> dict | None:
+    """Runtime enforcement hook for a least-privilege proxy (SPEC section 15).
+
+    `declaration` is the signed capability object in force for the acting
+    agent; `kind` is one of "env" (value: the variable name), "path" (value:
+    the file path), "tool" (value: the tool/API name) or "network". Returns
+    None when the access is inside the declaration, else a reason dict with
+    code `capability_not_declared`. A path that is absolute, contains a
+    backslash, or contains a `..` segment is rejected outright with code
+    `capability_path_unsafe`: no traversal can ever match a declared root.
+    With no declaration in force everything is denied: an undeclared env var,
+    path or tool is outside the (empty) declaration, and network egress is
+    denied by default.
+    """
+    cap = declaration if isinstance(declaration, dict) else {}
+    has_decl = isinstance(declaration, dict) and bool(declaration)
+
+    def deny(what: str) -> dict:
+        return {"state": "blocked", "code": "capability_not_declared",
+                "message": f"{what} is outside the signed capability declaration"
+                           + ("" if has_decl else "; no capability declaration is in force")}
+
+    if kind == "env":
+        if isinstance(value, str) and value in _cap_strs(cap, "env"):
+            return None
+        return deny(f"read of env var {value!r}")
+    if kind == "path":
+        if isinstance(value, str):
+            norm = _norm_cap_path(value)
+            if norm is None:
+                # Fail closed with a named code: a traversal is not merely
+                # "outside the declaration", it is an unsafe shape that can
+                # never match any declared root.
+                return {"state": "blocked", "code": "capability_path_unsafe",
+                        "message": f"file access to {value!r} is rejected outright: "
+                                   "capability paths must be relative and may not contain "
+                                   "'..' segments or backslashes"}
+            for p in _cap_strs(cap, "paths"):
+                pn = _norm_cap_path(p)
+                if pn is not None and glob_match(pn, norm):
+                    return None
+        return deny(f"file access to {value!r}")
+    if kind == "tool":
+        if isinstance(value, str) and value in _cap_strs(cap, "tools"):
+            return None
+        return deny(f"call to tool {value!r}")
+    if kind == "network":
+        if cap.get("network") is True:
+            return None
+        return deny("network egress (denied by default; declare \"network\": true)")
+    return deny(f"access of unknown capability kind {kind!r}")
+
+
+def _cap_within_ceiling(decl: dict, ceiling: dict) -> list:
+    """(code, message) problems when the packet's capability declaration
+    exceeds the receiver's capability ceiling: blocked /
+    capability_exceeds_receiver_policy. Authority may only narrow."""
+    problems = []
+    if ceiling.get("version") is not None and decl.get("version") != ceiling["version"]:
+        problems.append(("capability_exceeds_receiver_policy",
+                         f"capability declaration version {decl.get('version')!r} does not match "
+                         f"the receiver's required version {ceiling['version']!r}"))
+    for dim in ("env", "tools"):
+        if dim in ceiling:
+            extra = set(_cap_strs(decl, dim)) - set(_cap_strs(ceiling, dim))
+            if extra:
+                problems.append(("capability_exceeds_receiver_policy",
+                                 f"capability declaration claims {dim} the receiver never "
+                                 f"allows: {sorted(extra)}"))
+    if "paths" in ceiling:
+        uncovered = [p for p in _cap_strs(decl, "paths")
+                     if not any(_glob_covers(c, p) for c in _cap_strs(ceiling, "paths"))]
+        if uncovered:
+            problems.append(("capability_exceeds_receiver_policy",
+                             f"capability declaration claims paths outside the receiver's "
+                             f"ceiling: {uncovered}"))
+    if "network" in ceiling and ceiling.get("network") is not True and decl.get("network") is True:
+        problems.append(("capability_exceeds_receiver_policy",
+                         "capability declaration claims network egress, which the "
+                         "receiver's capability ceiling denies"))
+    return problems
+
+
+def _action_capability_problems(name: str, act: dict, packet_cap, role_cap, pol_cap) -> list:
+    """A planned action's declared intent against the capability sources in
+    force. Conventions (SPEC section 15): `params.env` lists env vars the
+    action reads, `params.paths` lists files it touches, `params.network: true`
+    declares egress. Anything outside the narrowed declaration is
+    `capability_not_declared` (blocked)."""
+    decls = [c for c in (packet_cap, role_cap) if isinstance(c, dict)]
+    ceiling = pol_cap if isinstance(pol_cap, dict) else None
+    if not decls and ceiling is None:
+        return []
+    sources = [(c, False) for c in decls] + ([(ceiling, True)] if ceiling is not None else [])
+
+    def denied(kind, value) -> bool:
+        return not all(_cap_allows(c, kind, value, ceiling=is_ceil) for c, is_ceil in sources)
+
+    problems = []
+    tool = act.get("tool")
+    if denied("tool", tool):
+        problems.append(("capability_not_declared",
+                         f"action '{name}' uses tool '{tool}', outside the signed "
+                         f"capability declaration"))
+    params = act.get("params") if isinstance(act.get("params"), dict) else {}
+    envs = params.get("env")
+    if isinstance(envs, list):
+        for env in envs:
+            if denied("env", env):
+                problems.append(("capability_not_declared",
+                                 f"action '{name}' reads env var {env!r}, outside the signed "
+                                 f"capability declaration"))
+    paths = params.get("paths")
+    if isinstance(paths, list):
+        for path in paths:
+            if isinstance(path, str) and _norm_cap_path(path) is None:
+                # Tripwire (see SPEC 15.1): the sender volunteers these params,
+                # but an outright-unsafe shape is rejected before matching.
+                problems.append(("capability_path_unsafe",
+                                 f"action '{name}' touches path {path!r}, which is rejected "
+                                 f"outright: capability paths must be relative and may not "
+                                 f"contain '..' segments or backslashes"))
+            elif denied("path", path):
+                problems.append(("capability_not_declared",
+                                 f"action '{name}' touches path {path!r}, outside the signed "
+                                 f"capability declaration"))
+    if params.get("network") is True and denied("network", None):
+        problems.append(("capability_not_declared",
+                         f"action '{name}' needs network egress, which is denied by default "
+                         f"(declare \"network\": true in the capability declaration)"))
+    return problems
+
+
+def _verify_topology(name: str, registry: dict | None, reasons: list) -> dict | None:
+    """Return the verified team topology, or None (reasons already failed).
+
+    Checks the registry defines it, its shape is sound, and its founder
+    signature verifies. The signature covers the name, version, roles, edges,
+    role capabilities and the role membership binding, so any topology change
+    requires re-signing."""
+    topos = registry.get("topologies") if isinstance(registry, dict) else None
+    topo = topos.get(name) if isinstance(topos, dict) else None
+    if not isinstance(topo, dict):
+        fail("invalid", "registry_malformed",
+             f"receiver policy names team topology '{name}', but the registry defines "
+             f"no such topology", reasons)
+        return None
+    problems = []
+    if not isinstance(topo.get("version"), str) or not topo["version"]:
+        problems.append("version must be a non-empty string")
+    roles = topo.get("roles")
+    if not isinstance(roles, list) or not roles \
+            or not all(isinstance(r, str) and r for r in roles):
+        problems.append("roles must be a non-empty list of non-empty strings")
+    edges = topo.get("edges")
+    if not isinstance(edges, list) or any(
+            not isinstance(e, list) or len(e) != 2
+            or not all(isinstance(x, str) and x for x in e) for e in edges):
+        problems.append("edges must be a list of [from_role, to_role] pairs")
+    elif isinstance(roles, list):
+        known = {r for r in roles if isinstance(r, str)}
+        bad = [e for e in edges if e[0] not in known or e[1] not in known]
+        if bad:
+            problems.append(f"edges name roles not in 'roles': {bad[:3]}")
+    rcaps = topo.get("role_capabilities", {})
+    if not isinstance(rcaps, dict):
+        problems.append("role_capabilities must be an object")
+    else:
+        for role, cap in rcaps.items():
+            for _code, msg in _capability_shape(cap, f"topology role_capabilities.{role}",
+                                                require_version=False):
+                problems.append(msg)
+            if isinstance(roles, list) and role not in roles:
+                problems.append(f"role_capabilities names unknown role '{role}'")
+    members = topo.get("members", {})
+    if not isinstance(members, dict):
+        problems.append("members must be an object mapping roles to lists of agent ids")
+    else:
+        for role, agents in members.items():
+            if not isinstance(role, str) or not role:
+                problems.append("members keys must be non-empty role names")
+                break
+            if not isinstance(agents, list) or not agents \
+                    or not all(isinstance(a, str) and a for a in agents):
+                problems.append(f"members[{role!r}] must be a non-empty list of agent ids")
+                break
+    if problems:
+        fail("invalid", "topology_malformed",
+             f"team topology '{name}' is malformed: {problems[0]}", reasons)
+        return None
+    if not isinstance(topo.get("signed_by"), str) or not isinstance(topo.get("sig"), str):
+        fail("invalid", "topology_signature_missing",
+             f"team topology '{name}' carries no founder signature; topology "
+             f"declarations must be signed", reasons)
+        return None
+    try:
+        import synthe_crypto as sc
+    except ImportError:
+        fail("invalid", "signature_unsupported",
+             "synthe_crypto.py not found next to the checker", reasons)
+        return None
+    signer = topo["signed_by"]
+    agent = (registry.get("agents", {}) or {}).get(signer) if isinstance(registry, dict) else None
+    if not isinstance(agent, dict) or agent.get("kind") != "human":
+        fail("invalid", "topology_signer_not_founder",
+             f"team topology '{name}' is signed by '{signer}', who is not a registered "
+             f"human founder; topologies must be signed by a founder", reasons)
+        return None
+    key = sc.find_key(registry, signer, topo.get("kid"))
+    if key is None:
+        fail("invalid", "topology_signature_invalid",
+             f"no Ed25519 key on record for topology signer '{signer}' "
+             f"(kid={topo.get('kid')})", reasons)
+        return None
+    try:
+        raw = sc.unb64u(topo["sig"])
+    except Exception:
+        raw = b""
+    if not sc.verify_bytes(key, sc.topology_signing_input(name, topo), raw):
+        fail("invalid", "topology_signature_invalid",
+             f"team topology '{name}' signature does not verify: the topology was changed "
+             f"after signing; re-sign it with a founder key", reasons)
+        return None
+    return topo
 
 
 def receiver_policy(registry: dict | None, receiver: str) -> dict | None:
@@ -533,6 +907,9 @@ def receiver_policy(registry: dict | None, receiver: str) -> dict | None:
                     merged[k] = min(merged[k], v)
                 elif _is_number(merged[k]):
                     merged[k] = v  # a malformed layer is kept, so validation refuses it (fail closed)
+            elif k == "capability" and isinstance(v, dict):
+                # v0.6: a capability ceiling narrows like every other ceiling.
+                merged[k] = _merge_capability_ceiling(merged.get(k), v)
             else:
                 merged[k] = v
     return merged
@@ -625,6 +1002,14 @@ def _shape_errors(h: dict) -> list:
     str_list(auth.get("allowed_tools"), "authority.allowed_tools")
     str_list(auth.get("approval_required_for"), "authority.approval_required_for")
     str_list(acc.get("required_evidence"), "acceptance.required_evidence")
+    # v0.6: capability declaration and team roles (SPEC section 15)
+    if h.get("capability") is not None:
+        errs.extend(_capability_shape(h["capability"]))
+    for role_field in ("sender_role", "receiver_role"):
+        rv = h.get(role_field)
+        if rv is not None and (not isinstance(rv, str) or not rv):
+            errs.append((f"malformed:{role_field}",
+                         f"{role_field} must be a non-empty string"))
     for i, ref in enumerate(obj_list(inputs.get("artifact_refs"), "inputs.artifact_refs", ["path"])):
         if ref.get("sha256") is not None and not _is_sha256(ref.get("sha256")):
             errs.append((f"bad_sha256:inputs.artifact_refs[{i}]",
@@ -943,6 +1328,17 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
         fail("invalid", "planned_actions_missing",
              "receiver policy requires planned_actions: authority cannot be checked "
              "against actions the sender did not declare", reasons)
+    # v0.6: capability declarations and team roles are optional unless the
+    # receiver's policy requires them (SPEC section 15).
+    if policy and policy.get("require_capability_declaration") and h.get("capability") is None:
+        fail("invalid", "capability_declaration_missing",
+             "receiver policy requires a signed capability declaration; the packet carries none",
+             reasons)
+    if policy and policy.get("require_topology") \
+            and (h.get("sender_role") is None or h.get("receiver_role") is None):
+        fail("invalid", "topology_declaration_missing",
+             "receiver policy requires sender_role and receiver_role; the packet declares "
+             "no team roles", reasons)
     if reasons:
         return False, reasons
 
@@ -1025,6 +1421,74 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
     # 5. authority: planned actions vs tools / forbidden / approvals / budget,
     #    with the receiver policy as a ceiling the packet can only narrow.
     pol = policy or {}
+
+    # 5a. (v0.6) team topology (SPEC section 15): the (sender_role,
+    #     receiver_role) edge must be declared in the receiver's team topology,
+    #     whose founder signature is re-verified on every check. A receiver
+    #     role's declared capability narrows the packet further.
+    topo_name = pol.get("topology")
+    sender_role, receiver_role = h.get("sender_role"), h.get("receiver_role")
+    role_cap = None
+    if topo_name is not None and not isinstance(topo_name, str):
+        fail("invalid", "registry_malformed",
+             "receiver policy 'topology' must name a team topology (a string)", reasons)
+    elif topo_name is None and pol.get("require_topology"):
+        fail("invalid", "registry_malformed",
+             "receiver policy requires team topologies but names none: set the "
+             "'topology' policy key to a topology in the registry", reasons)
+    elif topo_name is not None:
+        topo = _verify_topology(topo_name, registry, reasons)
+        if topo is not None:
+            # Roles stay optional unless require_topology: with no roles the
+            # packet makes no routing claim, so there is no edge to verify.
+            if sender_role is not None or receiver_role is not None:
+                info["topology"] = topo_name
+                if [sender_role, receiver_role] not in topo.get("edges", []):
+                    fail("blocked", "topology_violation",
+                         f"handoff edge '{sender_role}' -> '{receiver_role}' is not in team "
+                         f"topology '{topo_name}'; handoffs on undeclared edges are rejected",
+                         reasons)
+                rcaps = topo.get("role_capabilities") or {}
+                if isinstance(receiver_role, str) and isinstance(rcaps.get(receiver_role), dict):
+                    role_cap = rcaps[receiver_role]
+                # v0.6.1: roles are bound to agent ids in the SIGNED topology
+                # (`members: {role: [agent ids]}`), because roles are otherwise
+                # sender-asserted labels: a sender could claim any role that
+                # has the edge they want. The packet's from/to (already
+                # signature-bound: the signer must equal `from`) must be
+                # members of the claimed roles. A topology with no binding for
+                # a claimed role fails closed: an unverifiable role claim is
+                # rejected, never silently passed.
+                members = topo.get("members") if isinstance(topo.get("members"), dict) else {}
+                for claimed, who, field in ((sender_role, h.get("from"), "sender_role"),
+                                            (receiver_role, h.get("to"), "receiver_role")):
+                    if isinstance(claimed, str) and who not in members.get(claimed, []):
+                        fail("blocked", "topology_role_unbound",
+                             f"handoff claims {field} '{claimed}' for agent '{who}', but "
+                             f"'{who}' is not bound to role '{claimed}' in team topology "
+                             f"'{topo_name}'; roles are bound to agent ids in the signed "
+                             f"topology, not asserted by the sender", reasons)
+    elif sender_role is not None or receiver_role is not None:
+        # The packet claims team roles but this receiver enforces no topology,
+        # so the edge cannot be verified: fail closed.
+        fail("blocked", "topology_violation",
+             "packet declares sender_role/receiver_role but this receiver's policy names "
+             "no team topology, so the handoff edge cannot be verified", reasons)
+
+    # 5b. (v0.6) capability ceiling (SPEC section 15): the packet's signed
+    #     declaration may only narrow what the receiver's policy allows.
+    packet_cap = h.get("capability")
+    pol_cap = pol.get("capability")
+    if pol_cap is not None:
+        shape = _capability_shape(pol_cap, "policy.capability", require_version=False)
+        if shape:
+            fail("invalid", "registry_malformed",
+                 f"receiver policy capability is malformed: {shape[0][1]}", reasons)
+            pol_cap = None
+    if isinstance(packet_cap, dict) and isinstance(pol_cap, dict):
+        for code, msg in _cap_within_ceiling(packet_cap, pol_cap):
+            fail("blocked", code, msg, reasons)
+
     forbidden = set(scope.get("forbidden", [])) | set(pol.get("forbidden", []))
     allowed = set(auth.get("allowed_tools", []))
     ceiling_tools = set(pol["allowed_tools"]) if "allowed_tools" in pol else None
@@ -1075,6 +1539,10 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
                 info.setdefault("approval_problems", {})[name] = [c for c, _ in problems]
             for code, msg in problems:
                 fail("blocked", code, msg, reasons)
+        # v0.6: the action's declared intent against the capability sources in
+        # force (packet declaration, receiver role capability, policy ceiling).
+        for code, msg in _action_capability_problems(name, act, packet_cap, role_cap, pol_cap):
+            fail("blocked", code, msg, reasons)
         for k in est:
             est[k] += float(act.get(f"est_{k}", 0) or 0)
     ceiling_budget = pol.get("budget") or {}
@@ -1165,6 +1633,8 @@ def _result(ok: bool, reasons: list, h: dict, info: dict) -> dict:
         out["defaults_applied"] = info["defaults_applied"]
     if info.get("signature") == "verified":
         out["signature"] = "verified"
+    if info.get("topology"):  # v0.6: the team topology that admitted this edge
+        out["topology"] = info["topology"]
     if info.get("approvals_deferred"):  # v0.5, only when the caller deferred them
         out["approvals_deferred"] = list(info["approvals_deferred"])
     return out

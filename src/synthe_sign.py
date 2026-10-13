@@ -238,6 +238,17 @@ def sign_packet(packet: dict, key: dict) -> dict:
     return packet
 
 
+def sign_topology(name: str, topo: dict, key: dict) -> dict:
+    """Sign a team topology declaration (SPEC section 15) with a founder key.
+    The signature covers the name, version, roles, edges, role capabilities
+    and members, so any change to the topology requires re-signing. Returns
+    the topology object with `signed_by`, `kid` and `sig` attached."""
+    sig = sc.sign_bytes(key["_secret"], sc.topology_signing_input(name, topo))
+    topo = {k: v for k, v in topo.items() if k not in ("signed_by", "kid", "sig")}
+    topo.update(signed_by=key["agent"], kid=key["kid"], sig=sc.b64u(sig))
+    return topo
+
+
 def planned_params(h: dict, action: str):
     """The `params` of the planned action named (or using tool) `action`."""
     for act in h.get("planned_actions") or []:

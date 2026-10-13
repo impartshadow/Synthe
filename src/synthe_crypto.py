@@ -40,6 +40,7 @@ APPROVAL_ALGS = (ALG, ALG_ES256)  # packets and receipts stay Ed25519
 PACKET_SIG_DOMAIN = "synthe/handoff-signature/v1"
 APPROVAL_SIG_DOMAIN = "synthe/approval-signature/v1"
 RECEIPT_SIG_DOMAIN = "synthe/effect-receipt/v1"
+TOPOLOGY_SIG_DOMAIN = "synthe/topology-signature/v1"
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +266,19 @@ def receipt_signing_input(receipt: dict) -> bytes:
     the signature itself). Domain-separated from packets and approvals."""
     body = {k: v for k, v in receipt.items() if k != "sig"}
     return RECEIPT_SIG_DOMAIN.encode() + b"\n" + canonical_json(body)
+
+
+_TOPOLOGY_SIG_FIELDS = ("signed_by", "kid", "sig")
+
+
+def topology_signing_input(name: str, topo: dict) -> bytes:
+    """Bytes a founder signs for a team topology: domain tag + canonical JSON
+    of the topology payload with the registry key bound as its name. Changing
+    anything (roles, edges, role capabilities, members, version) changes these
+    bytes, so any topology change requires a fresh signature."""
+    payload = {k: v for k, v in topo.items() if k not in _TOPOLOGY_SIG_FIELDS}
+    payload["name"] = name
+    return TOPOLOGY_SIG_DOMAIN.encode() + b"\n" + canonical_json(payload)
 
 
 def _raw_find_key_with_kid(registry: dict | None, agent_id: str, kid: str | None):
