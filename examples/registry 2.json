@@ -1,0 +1,35 @@
+{
+  "agents": {
+    "caddy": {
+      "role": "rules-integration"
+    },
+    "cora": {
+      "role": "cto"
+    },
+    "lebron": {
+      "role": "head-build"
+    },
+    "lebron-crown": {
+      "alias_of": "lebron"
+    },
+    "lex": {
+      "role": "data-corpus"
+    },
+    "spark": {
+      "role": "accuracy"
+    }
+  },
+  "signature": {
+    "alg": "Ed25519",
+    "kid": "example-key",
+    "chain": [
+      {
+        "seq": 0,
+        "kid": "example-key",
+        "public_key": "l2hhlEtIWydQUlkmKwmLQ27fTM2i7WpgIfrE02AfuWY",
+        "sig": "eZrcW6Wf5M_ttNStnBEJ3Q9PzJuvJSBQR_maxAhfQVIENHq8Hkm6RYb9-Tld9N14MiGd2BQ_HbC627NlFwGhCA"
+      }
+    ],
+    "sig": "60vQ-8_fr3Ib_5kns1BGOWk8W-3eN9TNuk7GZtSRQrBWEAIM7-0o94WmGwVDoZC7Y5szzrh_ETn-54ffiWg-CA"
+  }
+}

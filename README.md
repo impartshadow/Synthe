@@ -1,7 +1,7 @@
 # Synthe
 
-**The commit barrier for AI agents.** Agents propose. You approve. Synthe commits, exactly once, and
-writes a signed receipt anyone can verify.
+**The commit barrier for AI agents.** Agents propose. You approve. Synthe pushes exactly the commit
+you approved, and writes a signed receipt anyone can verify.
 
 An AI agent with a GitHub token can push whatever it decides to. With Synthe, the agent holds no
 credential at all. It commits on its own branch and *proposes* the push. The Synthe broker runs as its
