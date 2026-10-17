@@ -1,0 +1,213 @@
+"""Executable commands are checked; inert shell/Python data is not publishing."""
+import importlib.util
+import io
+import json
+import re
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+HOOK = ROOT / "integrations/claude-code/hooks/pre_tool_use.py"
+spec = importlib.util.spec_from_file_location("command_hook", HOOK)
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+
+
+def event(command):
+    return {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
+
+
+@pytest.mark.parametrize("command", [
+    "echo 'git push origin main'", 'printf "%s\\n" "gh api /repos/example/repo"',
+    "git commit -m 'document git push and gh pr merge'", "# git push\ngit status",
+    "python3 - <<'PY'\nfrom pathlib import Path\nPath('notes.md').write_text('git push; gh api; gh release create v1')\nPY\n",
+    "python3 - <<PY\nprint('git push')\nPY\n",
+    "cat <<'EOF'\n$(git push)\n`gh pr merge`\ngit push\nEOF\n",
+    "cat <<EOF\ngit push origin main\nEOF\n",
+    "bash -c 'echo \"git push\"'", "bash -c 'echo \"$UNKNOWN\"'",
+    "python -c 'print([\"git\", \"push\"])'", "echo '$(git push)'",
+    "git status > 'git push'; git diff", "printf '%s' 'gh api' | cat", "command -v git push",
+    "2>&1 echo 'git push'", "env -S 'echo git push'", "env --split-string='echo git push'",
+    "cat <<\\EOF\n$(git push)\nEOF\n", r'echo "git\ push"',
+])
+def test_harmless_mentions_are_allowed(command):
+    assert not hook.denied(event(command))
+
+
+@pytest.mark.parametrize("command", [
+    "git push", "'git' 'push'", r"g\it pu\sh", "/usr/bin/git -C /tmp/repo push",
+    "env X=1 git -c x=y push", "command git push", "nohup git push",
+    "bash -c 'git push'", "bash -lc 'git push'", "sh -c 'bash -c \"git push\"'",
+    "eval 'git push'", "CMD='git push'; $CMD", "G=git; P=push; $G $P",
+    "A=git; B=$A; $B push", "CMD='git push'; bash -c \"$CMD\"", "$UNKNOWN push",
+    'echo "$(git push)"', "echo `git push`", "cat <<EOF\n$(git push)\nEOF\n",
+    "bash <<'EOF'\ngit push\nEOF\n", "cat <<'EOF'\ngit push\nEOF\ngit push\n",
+    "git status && git push", "true || git push", "echo ok | git push",
+    "if git push; then echo ok; fi", "true; >out git push; true",
+    "sudo -u fixture git push", "timeout 10 git push", "nice -n 1 git push",
+    "env --argv0 fixture git push", "exec -a fixture git push", "xargs -d ' ' git push",
+    "2>&1 git push", "true; 2>&1 git push; true", "{fd}>out git push", ">&2 git push",
+    "env -S 'git push'", "env --split-string='git push'", "env '-Sgit push'",
+    "sudo --prompt fixture git push", "timeout --kill-after 2 10 git push",
+    "git send-pack origin", "git http-push origin", "gh pr merge 1", "gh release upload v1 file",
+    "gh api /repos/example/repo", "gh --repo example/repo pr merge 1", "curl -X POST https://api.github.com/repos/example/repo",
+    "curl -X POST https://API.GITHUB.COM/repos/example/repo",
+    r'''python -c "import subprocess; subprocess.run(['git', 'pu\x73h'])"''',
+    "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'push'])\nPY\n",
+    "python -c 'import subprocess as sp; sp.run([\"git\", \"push\"])'",
+    "python -c 'from subprocess import run as r; r([\"git\", \"push\"])'",
+    "python -c 'import os; os.system(\"git push\")'",
+    "python -c 'import os; os.execv(\"git\", [\"git\", \"push\"])'",
+    "python -c 'import subprocess; cmd=[\"git\", \"push\"]; subprocess.run(cmd)'",
+    "python -c 'import subprocess; cmd=[\"git\", \"push\"]; subprocess.run(cmd); cmd=[\"git\", \"status\"]'",
+])
+def test_publishing_and_nested_executors_remain_denied(command):
+    assert hook.denied(event(command))
+
+
+@pytest.mark.parametrize("command", ["echo '", "cat <<EOF\nunterminated", "git \\", "eval '$UNKNOWN'"])
+def test_invalid_or_unresolved_commands_fail_closed(command):
+    assert hook.denied(event(command))
+
+
+@pytest.mark.parametrize('command', [
+    '$HOME/bin/python3 -c "print(1)"', '${HOME}/bin/git status',
+    '"$HOME/bin/python3" -c "print(1)"', '"${HOME}/bin/git" diff',
+    '$GIT_BIN status', '"$PYTHON_BIN" -c "print(1)"',
+])
+def test_executable_environment_paths_allow_local_work(monkeypatch, command):
+    monkeypatch.setenv('HOME', '/tmp/fixture-home')
+    monkeypatch.setenv('GIT_BIN', '/tmp/fixture-home/bin/git')
+    monkeypatch.setenv('PYTHON_BIN', '/tmp/fixture-home/bin/python3')
+    assert not hook.denied(event(command))
+
+
+@pytest.mark.parametrize('command', [
+    '$HOME/bin/git push', '${HOME}/bin/gh pr merge 1', '$GIT_BIN push',
+    '"$HOME/bin/git" push', '"${HOME}/bin/gh" api /repos/fixture/repo',
+    '"$HOME/bin/python3" -c \'import os; os.system("git push")\'',
+    '$PUBLISH', '""$PUBLISH', '"g"$PUBLISH_TAIL',
+    'GIT_BIN=echo $GIT_BIN push',
+])
+def test_environment_paths_do_not_hide_publishing(monkeypatch, command):
+    monkeypatch.setenv('HOME', '/tmp/fixture-home')
+    monkeypatch.setenv('GIT_BIN', '/tmp/fixture-home/bin/git')
+    monkeypatch.setenv('PUBLISH', 'git push')
+    monkeypatch.setenv('PUBLISH_TAIL', 'it push')
+    assert hook.denied(event(command))
+
+
+def test_quoted_home_with_spaces_preserves_executable_name(monkeypatch):
+    monkeypatch.setenv('HOME', '/tmp/Fixture Home')
+    assert not hook.denied(event('"$HOME/bin/python3" -c "print(1)"'))
+    assert not hook.denied(event('"$HOME/bin/git" status'))
+    assert hook.denied(event('"$HOME/bin/git" push'))
+    assert hook.denied(event('"$HOME"/bin/gh pr merge 1'))
+
+
+def test_environment_cannot_resolve_unknown_command_substitution(monkeypatch):
+    monkeypatch.setenv('SYNTHE_UNKNOWN_SUBSTITUTION', 'echo')
+    assert hook.denied(event('$(cat unknown-command) push'))
+
+
+def test_env_split_string_preserves_quoted_executable_paths(monkeypatch):
+    monkeypatch.setenv('HOME', '/tmp/Fixture Home')
+    assert not hook.denied(event("env -S '\"${HOME}/bin/git\" status'"))
+    assert hook.denied(event("env -S '\"${HOME}/bin/git\" push'"))
+
+
+def test_environment_resolution_does_not_allow_unparsed_command_arguments(monkeypatch):
+    monkeypatch.setenv('SUBCOMMAND', 'push origin HEAD')
+    monkeypatch.setenv('OPTIONS', '-C /tmp/fixture')
+    assert hook.denied(event('git $SUBCOMMAND'))
+    assert hook.denied(event('git $OPTIONS push'))
+
+
+def test_environment_expansion_is_bounded(monkeypatch):
+    monkeypatch.setenv('LONG_PATH', 'x' * 200000)
+    assert hook.denied(event('$LONG_PATH$LONG_PATH/git push'))
+
+
+@pytest.mark.parametrize('operation', ['push_files', 'create_or_update_file', 'delete_file',
+                                       'merge_pull_request', 'create_branch'])
+@pytest.mark.parametrize('server', ['github', 'plugin_github_github', 'enterprise'])
+def test_github_write_tools_are_matched_and_denied(operation, server):
+    tool = f'mcp__{server}__{operation}'
+    matcher = json.loads(HOOK.with_name('hooks.json').read_text())['hooks']['PreToolUse'][0]['matcher']
+    assert re.fullmatch(matcher, tool), 'Claude must dispatch the hook for this tool'
+    assert hook.denied({'hook_event_name': 'PreToolUse', 'tool_name': tool, 'tool_input': {}})
+
+
+@pytest.mark.parametrize('tool', ['mcp__github__get_file_contents', 'mcp__github__list_branches',
+                                  'mcp__github__get_pull_request', 'mcp__synthe__synthe_propose_effect'])
+def test_read_and_broker_tools_receive_no_permission_override(tool):
+    assert not hook.denied({'hook_event_name': 'PreToolUse', 'tool_name': tool, 'tool_input': {}})
+
+
+@pytest.mark.parametrize('error', [RuntimeError, OSError, AssertionError, MemoryError])
+def test_unexpected_exception_is_a_deny_without_echo(monkeypatch, capsys, error):
+    def crash(_):
+        raise error('fixture-sensitive-detail')
+    monkeypatch.setattr(hook.sys, 'stdin', io.StringIO(json.dumps(event('git status'))))
+    monkeypatch.setattr(hook, 'denied', crash)
+    assert hook.main() == 0
+    result = capsys.readouterr()
+    assert json.loads(result.out)['hookSpecificOutput']['permissionDecision'] == 'deny'
+    assert 'fixture-sensitive-detail' not in result.out + result.err
+
+
+def test_input_read_failure_denies(monkeypatch, capsys):
+    class BrokenInput:
+        def read(self, _):
+            raise OSError('fixture-sensitive-detail')
+    monkeypatch.setattr(hook.sys, 'stdin', BrokenInput())
+    assert hook.main() == 0
+    assert json.loads(capsys.readouterr().out)['hookSpecificOutput']['permissionDecision'] == 'deny'
+
+
+def test_output_failure_returns_blocking_exit_code(monkeypatch):
+    class BrokenOutput:
+        def write(self, _):
+            raise OSError('fixture-sensitive-detail')
+    monkeypatch.setattr(hook.sys, 'stdin', io.StringIO(json.dumps(event('git push'))))
+    monkeypatch.setattr(hook.sys, 'stdout', BrokenOutput())
+    def exit_fixture(code):
+        raise SystemExit(code)
+    monkeypatch.setattr(hook.os, '_exit', exit_fixture)
+    with pytest.raises(SystemExit) as result:
+        hook.main()
+    assert result.value.code == 2
+
+
+def test_real_broken_stdout_pipe_keeps_blocking_exit_code():
+    child = subprocess.Popen([sys.executable, str(HOOK)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    child.stdout.close()
+    child.stdin.write(json.dumps(event('git push')).encode())
+    child.stdin.close()
+    assert child.wait(timeout=10) == 2
+    assert child.stderr.read() == b''
+
+
+@pytest.mark.parametrize("guard, replacement, command", [
+    ('in {"push", "send-pack", "http-push"}', 'in {"mutation-disabled"}', "git push"),
+    ('if executable in SHELLS:', 'if executable in set():', "bash -c 'git push'"),
+])
+def test_mutations_disabling_command_or_nested_shell_guard_are_detected(tmp_path, guard, replacement, command):
+    source = HOOK.read_text()
+    assert guard in source
+    mutant = tmp_path / "hook.py"
+    mutant.write_text(source.replace(guard, replacement, 1))
+    result = subprocess.run([sys.executable, str(mutant)], input=json.dumps(event(command)),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+    assert result.stdout == "", "mutant should expose the unsafe allowance caught by the denial test"
+    mutant_spec = importlib.util.spec_from_file_location("mutant_hook", mutant)
+    mutant_hook = importlib.util.module_from_spec(mutant_spec)
+    mutant_spec.loader.exec_module(mutant_hook)
+    with pytest.raises(AssertionError):
+        assert mutant_hook.denied(event(command)), "same publishing-denial assertion kills the mutant"
+    assert hook.denied(event(command))

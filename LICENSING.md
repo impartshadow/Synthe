@@ -1,6 +1,6 @@
 # Licensing
 
-Synthe is open-core. What you install and what lets anyone check our claims is open source. The broker,
+Synthe is open-core. The spec, checker, clients and integrations are open source under Apache-2.0. The broker,
 which holds the credentials and does the push, is source-available: you can read, audit and run it, but
 you can't sell it as a competing service. The paid team and hosted features are proprietary.
 

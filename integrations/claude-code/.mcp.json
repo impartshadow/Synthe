@@ -2,7 +2,7 @@
   "mcpServers": {
     "synthe-local": {
       "command": "synthe-mcp",
-      "args": ["--broker-url", "${SYNTHE_BROKER}"]
+      "args": []
     }
   }
 }

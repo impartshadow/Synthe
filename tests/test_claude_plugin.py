@@ -35,7 +35,8 @@ def test_approval_delivery_blocked():
     assert hook.denied({"hook_event_name": "PreToolUse", "tool_name": "mcp__plugin_synthe_local__synthe_submit_approval"})
 
 
-@pytest.mark.parametrize("raw", ["{", "[]", "null", "{}", '{"tool_name":"Bash","tool_input":null}', "x" * 256001])
+@pytest.mark.parametrize("raw", ["{", "[]", "null", "{}", '{"tool_name":"Bash","tool_input":null}', "x" * 256001],
+                         ids=["truncated-json", "array", "null", "empty-event", "null-input", "oversized"])
 def test_malformed_input_denied_without_echo(raw):
     result = subprocess.run([sys.executable, str(HOOK)], input=raw, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
@@ -55,7 +56,7 @@ def test_cli_does_not_echo_secrets_or_grant_permission():
 def test_plugin_layout_and_broker_only_mcp():
     assert json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())["name"] == "synthe"
     server = json.loads((PLUGIN / ".mcp.json").read_text())["mcpServers"]["synthe-local"]
-    assert server == {"command": "synthe-mcp", "args": ["--broker-url", "${SYNTHE_BROKER}"]}
+    assert server == {"command": "synthe-mcp", "args": []}
     config = json.loads((PLUGIN / "hooks/hooks.json").read_text())["hooks"]["PreToolUse"][0]
     assert "Bash" in config["matcher"] and "synthe_submit_approval" in config["matcher"]
     assert "${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py" in config["hooks"][0]["command"]
@@ -71,7 +72,9 @@ def test_mcp_broker_url_fallback(monkeypatch, tmp_path):
         def mock_server(registry, ledger, workspace, reserve_ttl_hours=24.0, verify_evidence=False,
                         broker_config=None, broker_url=None, as_receiver=None):
             called["broker_url"] = broker_url
-            return object()
+            from types import SimpleNamespace
+            client = SimpleNamespace(timeout=600, call=lambda op: {})
+            return SimpleNamespace(client=client)
         monkeypatch.setattr(sm, "SyntheServer", mock_server)
         monkeypatch.setattr(sm, "serve_stdio", lambda s: None)
         assert sm.main(["--broker-url", arg]) == 0

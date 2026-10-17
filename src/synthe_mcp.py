@@ -484,12 +484,25 @@ def main(argv=None):
                     help="browser Origin allowed to call the HTTP endpoint (repeatable)")
     a = ap.parse_args(argv)
     broker_url = (a.broker_url or "").strip()
-    if not broker_url or broker_url == "${SYNTHE_BROKER}":
-        import synthe_client as scl
+    import synthe_client as scl
+    if broker_url == "${SYNTHE_BROKER}" or (not broker_url and not a.broker and not (a.registry and a.ledger)):
         broker_url = os.environ.get("SYNTHE_BROKER", "").strip() or (scl.configured_broker() or "")
 
     if broker_url:
-        server = SyntheServer(None, None, None, broker_url=broker_url, as_receiver=a.as_receiver)
+        try:
+            server = SyntheServer(None, None, None, broker_url=broker_url, as_receiver=a.as_receiver)
+            # Detect a dead endpoint before MCP reports a connection that cannot serve tools.
+            # BrokerClient still checks the pinned kernel uid before sending even this hello.
+            timeout = server.client.timeout
+            try:
+                server.client.timeout = 5.0
+                server.client.call("hello")
+            finally:
+                server.client.timeout = timeout
+        except (scl.BrokerError, OSError) as exc:
+            code = exc.code if isinstance(exc, scl.BrokerError) else "broker_unreachable"
+            print(f"synthe-mcp: {code}; start the isolated broker or set SYNTHE_BROKER.", file=sys.stderr)
+            return 1
     else:
         if a.broker:
             import synthe_commit as cm
@@ -498,7 +511,8 @@ def main(argv=None):
             a.ledger = a.ledger or str(bc.ledger_path)
             a.workspace = a.workspace or (str(bc.workspace) if bc.workspace else None)
         if not a.registry or not a.ledger:
-            ap.error("--registry and --ledger are required (or pass --broker-url)")
+            print("synthe-mcp: no broker found; start the isolated broker or set SYNTHE_BROKER.", file=sys.stderr)
+            return 1
         server = SyntheServer(a.registry, a.ledger, a.workspace or ".", a.reserve_ttl_hours,
                               a.verify_evidence, broker_config=a.broker, as_receiver=a.as_receiver)
     if not a.http:

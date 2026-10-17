@@ -1,7 +1,7 @@
 {
   "hooks": {
     "PreToolUse": [{
-      "matcher": "Bash|mcp__.*__synthe_submit_approval|mcp__.*__github_publish",
+      "matcher": "^(Bash|mcp__.*__(synthe_submit_approval|github_publish|push_files|create_or_update_file|delete_file|merge_pull_request|create_branch))$",
       "hooks": [{
         "type": "command",
         "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\"",

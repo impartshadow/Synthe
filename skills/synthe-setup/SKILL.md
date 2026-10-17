@@ -5,8 +5,9 @@ description: Set up Synthe on the user's Mac so an AI agent (OpenClaw) can only 
 
 # Set up Synthe (macOS)
 
-Synthe makes an AI agent's pushes wait for a human's signed approval. Its guarantee is that the
-agent **can't** push or approve on its own. So you, the agent doing the setup, must never handle the
+Under ENFORCED, pushes to configured remotes go through the isolated broker's signed authorization
+checks. The agent account must hold no push credential or human approval key. Synthe does not stop
+prompt injection or a person approving the wrong change. You, the agent doing the setup, must never handle the
 secrets that guarantee rests on. Your job is to prepare everything else and hand the user one command.
 
 ## Never
@@ -50,4 +51,3 @@ secrets that guarantee rests on. Your job is to prepare everything else and hand
 6. **After they finish,** the output ends with the last step, which is theirs: give OpenClaw its
    model (`openclaw onboard` in the agent's account), then run it through its gateway. Point them to
    it. If the doctor didn't say ENFORCED, read the check that failed and explain it.
-
