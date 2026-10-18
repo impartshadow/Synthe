@@ -22,19 +22,14 @@ Using Claude Code, Cursor, Cline, or no AI at all? See [ANY_AGENT.md](docs/ANY_A
 - A fine-grained GitHub token for that one repo, with **Contents: Read and write**. You paste it
   once, hidden, in step 3.
 
-## Fast Track: 1-Line Setup
-
-Run this one command from your terminal:
+## Get Synthe
 
 ```bash
-curl -sSL https://synthe.live/install | bash
+git clone https://github.com/rohansiddam/Synthe ~/synthe && cd ~/synthe
 ```
 
-It checks Homebrew, installs Python and Node, sets up the virtual environment, prepares your repository, and launches setup.
-
----
-
-## Or Manual Step-by-Step Install
+Run every command below from that folder. A one-line installer is coming with the first tagged
+release; until then, these steps are the install.
 
 ### 1. Install
 
@@ -106,7 +101,11 @@ Then start chatting through the gateway:
 cd ~/repo && openclaw tui
 ```
 
-Check the title bar: it will say `ws://127.0.0.1:...` (the gateway). You are fully protected by Synthe.
+Check the title bar: it will say `ws://127.0.0.1:...` (the gateway).
+If it says local or embedded instead, quit and run `openclaw tui` without `--local`: in embedded
+mode the Synthe plugin doesn't run at all, and only the missing credentials stop a push.
+In this setup, pushes go through Synthe: the agent can propose, only you can approve.
+Synthe does not stop prompt injection or a person approving the wrong change.
 
 ## 5. Give OpenClaw a task (your account)
 

@@ -10,9 +10,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = "integrations/claude-code/hooks/pre_tool_use.py"
 MUTATIONS = {
-    "push filter removed": (HOOK, "return any(re.search(rule, command) for rule in RULES)", "return False"),
+    "push filter removed": (HOOK, 'return _shell_denied(params["command"])', "return False"),
+    "nested shell filter removed": (HOOK, 'if executable in SHELLS:', 'if executable in set():'),
     "approval delivery allowed": (HOOK, 'if tool.endswith(("__synthe_submit_approval", "__github_publish")):', 'if False:'),
-    "malformed hook allowed": (HOOK, "except (ValueError, RecursionError):\n        block = True", "except (ValueError, RecursionError):\n        block = False"),
+    "malformed hook allowed": (HOOK, "except Exception:\n        block = True", "except Exception:\n        block = False"),
+    "GitHub MCP writes allowed": (HOOK, 'if tool.startswith("mcp__") and tool.rsplit("__", 1)[-1] in GITHUB_WRITES:', 'if False:'),
+    "environment variables ignored": (HOOK, '_expand(command_word, variables, environment=True)', '_expand(command_word, variables)'),
     "hook authorizes tools": (HOOK, "    # No allow decision:", '    print("allow")\n    # No allow decision:'),
     "generic setup allows human identity": ("src/synthe_init.py", "if agent_account == approver:", "if False:"),
     "broker identity allowed": ("src/synthe_init.py", 'if agent_account in ("root", "synthe", "_synthe"):', 'if False:'),
@@ -32,7 +35,7 @@ def test_mutation_is_caught(tmp_path, name):
         shutil.copytree(ROOT / directory, tmp_path / directory, ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
     shutil.copyfile(ROOT / "LICENSE", tmp_path / "LICENSE")
     (tmp_path / "tests").mkdir()
-    for filename in ("test_any_agent.py", "test_claude_plugin.py", "test_release_packaging.py"):
+    for filename in ("test_any_agent.py", "test_claude_plugin.py", "test_claude_hook_commands.py", "test_release_packaging.py"):
         shutil.copyfile(ROOT / "tests" / filename, tmp_path / "tests" / filename)
     if name:
         filename, old, new = MUTATIONS[name]

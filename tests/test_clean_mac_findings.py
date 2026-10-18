@@ -40,7 +40,17 @@ def pythons(tmp_path):
     # Like Homebrew's 3.14.8 on macOS 26.1: a real, new enough Python whose pyexpat won't load.
     shadow = tmp_path / "no-expat"
     shadow.mkdir()
-    (shadow / "pyexpat.py").write_text("raise ImportError('dlopen pyexpat: Symbol not found: _XML_SetAllocTrackerActivationThreshold')\n")
+    # Python distributions can build pyexpat into the interpreter, where a shadow module cannot
+    # replace it. Fail the import itself so the same broken-interpreter guard is exercised on both.
+    (shadow / "sitecustomize.py").write_text(
+        "import builtins\n"
+        "original_import = builtins.__import__\n"
+        "def import_without_expat(name, *args, **kwargs):\n"
+        "    if name == 'pyexpat':\n"
+        "        raise ImportError('dlopen pyexpat: Symbol not found: _XML_SetAllocTrackerActivationThreshold')\n"
+        "    return original_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = import_without_expat\n"
+    )
     broken = fake(tmp_path, "broken-python", f'PYTHONPATH="{shadow}" exec "{sys.executable}" "$@"')
     return {"good": str(good), "broken": str(broken), "missing": str(tmp_path / "nope")}
 
@@ -135,18 +145,65 @@ def test_an_agent_shell_without_synthe_broker_finds_the_broker_its_setup_recorde
     import synthe_client as scl
     monkeypatch.delenv("SYNTHE_BROKER", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    defaults = [Path("/var/db/synthe-run/broker.sock"), Path("/run/synthe/broker.sock"),
+                tmp_path / ".synthe/broker.sock"]
+    available = set()
+    exists = Path.exists
+    monkeypatch.setattr(Path, "exists", lambda path: path in available if path in defaults else exists(path))
     with pytest.raises(scl.BrokerError) as e:                       # nothing recorded: still a clear error
         scl.BrokerClient()
     assert e.value.code == "broker_unset"
     (tmp_path / ".synthe").mkdir()
     (tmp_path / ".synthe" / "setup.json").write_text(json.dumps({"broker": si.MACOS_SOCKET}))
     assert scl.BrokerClient().url == si.MACOS_SOCKET
+    assert scl.BrokerClient("unix:///tmp/argument.sock").url == "unix:///tmp/argument.sock"
     monkeypatch.setenv("SYNTHE_BROKER", "unix:///tmp/explicit.sock")   # an explicit address still wins
     assert scl.BrokerClient().url == "unix:///tmp/explicit.sock"
+    assert scl.BrokerClient("unix:///tmp/argument.sock").url == "unix:///tmp/argument.sock"
     monkeypatch.delenv("SYNTHE_BROKER")
     (tmp_path / ".synthe" / "setup.json").write_text(json.dumps({"broker": "/not/an/address"}))
     with pytest.raises(scl.BrokerError):
         scl.BrokerClient()
+    (tmp_path / ".synthe" / "setup.json").unlink()
+    available.update(defaults)
+    for candidate in defaults:
+        assert scl.BrokerClient().url == f"unix://{candidate}"
+        available.remove(candidate)
+    with pytest.raises(scl.BrokerError, match="broker_unset"):
+        scl.BrokerClient()
+
+
+def test_discovered_broker_still_checks_the_pinned_uid_before_sending(tmp_path, monkeypatch):
+    import json
+    import socket
+    import tempfile
+    import threading
+    import synthe_client as scl
+    monkeypatch.delenv("SYNTHE_BROKER", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SYNTHE_BROKER_UID", str(os.getuid() + 1))
+    (tmp_path / ".synthe").mkdir()
+    with tempfile.TemporaryDirectory(prefix="sy", dir="/tmp") as directory:
+        address = str(Path(directory) / "b.sock")
+        (tmp_path / ".synthe/setup.json").write_text(json.dumps({"broker": f"unix://{address}"}))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(address)
+            server.listen(1)
+            server.settimeout(5)
+            received = []
+            def accept():
+                with server.accept()[0] as connection:
+                    connection.settimeout(5)
+                    received.append(connection.recv(1))
+            thread = threading.Thread(target=accept, daemon=True)
+            thread.start()
+            try:
+                with pytest.raises(scl.BrokerError) as error:
+                    scl.BrokerClient().call("hello")
+                assert error.value.code == "broker_not_isolated"
+            finally:
+                thread.join(timeout=6)
+            assert not thread.is_alive() and received == [b""], "send nothing to the wrong uid"
 
 
 def test_the_agent_is_told_base_is_a_branch_never_a_commit():
@@ -159,9 +216,12 @@ def test_the_agent_is_told_base_is_a_branch_never_a_commit():
     assert broker.count("(base names a branch there, e.g. main, not a commit)") == 2
 
 
-def test_the_quickstart_warns_that_onboarding_opens_an_embedded_chat_the_plugin_skips():
+def test_the_quickstart_configures_model_auth_without_onboarding_or_embedded_chat():
     qs = (ROOT / "QUICKSTART_OPENCLAW.md").read_text()
-    assert "local embedded" in qs and "Skip for now" in qs and "ws://127.0.0.1" in qs
+    assert "openclaw models auth add" in qs and "ws://127.0.0.1" in qs
+    assert "openclaw onboard" not in qs and "openclaw onboarding" not in qs
+    assert "openclaw tui --local" not in qs and "openclaw agent --local" not in qs
+    assert "gateway auth-token" not in qs
 
 
 # --- gateway auto-start (live on a founder's Mac 2026-10-07; fresh-account behavior checked with an empty
@@ -178,4 +238,5 @@ def test_a_failed_gateway_service_start_doesnt_stop_setup_before_the_doctor(tmp_
 def test_the_quickstart_no_longer_asks_for_a_gateway_window_or_a_token():
     qs = (ROOT / "QUICKSTART_OPENCLAW.md").read_text()
     assert "openclaw gateway run" not in qs and "auth-token" not in qs
-    assert "Gateway service:** skip installing it" in qs
+    assert "Setup already runs OpenClaw's gateway as a service in the agent's account" in qs
+    assert "cd ~/repo && openclaw tui" in qs

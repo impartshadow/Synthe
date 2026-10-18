@@ -280,16 +280,21 @@ class _FakeOpenClaw:
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
-def test_agent_setup_wires_openclaw_with_no_key_and_no_token(tmp_path):
+@pytest.mark.parametrize("platform,mode,socket,workspace", [
+    ("darwin", "macos-user", si.MACOS_SOCKET, si.MACOS_WORKSPACE),
+    ("linux", "linux-user", si.LINUX_SOCKET, si.LINUX_WORKSPACE),
+])
+def test_agent_setup_wires_openclaw_with_no_key_and_no_token(tmp_path, monkeypatch, platform, mode, socket, workspace):
+    monkeypatch.setattr(si.sys, "platform", platform)
     home, oc = tmp_path / "agent-home", _FakeOpenClaw()
     assert si.agent_setup(home, oc, "openclaw", assume_yes=True) == 0
     setup = json.loads((home / "setup.json").read_text())
-    assert setup == {"mode": "macos-user", "role": "agent", "broker": si.MACOS_SOCKET,
-                     "workspace": str(si.MACOS_WORKSPACE), "receiver": "openclaw", "agent_kind": "openclaw"}
+    assert setup == {"mode": mode, "role": "agent", "broker": socket,
+                     "workspace": str(workspace), "receiver": "openclaw", "agent_kind": "openclaw"}
     assert sorted(p.name for p in home.iterdir()) == ["setup.json"]          # no key, no token, nothing else
     assert home.stat().st_mode & 0o777 == 0o700
     mcp = next(c for c in oc.calls if c[:2] == ("mcp", "add"))
-    assert si.MACOS_SOCKET in mcp and "--as-receiver" in mcp and "openclaw" in mcp
+    assert socket in mcp and "--as-receiver" in mcp and "openclaw" in mcp
     assert ("mcp", "tools", si.MCP_NAME, "--exclude", "synthe_submit_approval") in oc.calls
 
 
@@ -351,11 +356,30 @@ def test_setup_refuses_a_bad_token_before_asking_for_a_passphrase(tmp_path, monk
 
 def test_the_installer_is_found_from_the_source_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(si, "__file__", str(tmp_path / "site-packages" / "synthe_init.py"))  # a regular install
+    monkeypatch.setattr(si.sys, "prefix", str(tmp_path / "empty-prefix"))  # ignore the real installed data files
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit, match="Synthe source directory"):
         si.source_root()
     monkeypatch.chdir(ORIGINAL_ROOT)
     assert si.source_root() == ORIGINAL_ROOT.resolve()
+
+
+def test_the_installer_is_found_in_the_installed_package_data(tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installed = prefix / "share" / "synthe" / "source"
+    installer = installed / "deploy" / "macos" / "install.sh"
+    broker = installed / "src" / "synthe_commit.py"
+    installer.parent.mkdir(parents=True)
+    broker.parent.mkdir(parents=True)
+    installer.touch()
+    broker.touch()
+    monkeypatch.setattr(si, "__file__", str(tmp_path / "site-packages" / "synthe_init.py"))
+    monkeypatch.setattr(si.sys, "prefix", str(prefix))
+    monkeypatch.chdir(tmp_path)
+    assert si.source_root() == installed
+    installer.unlink()
+    with pytest.raises(SystemExit, match="Synthe source directory"):
+        si.source_root()
 
 
 def test_the_agent_can_read_its_task_under_the_daemons_umask(staged):
@@ -387,6 +411,20 @@ def _prep(tmp_path, **kw):
                 approver="rohan", python="/usr/bin/python3", script_path=ROOT / "src" / "synthe_init.py", node=node)
     args.update(kw)
     return si.prepare(tmp_path / "home", **args)
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_prepare_refuses_the_approvers_account_on_supported_platforms(tmp_path, monkeypatch, platform):
+    monkeypatch.setattr(si.sys, "platform", platform)
+    # Satisfy the unrelated host preflights so a removed account guard cannot be hidden by
+    # missing Linux tools or by a container running the test as root.
+    monkeypatch.setattr(si.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(si.shutil, "which", lambda name: f"/test-bin/{name}")
+    monkeypatch.chdir(ORIGINAL_ROOT)
+    with pytest.raises(SystemExit, match=r"the agent's account must not be yours \(rohan\)"):
+        _prep(tmp_path, agent_account="rohan")
+    assert not (tmp_path / "home").exists()  # refusal precedes writing the human's setup command
+    assert _prep(tmp_path, agent_account="openclaw").is_file()  # a separate account still works
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS setup")

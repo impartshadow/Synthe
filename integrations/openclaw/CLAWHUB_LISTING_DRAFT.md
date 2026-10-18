@@ -23,7 +23,7 @@ licensing fields before converting it to a live listing.
 
 **Short summary (100 characters)**
 
-> Blocks direct code pushes and routes them through a human-approved, receipt-producing Synthe broker.
+> Blocks recognized code pushes and routes proposals through Synthe for signed authorization.
 
 ## Description
 
@@ -82,6 +82,8 @@ or other git libraries may bypass it. The security boundary is credential isolat
 not hold a GitHub token, authenticated `gh` session, or push-capable SSH key; an isolated broker must
 hold the only credential. `synthe-init doctor` checks the resulting enforcement level. Synthe does
 not prevent prompt injection, inspect code quality, or make compliance/certification claims.
+It also cannot stop a person approving the wrong change, and controls only the credentials and
+remotes configured for its broker. The normal installation requires your signed approval for each push.
 
 ## Installation copy
 

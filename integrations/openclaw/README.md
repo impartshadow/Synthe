@@ -18,8 +18,10 @@ Two pieces, installed together by `synthe-init` (or by hand):
 - **The wall is credentials.** The agent must hold no GitHub token and no SSH key with push rights,
   and the broker must hold the only one. `synthe-init` checks this and reports the result as an
   enforcement level: Advisory, Guarded or Enforced.
-- Synthe does not stop prompt injection or memory poisoning (MemGhost was measured at 87.5% on
-  OpenClaw). It stops the *effect*: nothing reaches the remote without a human's signed approval.
+- Synthe does not stop prompt injection or memory poisoning, judge code quality, or stop a person
+  approving the wrong change. Under ENFORCED, pushes to the configured remotes go through the
+  broker's commit-time authorization checks. The normal installation requires your signed approval
+  for each push.
 
 ## Tests
 
