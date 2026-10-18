@@ -1,7 +1,0 @@
-# Public genesis key of the THROWAWAY example operator key ("example-key") that
-# signs examples/registry.json and examples/v03/registry.json. Its private key
-# was discarded. Pin it only to try the examples:
-#   handoff_check.py examples/valid.json --registry examples/registry.json \
-#     --registry-genesis-key "$(grep -v '^#' examples/registry-genesis.pub)"
-# Never pin this in a real deployment: pin your own operator key.
-l2hhlEtIWydQUlkmKwmLQ27fTM2i7WpgIfrE02AfuWY
