@@ -8,3 +8,7 @@ formal/states/
 # a local dev venv: name it venv, not .venv, inside iCloud-synced folders (QUICKSTART_OPENCLAW.md)
 .venv/
 venv/
+
+# iCloud "Keep both" copies (e.g. "synthe_approve 2.py"); never commit them
+* [0-9].*
+* [0-9]

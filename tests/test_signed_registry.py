@@ -287,7 +287,7 @@ def test_cli_accepts_signed_registry(tmp_path, op_key):
     reg = _signed_example_registry(tmp_path, op_key)
     r = _run("src/handoff_check.py", "examples/valid.json",
              "--registry", str(reg), "--workspace", ".",
-             "--registry-genesis-key", _op_pin(op_key))
+             f"--registry-genesis-key={_op_pin(op_key)}")
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(r.stdout)["decision"] == "ACCEPT"
 
@@ -299,7 +299,7 @@ def test_cli_rejects_tampered_registry(tmp_path, op_key):
     reg.write_text(json.dumps(tampered))
     r = _run("src/handoff_check.py", "examples/valid.json",
              "--registry", str(reg), "--workspace", ".",
-             "--registry-genesis-key", _op_pin(op_key))
+             f"--registry-genesis-key={_op_pin(op_key)}")
     assert r.returncode == 2, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["decision"] == "REJECT"
@@ -498,7 +498,7 @@ def test_cli_genesis_pin_precedence_flag_over_env(tmp_path, op_key, op_key2, mon
     reg = _signed_example_registry(tmp_path, op_key)
     r = _run_env("src/handoff_check.py", "examples/valid.json",
                  "--registry", str(reg), "--workspace", ".",
-                 "--registry-genesis-key", _op_pin(op_key),
+                 f"--registry-genesis-key={_op_pin(op_key)}",
                  env={"SYNTHE_REGISTRY_GENESIS_KEY": _op_pin(op_key2)})
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(r.stdout)["decision"] == "ACCEPT"
@@ -531,7 +531,7 @@ def test_cli_wrong_pin_rejects(tmp_path, op_key, op_key2):
     reg = _signed_example_registry(tmp_path, op_key)
     r = _run("src/handoff_check.py", "examples/valid.json",
              "--registry", str(reg), "--workspace", ".",
-             "--registry-genesis-key", _op_pin(op_key2))
+             f"--registry-genesis-key={_op_pin(op_key2)}")
     assert r.returncode == 2, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["decision"] == "REJECT"
@@ -551,7 +551,22 @@ def test_cli_quickstart_with_and_without_example_pin(monkeypatch):
            if l.strip() and not l.startswith("#")][0]
     r = _run_env("src/handoff_check.py", "examples/valid.json",
                  "--registry", "examples/registry.json", "--workspace", ".",
-                 "--registry-genesis-key", pub, env={})
+                 f"--registry-genesis-key={pub}", env={})
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(r.stdout)["decision"] == "ACCEPT"
     assert "NOT verified" not in r.stderr
+
+def test_cli_takes_a_pin_that_starts_with_a_dash(tmp_path):
+    """About 1 base64url key in 64 starts with '-'. Passed as a separate argument, argparse reads it as
+    an option and exits 2 with no verdict, which made test_cli_rejects_tampered_registry flaky in CI
+    (2026-10-18). The '=' form always works; this pins that."""
+    for _ in range(5000):
+        secret = sc.generate_secret()
+        if sc.b64u(sc.public_key(secret)).startswith("-"):
+            break
+    key = {"secret": secret, "kid": "op-1", "pub": sc.public_key(secret)}
+    reg = _signed_example_registry(tmp_path, key)
+    r = _run("src/handoff_check.py", "examples/valid.json", "--registry", str(reg), "--workspace", ".",
+             f"--registry-genesis-key={_op_pin(key)}")
+    assert _op_pin(key).startswith("-")
+    assert json.loads(r.stdout)["decision"] == "ACCEPT", r.stdout + r.stderr

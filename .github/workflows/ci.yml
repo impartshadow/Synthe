@@ -1,0 +1,58 @@
+# Public CI: the full Python suite on macOS and Linux, and the OpenClaw plugin tests,
+# on every pull request and every push to main. Free for a public repository.
+#
+# This file is public-only. release-full-suite.yml comes from the private repo's export;
+# keep this one separate so an export never overwrites it.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install '.[test]'
+      - name: Refuse sudo, so the doctor's privilege probe never escalates
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/synthe-test-bin"
+          printf '#!/bin/sh\nexit 1\n' > "$RUNNER_TEMP/synthe-test-bin/sudo"
+          chmod +x "$RUNNER_TEMP/synthe-test-bin/sudo"
+          echo "$RUNNER_TEMP/synthe-test-bin" >> "$GITHUB_PATH"
+      - name: Run every collected test
+        run: python -m pytest -q -p no:cacheprovider
+        env:
+          PYTHONPATH: src
+
+  plugin:
+    name: OpenClaw plugin tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - run: node --test
+        working-directory: integrations/openclaw/plugin
