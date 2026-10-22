@@ -53,7 +53,7 @@ branch must not exist.
 
 33 passed, 0 failed, 0 skipped, on a real ENFORCED macOS install (broker as `_synthe`, agent as its own account) against the public test repo `rohansiddam/synthe-test`, at 2026-10-07T18:41:33+00:00. The raw report is [`docs/results/redteam-2026-10-07.json`](results/redteam-2026-10-07.json), exactly as `redteam_live.py` wrote it.
 
-This is a defined set of attacks, not proof that no other attack works. Two rows are controls (the real task is claimed and the in-scope change is pushed), so 31 rows are attacks and 2 show the normal path still works.
+This is a defined set of attacks, not proof that no other attack works. Three rows (14, 22 and 28) are controls: claiming the real task, staging the in-scope change, and pushing the approved change. The other 30 rows are attacks or checks of their containment. Of the refusals, 13 reached the broker and received signed receipts; other attacks failed earlier at credential, permission or signature checks.
 
 | # | Layer | Attack | Synthe must | Result | What happened |
 |---|---|---|---|---|---|
