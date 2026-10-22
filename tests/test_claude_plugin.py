@@ -20,7 +20,7 @@ def event(command):
 
 @pytest.mark.parametrize("command", ["git push", "git -C /tmp/repo push origin main", "env X=1 /usr/bin/git push",
     "git -c core.sshCommand=x push", "git \\\npush", "git send-pack x", "gh pr merge 1", "gh release create v1",
-    "gh api /repos/example/repo/git/refs", "curl -X POST https://api.github.com/repos/example/repo",
+    "gh api -X POST /repos/example/repo/git/refs -f ref=refs/heads/x", "curl -X POST https://api.github.com/repos/example/repo",
     'python -c \'subprocess.run(["git", "push"])\'', "true; git push origin HEAD", "$(git push)"])
 def test_direct_publication_denied(command):
     assert hook.denied(event(command))

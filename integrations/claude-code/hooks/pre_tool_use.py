@@ -298,10 +298,15 @@ def _command_denied(words, docs, variables, depth):
             if option in {"-R", "--repo", "--hostname"} and words:
                 words.pop(0)
         args = [_expand(word, variables) for word in words[:2]]
-        return bool(args) and (args[0] == "api" or args[:2] in [
+        if args and args[0] == "api":
+            return not _gh_api_read_only([_expand(word, variables) for word in words[1:]])
+        return bool(args) and args[:2] in [
             ["pr", "merge"], ["repo", "sync"], ["release", "create"], ["release", "upload"],
-            ["release", "edit"], ["release", "delete"]])
-    if executable in {"curl", "wget", "http", "https", "xh"}:
+            ["release", "edit"], ["release", "delete"]]
+    if executable == "curl":
+        expanded = [_expand(word, variables) for word in words]
+        return any("api.github.com" in w.lower() for w in expanded) and not _curl_read_only(expanded)
+    if executable in {"wget", "http", "https", "xh"}:
         return any("api.github.com" in _expand(word, variables).lower() for word in words)
     if re.fullmatch(r"python(?:[23](?:\.\d+)?)?", executable):
         if "-c" in words:
@@ -309,6 +314,72 @@ def _command_denied(words, docs, variables, depth):
             return i + 1 >= len(words) or _python_denied(words[i + 1], depth + 1, variables)
         return any(_python_denied(doc["body"], depth + 1, variables) for doc in docs)
     return False
+
+
+# Reads are not publishing. `gh api` and curl are blocked only when they could write: an explicit
+# non-GET method, a field or body (which makes gh send a POST), GraphQL (a query can carry a
+# mutation), or a call the parser can't classify. Blocking every read made the hook fail on
+# harmless commands, and a guard people learn to switch off protects nothing.
+_GH_WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+_CURL_WRITE_FLAGS = ("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii",
+                     "-F", "--form", "--form-string", "-T", "--upload-file", "--json")
+
+
+def _method_is_read(value) -> bool:
+    return isinstance(value, str) and value.upper() in {"GET", "HEAD"}
+
+
+def _writes(a, flags, short) -> bool:
+    """A body or field flag, alone, as --flag=value, or glued to its value (-fkey=v)."""
+    return (a in flags or any(a.startswith(f + "=") for f in flags if f.startswith("--"))
+            or (a[:2] in short and len(a) > 2))
+
+
+def _method_ok(args, i, long_flag):
+    """(read_only, next_index) for a method option at args[i], or None if args[i] isn't one."""
+    a = args[i]
+    if a in ("-X", long_flag):
+        return (i + 1 < len(args) and _method_is_read(args[i + 1])), i + 2
+    if a.startswith(long_flag + "="):
+        return _method_is_read(a.split("=", 1)[1]), i + 1
+    if a.startswith("-X") and len(a) > 2:
+        return _method_is_read(a[2:]), i + 1
+    return None
+
+
+def _gh_api_read_only(args) -> bool:
+    endpoint, i = None, 0
+    while i < len(args):
+        m = _method_ok(args, i, "--method")
+        if m is not None:
+            if not m[0]:
+                return False
+            i = m[1]
+            continue
+        a = args[i]
+        if _writes(a, _GH_WRITE_FLAGS, ("-f", "-F")):
+            return False
+        if not a.startswith("-") and endpoint is None:
+            endpoint = a
+        i += 1
+    if endpoint is None:
+        return False
+    return endpoint.strip("/").split("?", 1)[0].lower() != "graphql"
+
+
+def _curl_read_only(args) -> bool:
+    i = 0
+    while i < len(args):
+        m = _method_ok(args, i, "--request")
+        if m is not None:
+            if not m[0]:
+                return False
+            i = m[1]
+            continue
+        if _writes(args[i], _CURL_WRITE_FLAGS, ("-d", "-F", "-T")):
+            return False
+        i += 1
+    return True
 
 
 def _shell_denied(source, depth=0, variables=None):
