@@ -44,11 +44,31 @@ def test_harmless_mentions_are_allowed(command):
     "gh api -X GET repos/example/repo/pulls", "gh api --method=get repos/example/repo",
     "gh api -XGET repos/example/repo/commits/main", "gh -R example/repo api repos/example/repo/actions/runs",
     "gh api --paginate repos/example/repo/branches", "gh api -H 'Accept: application/json' repos/example/repo",
-    "curl -s https://api.github.com/repos/example/repo",
-    "curl -X GET https://api.github.com/repos/example/repo", "curl -I https://api.github.com/",
+    "gh api https://api.github.com/repos/example/repo", "gh api -iH 'Accept: x' repos/example/repo",
+    "curl -q -s https://api.github.com/repos/example/repo", "curl --disable -sSL https://api.github.com/x",
+    "curl -q -X GET https://api.github.com/repos/example/repo", "curl -q -I https://api.github.com/",
+    "curl -q -sXGET https://api.github.com/x", "curl -q --url https://api.github.com/x -H 'Accept: y'",
 ])
 def test_github_api_reads_are_allowed(command):
     assert not hook.denied(event(command))
+
+
+# Codex's review of the first version (2026-10-22): each of these got through it. Uncertain forms stay denied.
+@pytest.mark.parametrize("command", [
+    "curl -sX POST https://api.github.com/repos/example/repo/pulls",
+    "curl -sd '{}' https://api.github.com/repos/example/repo/pulls",
+    "curl --config payload.conf https://api.github.com/repos/example/repo/pulls",
+    "curl -K payload.conf https://api.github.com/repos/example/repo/pulls",
+    "gh api -H 'Accept: application/json' graphql", "gh api https://api.github.com/graphql",
+    "curl -s https://api.github.com/repos/example/repo",  # no -q: ~/.curlrc could add a body
+    "curl -q -K payload.conf https://api.github.com/x", "curl -q -sK payload.conf https://api.github.com/x",
+    "curl -q --unknown-flag https://api.github.com/x", "gh api --unknown repos/example/repo",
+    "gh api repos/a/b repos/c/d", "gh api http://api.github.com/repos/x", "gh api https://evil.example/graphql",
+    "gh api -X", "gh api --method", "curl -q https://api.github.com/x -X", "gh api repos/example/repo/graphql",
+    "gh pr create --fill", "gh pr create --dry-run --head feature", "gh -R example/repo pr create",
+])
+def test_review_bypasses_and_uncertain_forms_are_denied(command):
+    assert hook.denied(event(command))
 
 
 @pytest.mark.parametrize("command", [
