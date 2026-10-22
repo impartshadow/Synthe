@@ -1,4 +1,5 @@
-"""Mutation check for tests/test_approve.py: each guard removed in a copy must make that file fail.
+"""Mutation check for tests/test_approve.py and tests/test_approve_card_v2.py: each guard removed in a
+copy must make those files fail.
 
 Set SYNTHE_SKIP_MUTATIONS=1 to skip (each mutation runs the approval tests in a subprocess).
 The terminal check in synthe_sign.prompt_passphrase is not mutated here: without it getpass
@@ -30,6 +31,21 @@ MUTATIONS = {
                                  "    if False:\n"),
     "plaintext approver key accepted": ("src/synthe_sign.py", "        if require_encrypted:\n            raise KeyFileError(",
                                         "        if False:\n            raise KeyFileError("),
+    "risk never assessed": ("src/synthe_approve.py", "    if not found:\n        return {\"tier\": \"routine\", \"reasons\": []}",
+                            "    if True:\n        return {\"tier\": \"routine\", \"reasons\": []}"),
+    "high-risk check skipped": ("src/synthe_approve.py",
+                                '        if assess(detail)["tier"] == "high" and not confirm_commit(detail):',
+                                "        if False:"),
+    "full-diff gate skipped": ("src/synthe_approve.py",
+                               '    return assess(detail)["tier"] != "routine" and diff_has_more(detail)',
+                               "    return False"),
+    "agent words before the diff": ("src/synthe_approve.py",
+                                    "    # The agent's words come last: read the change first, then what the agent says about it.\n",
+                                    "    lines.insert(4, \" The agent says (moved up)\")\n"
+                                    "    lines.insert(5, \"   \" + clean((detail.get(\"agent_says\") or {}).get(\"purpose\")))\n"),
+    "touch id prompt hides the risk": ("src/synthe_approve.py",
+                                       '    prefix = {"high": "HIGH-RISK: ", "review": "CHECK: "}.get(risk["tier"], "")',
+                                       '    prefix = ""'),
     "key metadata not bound": ("src/synthe_sign.py",
                                '    return sc.canonical_json({"v": KEY_FORMAT, "agent": key.get("agent"), "kid": key.get("kid"),\n'
                                '                              "alg": key.get("alg", sc.ALG)})',
@@ -43,7 +59,7 @@ def _copy_repo(dst: Path) -> None:
             continue
         shutil.copytree(ROOT / name, dst / name, ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
     (dst / "tests").mkdir()
-    for name in ("test_approve.py", "world.py", "test_isolation.py", "test_speculative.py"):
+    for name in ("test_approve.py", "test_approve_card_v2.py", "world.py", "test_isolation.py", "test_speculative.py"):
         shutil.copy2(ROOT / "tests" / name, dst / "tests" / name)
 
 
@@ -53,7 +69,7 @@ def _run(dst: Path, timeout: int = 600) -> subprocess.CompletedProcess | None:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     try:
         return subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
-                               str(dst / "tests" / "test_approve.py")],
+                               str(dst / "tests" / "test_approve.py"), str(dst / "tests" / "test_approve_card_v2.py")],
                               cwd=dst, env=env, capture_output=True, text=True, timeout=timeout,
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
