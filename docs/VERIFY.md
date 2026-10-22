@@ -8,6 +8,26 @@ built `synthe-verify` wheel. This is a release candidate, not a claim that a pac
 synthe-verify receipts.jsonl --key broker.pub.json --json
 ```
 
+What success and failure look like. A sample chain of three receipts (a push to `main` refused, then
+a push to the approved branch staged and executed), checked untouched and then with the refusal
+rewritten as `executed`. Your digests and key will differ; the shape will not.
+
+```text
+$ synthe-verify receipts.jsonl --key broker.pub.json
+VERIFIED  3 receipts signed by synthe-broker (kid synthe-broker-1)
+head      ebe32bfead2a6b3cc500a1825fc0274831ebec23fd33604603fba13d66d4cfaf  (seq 3)
+decisions denied 1, executed 1, staged 1
+
+$ synthe-verify tampered.jsonl --key broker.pub.json
+NOT VERIFIED  3 receipts, 2 problem(s); trusted signer synthe-broker (kid synthe-broker-1)
+  line 1 seq 1: signature_invalid: the signature does not verify
+  line 2 seq 2: prev_mismatch: prev is not the digest of the receipt before it
+```
+
+The first command exits 0, the second exits 1. One edited receipt fails twice: its own signature, and
+the link from the receipt after it. Record the `head` line somewhere the ledger writer can't change; it
+is your checkpoint for the next run (see below).
+
 Obtain the public key over a channel you trust, independently of the receipt file. On a configured Mac
 the installer publishes it at `/Users/Shared/Synthe/broker.pub.json`. Only use public keys here; never
 share broker private state. A public registry is accepted with `--key registry.json --broker synthe-broker`.
