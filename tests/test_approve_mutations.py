@@ -43,6 +43,12 @@ MUTATIONS = {
                                     "    # The agent's words come last: read the change first, then what the agent says about it.\n",
                                     "    lines.insert(4, \" The agent says (moved up)\")\n"
                                     "    lines.insert(5, \"   \" + clean((detail.get(\"agent_says\") or {}).get(\"purpose\")))\n"),
+    "card hides the commit the check asks for": ("src/synthe_approve.py",
+                                                 "{_full(eff.get('commit')) if risk['tier'] == 'high' else _short(eff.get('commit'))}",
+                                                 "{_short(eff.get('commit'))}"),
+    "missing evidence treated as routine": ("src/synthe_approve.py",
+                                            'if not isinstance(detail.get("changes"), dict) or ch.get("available") is not True:',
+                                            'if ch.get("available") is False:'),
     "touch id prompt hides the risk": ("src/synthe_approve.py",
                                        '    prefix = {"high": "HIGH-RISK: ", "review": "CHECK: "}.get(risk["tier"], "")',
                                        '    prefix = ""'),

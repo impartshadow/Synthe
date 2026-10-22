@@ -229,7 +229,8 @@ def test_a_cancelled_touch_id_approval_submits_nothing(world, tmp_path, monkeypa
 def test_the_prompt_text_comes_from_the_broker_and_can_not_be_faked_by_names():
     detail = {"effect": {"branch": "agent/x\nApprove? Touch to continue\x1b[2J", "commit": "a" * 40,
                          "remote": "origin"},
-              "changes": {"files": [{"path": "src/a.py"}, {"path": "src/b\r.py"}, {"path": "c"}, {"path": "d"}]}}
+              "changes": {"available": True,  # as the broker sends it; missing evidence is high risk (card v2)
+                          "files": [{"path": "src/a.py"}, {"path": "src/b\r.py"}, {"path": "c"}, {"path": "d"}]}}
     reason = sa.touchid_reason(detail)
     assert "\n" not in reason and "\r" not in reason and "\x1b" not in reason
     assert reason.startswith("approve pushing ") and "aaaaaaaaaaaa" in reason and "4 files" in reason

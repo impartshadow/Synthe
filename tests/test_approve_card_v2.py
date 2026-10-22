@@ -206,9 +206,63 @@ def test_stats_flag_rushed_high_risk_approvals(local_log, capsys):
     assert sa.main(["--stats"]) == 0
     out = capsys.readouterr().out
     assert "3 decisions" in out and "routine" in out and "50% approved" in out
-    assert "1 high-risk approval took less time" in out
+    assert "1 high-risk approval came faster than 2s per 100 changed lines" in out
+    assert "not proof of reading" in out
 
 
 def test_stats_with_no_log(local_log, capsys):
     assert sa.main(["--stats"]) == 0
     assert "No decisions recorded yet." in capsys.readouterr().out
+
+
+# ---- fixes from Codex's review (2026-10-22) ---------------------------------------------------
+
+def test_the_card_shows_the_characters_the_check_asks_for(monkeypatch, capsys):
+    """The check asks for the end of the commit; a card showing only its first 12 characters made the
+    check impossible to pass from the card. Render and prompt are tested together."""
+    d = high_detail()
+    card = sa.render(d)
+    assert COMMIT in card and COMMIT[-sa.CHECK_CHARS:] in card
+    sent, signed, prompts = drive(monkeypatch, d, ["a", COMMIT[-sa.CHECK_CHARS:]])
+    assert signed == ["k1/push_branch"]
+    shown = capsys.readouterr().out
+    assert COMMIT in shown and any("full commit on the Push line" in p for p in prompts)
+
+
+def test_routine_cards_keep_the_short_commit():
+    assert COMMIT not in sa.render(detail()) and COMMIT[:12] in sa.render(detail())
+
+
+@pytest.mark.parametrize("changes", [None, [], "nope", {}, {"files": []}, {"available": "yes"}])
+def test_missing_or_malformed_evidence_is_high_risk(changes):
+    d = detail()
+    if changes is None:
+        d.pop("changes")
+    else:
+        d["changes"] = changes
+    assert sa.assess(d)["tier"] == "high"
+
+
+def test_a_truncated_diff_is_never_called_whole(monkeypatch, capsys):
+    long = detail(truncated=True, patch_lines=sa.PREVIEW_LINES + 20)
+    sent, signed, prompts = drive(monkeypatch, long, ["v", "a", "beef"])
+    assert all("view the whole diff" not in p for p in prompts)
+    assert any("view the diff the broker returned" in p for p in prompts)
+    assert "read the commit itself as well" in capsys.readouterr().out
+
+
+def test_the_log_is_private_and_bounded(monkeypatch, local_log):
+    drive(monkeypatch, detail(), ["a"])
+    assert local_log.stat().st_mode & 0o777 == 0o600
+    local_log.write_text("{}\n" * (2 * sa.LOG_KEEP + 5))
+    drive(monkeypatch, detail(), ["a"])
+    lines = local_log.read_text().splitlines()
+    assert len(lines) == sa.LOG_KEEP and json.loads(lines[-1])["decision"] == "approved"
+
+
+def test_the_log_can_be_turned_off(monkeypatch, local_log, capsys):
+    monkeypatch.setenv("SYNTHE_APPROVALS_LOG", "off")
+    drive(monkeypatch, detail(), ["a"])
+    assert not local_log.exists()
+    assert sa.main(["--stats"]) == 0
+    assert "log is off" in capsys.readouterr().out

@@ -130,7 +130,8 @@ touching the sensor. Otherwise Synthe asks for the approval passphrase. A push t
 files, or changes CI, dependency or secrets-like files is marked CHECK or HIGH-RISK on the card and in
 the Touch ID prompt; for a high-risk push you type the last 4 characters of the commit first, and a long
 diff must be viewed in full (`v`) before you can approve. `synthe-approve --stats` shows your approval
-rate and time-to-decision from a log that never leaves your Mac. To force the fallback even
+rate and time-to-decision from a local log that never leaves your Mac (owner-only, last 1,000
+decisions; `SYNTHE_APPROVALS_LOG=off` turns it off). To force the fallback even
 after enrollment, run:
 
 ```bash
