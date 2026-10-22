@@ -298,10 +298,16 @@ def _command_denied(words, docs, variables, depth):
             if option in {"-R", "--repo", "--hostname"} and words:
                 words.pop(0)
         args = [_expand(word, variables) for word in words[:2]]
-        return bool(args) and (args[0] == "api" or args[:2] in [
-            ["pr", "merge"], ["repo", "sync"], ["release", "create"], ["release", "upload"],
-            ["release", "edit"], ["release", "delete"]])
-    if executable in {"curl", "wget", "http", "https", "xh"}:
+        if args and args[0] == "api":
+            return not _gh_api_read_only([_expand(word, variables) for word in words[1:]])
+        # `gh pr create` can push an unpublished head branch itself (even with --dry-run), so it is denied.
+        return bool(args) and args[:2] in [
+            ["pr", "merge"], ["pr", "create"], ["repo", "sync"], ["release", "create"], ["release", "upload"],
+            ["release", "edit"], ["release", "delete"]]
+    if executable == "curl":
+        expanded = [_expand(word, variables) for word in words]
+        return any("api.github.com" in w.lower() for w in expanded) and not _curl_read_only(expanded)
+    if executable in {"wget", "http", "https", "xh"}:
         return any("api.github.com" in _expand(word, variables).lower() for word in words)
     if re.fullmatch(r"python(?:[23](?:\.\d+)?)?", executable):
         if "-c" in words:
@@ -310,6 +316,104 @@ def _command_denied(words, docs, variables, depth):
         return any(_python_denied(doc["body"], depth + 1, variables) for doc in docs)
     return False
 
+
+# Reads are not publishing, but only a call that is *provably* a read is let through (Codex's review,
+# 2026-10-22). Every option must be known, with its value consumed the way the tool consumes it
+# (glued short options like `-sX POST` included); an unknown option, a body or field, a non-GET method,
+# GraphQL, or anything else uncertain is denied. curl counts as a read only with -q/--disable first,
+# because otherwise ~/.curlrc can add a method or body that the command line doesn't show.
+_GH_API_VALUE = {"-H": "header", "--header": "header", "-X": "method", "--method": "method",
+                 "-q": "x", "--jq": "x", "-t": "x", "--template": "x", "-p": "x", "--preview": "x",
+                 "--hostname": "x", "--cache": "x"}
+_GH_API_BOOL = {"-i", "--include", "--paginate", "--silent", "--slurp", "--verbose"}
+_CURL_VALUE = {"-H": "header", "--header": "header", "-X": "method", "--request": "method",
+               "-o": "x", "--output": "x", "-w": "x", "--write-out": "x", "-m": "x", "--max-time": "x",
+               "--connect-timeout": "x", "--retry": "x", "-A": "x", "--user-agent": "x", "--url": "url"}
+_CURL_BOOL = {"-s", "--silent", "-S", "--show-error", "-f", "--fail", "--fail-with-body", "-L", "--location",
+              "-i", "--include", "-I", "--head", "-v", "--verbose", "--compressed", "-g", "--globoff"}
+
+
+def _method_is_read(value) -> bool:
+    return isinstance(value, str) and value.upper() in {"GET", "HEAD"}
+
+
+def _parse_options(args, value_opts, bool_opts):
+    """[(option, value)] and positionals, or None when any option is unknown or lacks its value.
+    Short options may be combined (-sS) and the last may carry a glued or following value (-sXPOST, -sX POST)."""
+    opts, positional, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional += args[i + 1:]
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in value_opts:
+                if not eq:
+                    if i + 1 >= len(args):
+                        return None
+                    i += 1
+                    val = args[i]
+                opts.append((name, val))
+            elif name in bool_opts and not eq:
+                opts.append((name, None))
+            else:
+                return None
+        elif a.startswith("-") and len(a) > 1:
+            j = 1
+            while j < len(a):
+                flag = "-" + a[j]
+                if flag in bool_opts:
+                    opts.append((flag, None))
+                    j += 1
+                    continue
+                if flag in value_opts:
+                    val = a[j + 1:]
+                    if not val:
+                        if i + 1 >= len(args):
+                            return None
+                        i += 1
+                        val = args[i]
+                    opts.append((flag, val))
+                    break
+                return None
+        else:
+            positional.append(a)
+        i += 1
+    return opts, positional
+
+
+def _methods_read_only(opts, value_opts) -> bool:
+    return all(_method_is_read(v) for o, v in opts if value_opts.get(o) == "method")
+
+
+def _gh_api_read_only(args) -> bool:
+    parsed = _parse_options(args, _GH_API_VALUE, _GH_API_BOOL)
+    if parsed is None:
+        return False
+    opts, positional = parsed
+    if len(positional) != 1 or not _methods_read_only(opts, _GH_API_VALUE):
+        return False
+    endpoint = positional[0].split("?", 1)[0].split("#", 1)[0]
+    if "://" in endpoint:
+        scheme, _, rest = endpoint.partition("://")
+        host, _, path = rest.partition("/")
+        if scheme.lower() != "https" or host.lower() != "api.github.com":
+            return False
+        endpoint = path
+    path = endpoint.strip("/").lower()
+    return bool(path) and path != "graphql" and not path.endswith("/graphql")
+
+
+def _curl_read_only(args) -> bool:
+    if not args or args[0] not in ("-q", "--disable"):
+        return False
+    parsed = _parse_options(args[1:], _CURL_VALUE, _CURL_BOOL)
+    if parsed is None:
+        return False
+    opts, positional = parsed
+    urls = positional + [v for o, v in opts if o == "--url"]
+    return bool(urls) and _methods_read_only(opts, _CURL_VALUE)
 
 def _shell_denied(source, depth=0, variables=None):
     if depth > MAX_DEPTH:

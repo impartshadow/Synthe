@@ -37,6 +37,40 @@ def test_harmless_mentions_are_allowed(command):
     assert not hook.denied(event(command))
 
 
+# Reads are not publishing (2026-10-22): blocking every `gh api` and every curl to api.github.com made the
+# hook refuse harmless commands. Only a provable read is allowed; the write forms stay in the denied list.
+@pytest.mark.parametrize("command", [
+    "gh api /repos/example/repo", "gh api repos/example/repo/pulls/13 -q .head.sha",
+    "gh api -X GET repos/example/repo/pulls", "gh api --method=get repos/example/repo",
+    "gh api -XGET repos/example/repo/commits/main", "gh -R example/repo api repos/example/repo/actions/runs",
+    "gh api --paginate repos/example/repo/branches", "gh api -H 'Accept: application/json' repos/example/repo",
+    "gh api https://api.github.com/repos/example/repo", "gh api -iH 'Accept: x' repos/example/repo",
+    "curl -q -s https://api.github.com/repos/example/repo", "curl --disable -sSL https://api.github.com/x",
+    "curl -q -X GET https://api.github.com/repos/example/repo", "curl -q -I https://api.github.com/",
+    "curl -q -sXGET https://api.github.com/x", "curl -q --url https://api.github.com/x -H 'Accept: y'",
+])
+def test_github_api_reads_are_allowed(command):
+    assert not hook.denied(event(command))
+
+
+# Codex's review of the first version (2026-10-22): each of these got through it. Uncertain forms stay denied.
+@pytest.mark.parametrize("command", [
+    "curl -sX POST https://api.github.com/repos/example/repo/pulls",
+    "curl -sd '{}' https://api.github.com/repos/example/repo/pulls",
+    "curl --config payload.conf https://api.github.com/repos/example/repo/pulls",
+    "curl -K payload.conf https://api.github.com/repos/example/repo/pulls",
+    "gh api -H 'Accept: application/json' graphql", "gh api https://api.github.com/graphql",
+    "curl -s https://api.github.com/repos/example/repo",  # no -q: ~/.curlrc could add a body
+    "curl -q -K payload.conf https://api.github.com/x", "curl -q -sK payload.conf https://api.github.com/x",
+    "curl -q --unknown-flag https://api.github.com/x", "gh api --unknown repos/example/repo",
+    "gh api repos/a/b repos/c/d", "gh api http://api.github.com/repos/x", "gh api https://evil.example/graphql",
+    "gh api -X", "gh api --method", "curl -q https://api.github.com/x -X", "gh api repos/example/repo/graphql",
+    "gh pr create --fill", "gh pr create --dry-run --head feature", "gh -R example/repo pr create",
+])
+def test_review_bypasses_and_uncertain_forms_are_denied(command):
+    assert hook.denied(event(command))
+
+
 @pytest.mark.parametrize("command", [
     "git push", "'git' 'push'", r"g\it pu\sh", "/usr/bin/git -C /tmp/repo push",
     "env X=1 git -c x=y push", "command git push", "nohup git push",
@@ -53,7 +87,15 @@ def test_harmless_mentions_are_allowed(command):
     "env -S 'git push'", "env --split-string='git push'", "env '-Sgit push'",
     "sudo --prompt fixture git push", "timeout --kill-after 2 10 git push",
     "git send-pack origin", "git http-push origin", "gh pr merge 1", "gh release upload v1 file",
-    "gh api /repos/example/repo", "gh --repo example/repo pr merge 1", "curl -X POST https://api.github.com/repos/example/repo",
+    "gh api -X PUT /repos/example/repo/pulls/1/merge", "gh api --method POST repos/example/repo/git/refs",
+    "gh api --method=DELETE repos/example/repo/git/refs/heads/x", "gh api -XPATCH repos/example/repo",
+    "gh api repos/example/repo/git/refs -f ref=refs/heads/x -f sha=abc", "gh api repos/example/repo -Fname=x",
+    "gh api repos/example/repo/contents/a --input body.json", "gh api repos/example/repo --raw-field=x=1",
+    "gh api graphql -f query='mutation { x }'", "gh api graphql", "gh api", "gh api -X",
+    "gh --repo example/repo pr merge 1", "curl -X POST https://api.github.com/repos/example/repo",
+    "curl -d '{}' https://api.github.com/repos/example/repo/pulls", "curl --json '{}' https://api.github.com/x",
+    "curl -XPUT https://api.github.com/repos/example/repo/pulls/1/merge", "curl -T f https://api.github.com/x",
+    "curl --request=DELETE https://api.github.com/x", "curl https://api.github.com/x -X",
     "curl -X POST https://API.GITHUB.COM/repos/example/repo",
     r'''python -c "import subprocess; subprocess.run(['git', 'pu\x73h'])"''',
     "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'push'])\nPY\n",
@@ -87,7 +129,7 @@ def test_executable_environment_paths_allow_local_work(monkeypatch, command):
 
 @pytest.mark.parametrize('command', [
     '$HOME/bin/git push', '${HOME}/bin/gh pr merge 1', '$GIT_BIN push',
-    '"$HOME/bin/git" push', '"${HOME}/bin/gh" api /repos/fixture/repo',
+    '"$HOME/bin/git" push', '"${HOME}/bin/gh" api -X PUT /repos/fixture/repo/pulls/1/merge',
     '"$HOME/bin/python3" -c \'import os; os.system("git push")\'',
     '$PUBLISH', '""$PUBLISH', '"g"$PUBLISH_TAIL',
     'GIT_BIN=echo $GIT_BIN push',
