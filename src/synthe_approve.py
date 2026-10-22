@@ -82,8 +82,19 @@ def clean(text, one_line: bool = False) -> str:
     return _CONTROL.sub(esc, s)
 
 
+def _full(sha) -> str:
+    """The whole commit hash, for a card whose check asks you to type its end."""
+    return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else clean(sha, one_line=True)
+
+
 def _short(sha) -> str:
     return sha[:12] if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else clean(sha, one_line=True)
+
+
+def _part(detail: dict, key: str) -> dict:
+    """detail[key] when it is a dict, else {} (the assessment then calls the evidence incomplete)."""
+    value = detail.get(key) if isinstance(detail, dict) else None
+    return value if isinstance(value, dict) else {}
 
 
 def _matches(path: str, patterns) -> bool:
@@ -105,13 +116,13 @@ def assess(detail: dict) -> dict:
     """How carefully this push deserves to be read: {"tier": routine|review|high, "reasons": [...]}.
     Computed only from the broker's record (target, its own diff, file list, commits); never from
     anything the agent wrote about the push. Reasons are short plain sentences, already cleaned."""
-    eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
+    eff, ch = _part(detail, "effect"), _part(detail, "changes")
     found: list[tuple[int, str]] = []  # (tier index, reason)
 
     def flag(tier: str, reason: str):
         found.append((TIERS.index(tier), reason))
 
-    if ch and ch.get("available") is False:
+    if not isinstance(detail.get("changes"), dict) or ch.get("available") is not True:
         flag("high", "the broker can't show its copy of the change")
     if ch.get("patch_truncated"):
         flag("high", "the diff is larger than the broker's display limit")
@@ -203,7 +214,7 @@ def headline(risk: dict) -> str:
 def render(detail: dict, full: bool = False, ui=None) -> str:
     """The approval card. Facts first, from the broker's record; the agent's words last, labeled.
     With `ui` on a colour terminal, labels and diff lines are coloured; the text is the same."""
-    eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
+    eff, ch = _part(detail, "effect"), _part(detail, "changes")
     old = eff.get("expected_old")
     risk = assess(detail)
     rule = FRAME[risk["tier"]] * 72
@@ -215,7 +226,8 @@ def render(detail: dict, full: bool = False, ui=None) -> str:
     lines += [
              f" Proposal     {clean(detail.get('id'), True)}   (handoff {clean(detail.get('handoff_id'), True)})",
              f" Agents       {clean(detail.get('from'), True)} → {clean(detail.get('to'), True)}",
-             f" Push         commit {_short(eff.get('commit'))} to {clean(eff.get('remote'), True)} / "
+             f" Push         commit {_full(eff.get('commit')) if risk['tier'] == 'high' else _short(eff.get('commit'))}"
+             f" to {clean(eff.get('remote'), True)} / "
              f"{clean(eff.get('branch'), True)}"
              + ("   (a new branch)" if old in (None, "new") else f"   (replacing {_short(old)})")]
     budget = detail.get("effective_budget")
@@ -257,7 +269,7 @@ def render(detail: dict, full: bool = False, ui=None) -> str:
 
 def diff_has_more(detail: dict) -> bool:
     """Whether `v` can reveal patch lines not already present in the approval card."""
-    ch = detail.get("changes") or {}
+    ch = _part(detail, "changes")
     return bool(ch.get("available") and
                 len(clean(ch.get("patch") or "").splitlines()) > PREVIEW_LINES)
 
@@ -269,7 +281,7 @@ def build_approval(detail: dict, key: dict, expires_in_min: int = DEFAULT_EXPIRE
     that name no budget of their own are still capped."""
     if not 0 < expires_in_min <= MAX_EXPIRES_MIN:
         raise ValueError(f"approvals last between 1 and {MAX_EXPIRES_MIN} minutes")
-    eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
+    eff, ch = _part(detail, "effect"), _part(detail, "changes")
     commit = eff.get("commit")
     if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)):
         raise ValueError("this proposal has no commit to pin; approve it with synthe-sign approve --detached")
@@ -298,7 +310,7 @@ def build_approval(detail: dict, key: dict, expires_in_min: int = DEFAULT_EXPIRE
 def touchid_reason(detail: dict) -> str:
     """What the Touch ID prompt says, from the broker's view of the proposal (names cleaned: an agent
     chose the branch and file names, and they must not fake the prompt's wording)."""
-    eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
+    eff, ch = _part(detail, "effect"), _part(detail, "changes")
     files = ch.get("files") or []
     first = ", ".join(clean(f.get("path"), True) for f in files[:3] if isinstance(f, dict))
     more = f" and {len(files) - 3} more" if len(files) > 3 else ""
@@ -322,35 +334,54 @@ def confirm_commit(detail: dict, ask=None) -> bool:
     """High-risk pushes only: type the last characters of the commit hash shown on the card (number
     matching, the fix for push-approval fatigue). Three misses and nothing is signed."""
     ask = ask or _ask
-    commit = str((detail.get("effect") or {}).get("commit") or "")
+    commit = str((_part(detail, "effect")).get("commit") or "")
     want = commit[-CHECK_CHARS:].lower()
     if len(want) != CHECK_CHARS:
         return False
     for _ in range(3):
-        if ask(f" High-risk push. Type the last {CHECK_CHARS} characters of the commit shown above: ") == want:
+        if ask(f" High-risk push. Type the last {CHECK_CHARS} characters of the full commit on the Push line: ") == want:
             return True
         print(" That doesn't match the commit on the card.")
     print(" Not approved. It stays staged.")
     return False
 
 
-def log_path() -> Path:
-    return Path(os.environ.get("SYNTHE_APPROVALS_LOG") or DEFAULT_LOG).expanduser()
+LOG_KEEP = 1000  # decisions kept; older lines are dropped when the file passes twice this
+
+
+def log_path() -> Path | None:
+    """Where decisions are logged: local telemetry for --stats, never sent anywhere. Set
+    SYNTHE_APPROVALS_LOG=off to turn it off, or to a path to move it."""
+    value = os.environ.get("SYNTHE_APPROVALS_LOG")
+    if value and value.strip().lower() in ("off", "0", "false", "no"):
+        return None
+    return Path(value or DEFAULT_LOG).expanduser()
 
 
 def record(detail: dict, decision: str, shown_at: float, decided_at: float | None = None) -> None:
     """One line per decision in a local file, for --stats. It never leaves this machine and holds no
     agent text: the proposal id, tier, size and timing only. A write failure never blocks a decision."""
     risk = assess(detail)
-    ins, dels = _shortstat((detail.get("changes") or {}).get("stat"))
+    ins, dels = _shortstat((_part(detail, "changes")).get("stat"))
     entry = {"at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
              "id": clean(detail.get("id"), True), "tier": risk["tier"], "decision": decision,
              "lines": ins + dels, "seconds": round((decided_at or time.monotonic()) - shown_at, 1)}
+    path = log_path()
+    if path is None:
+        return
     try:
-        path = log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+        os.chmod(path, 0o600)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > 2 * LOG_KEEP:
+            tmp = path.with_suffix(".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines[-LOG_KEEP:]) + "\n")
+            os.replace(tmp, path)
     except OSError:
         pass
 
@@ -359,6 +390,8 @@ def stats(path: Path | None = None) -> str:
     """Approval rate and time-to-decision by tier, from the local log. A fast approval of a big
     high-risk push is the pattern of approving without reading; it is called out."""
     path = path or log_path()
+    if path is None:
+        return "The local approval log is off (SYNTHE_APPROVALS_LOG=off)."
     rows = []
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -385,8 +418,8 @@ def stats(path: Path | None = None) -> str:
     rushed = [r for r in rows if r.get("decision") == "approved" and r["tier"] == "high"
               and float(r.get("seconds") or 0) < max(2.0, 2.0 * int(r.get("lines") or 0) / 100)]
     if rushed:
-        out.append(f"  ! {len(rushed)} high-risk approval{'s' if len(rushed) != 1 else ''} took less time "
-                   f"than reading the diff plausibly needs (2s per 100 lines)")
+        out.append(f"  ! {len(rushed)} high-risk approval{'s' if len(rushed) != 1 else ''} came faster than "
+                   f"2s per 100 changed lines. A heuristic, not proof of reading; worth a look.")
     return "\n".join(out)
 
 
@@ -467,10 +500,13 @@ def main(argv=None) -> int:
         shown_at = time.monotonic()
         viewed_all = not must_view_full_diff(detail)
         while True:
-            view = "[v] view the whole diff   " if diff_has_more(detail) else ""
+            truncated = bool((_part(detail, "changes")).get("patch_truncated"))
+            view = ("[v] view the diff the broker returned   " if truncated else "[v] view the whole diff   ") \
+                if diff_has_more(detail) else ""
             approve = "[a] approve once   " if viewed_all else ""
             if not viewed_all:
-                print(" This push needs a careful read: view the whole diff (v) before approving.")
+                print(" This push needs a careful read: view the diff (v) before approving." +
+                      (" The broker cut it at its size limit, so read the commit itself as well." if truncated else ""))
             choice = _ask(f" {approve}{view}[s] skip   [q] quit > ")
             if choice == "v":
                 if diff_has_more(detail):
