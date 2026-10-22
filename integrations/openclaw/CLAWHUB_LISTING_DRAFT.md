@@ -54,8 +54,9 @@ claim, propose, and report through Synthe.
   with no credentials.
 - A real OpenClaw agent (Claude Opus) followed the skill on its own: validated, committed, proposed,
   and stopped for approval. It never tried a direct push.
-- Live red team, from the agent's account: 33 of 33 attacks refused or contained. Each refusal has
-  a signed receipt, and the receipt chain verifies with the broker's published key. Nothing reached
+- Live red team, from the agent's account: 30 of 30 attacks refused or contained (plus 3 controls for
+  the approved path). Each of the 13 refusals the broker handled has a signed receipt, and the receipt
+  chain verifies with the broker's published key. Nothing reached
   GitHub except the one approved change.
 
 ## Capabilities and data handling

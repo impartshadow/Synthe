@@ -18,7 +18,7 @@ Verified on 2026-10-07 on macOS, against real GitHub. The evidence is in
   All 8 doctor checks pass.
 - **A real OpenClaw agent** (Claude Opus) followed the rules on its own: it proposed, then stopped for
   approval.
-- **A live red team of 33 attacks** from the agent's account was refused or contained
+- **A live red team of 30 attacks** (plus 3 controls for the approved path) from the agent's account: every attack was refused or contained
   ([`docs/REDTEAM.md`](docs/REDTEAM.md)):
   - forged, tampered and replayed tasks;
   - pushes outside the allowed files or branches, or to `main`;
@@ -26,7 +26,9 @@ Verified on 2026-10-07 on macOS, against real GitHub. The evidence is in
   - self-approvals;
   - swapping the commit while you read the diff.
 
-  Every refusal left a signed receipt, and the chain verifies with the broker's published key.
+  Every refusal the broker handled (13) left a signed receipt, and the chain verifies with the broker's
+  published key. The other attacks failed before reaching it. Every row is in
+  [`docs/results/redteam-2026-10-07.json`](docs/results/redteam-2026-10-07.json).
 
 ## Get started (macOS, OpenClaw)
 
