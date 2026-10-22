@@ -126,7 +126,11 @@ SYNTHE_BROKER=unix:///var/db/synthe-run/broker.sock ~/synthe-venv/bin/synthe-app
 
 The diff shown is the broker's own copy, not the agent's description. Approve with `a`. If Touch ID
 is enrolled, verify the branch, commit and files in both the terminal card and system prompt before
-touching the sensor. Otherwise Synthe asks for the approval passphrase. To force the fallback even
+touching the sensor. Otherwise Synthe asks for the approval passphrase. A push that is large, deletes
+files, or changes CI, dependency or secrets-like files is marked CHECK or HIGH-RISK on the card and in
+the Touch ID prompt; for a high-risk push you type the last 4 characters of the commit first, and a long
+diff must be viewed in full (`v`) before you can approve. `synthe-approve --stats` shows your approval
+rate and time-to-decision from a log that never leaves your Mac. To force the fallback even
 after enrollment, run:
 
 ```bash

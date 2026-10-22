@@ -18,14 +18,24 @@ approving a pattern once (lane templates, study F11) comes later.
 
 Everything the agent wrote (its stated purpose, commit messages, file names, the patch) is shown
 with terminal control codes neutralized, so it can't clear the screen or fake a prompt.
+
+Card v2 (specs/approval-card-v2.md): people stop reading prompts that always look the same (users
+accept 93% of Claude Code's permission prompts). So the card assesses each push from the broker's
+data alone (size, deletions, sensitive paths, incomplete evidence) and looks different by risk; the
+agent's words come after the diff; a high-risk push asks you to type the end of the commit hash
+before Touch ID, and a non-routine push with a long diff can only be approved after you viewed all
+of it. Each decision is noted in a local log (never sent anywhere) for `--stats`.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
+import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -39,6 +49,21 @@ MAX_EXPIRES_MIN = 24 * 60
 DEFAULT_KEY = Path("~/.synthe/approver.key.json")
 DEFAULT_TOUCHID_KEY = Path("~/.synthe") / st.KEY_NAME
 PREVIEW_LINES = 60
+
+TIERS = ("routine", "review", "high")
+# Thresholds (specs/approval-card-v2.md). Lines are insertions + deletions from the broker's own diff.
+REVIEW_LINES, HIGH_LINES = 200, 400
+HIGH_DELETED_FILES = 10
+REVIEW_COMMITS, HIGH_COMMITS = 10, 30
+CHECK_CHARS = 4  # how much of the commit hash a high-risk approval must type back
+# Paths whose change can run code, ship a dependency, alter CI or hold a secret. A match on CI or a
+# secrets-like name makes the push high risk; the rest make it worth a check.
+HIGH_PATHS = (".github/workflows/*", ".github/actions/*", ".gitlab-ci.yml", ".circleci/*", "Jenkinsfile",
+              "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".env", ".env.*")
+REVIEW_PATHS = ("Dockerfile", "Dockerfile.*", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+                "poetry.lock", "uv.lock", "Cargo.lock", "go.sum", "setup.py", "pyproject.toml", "Makefile",
+                "scripts/*.sh", "bin/*", "CODEOWNERS", ".gitattributes")
+DEFAULT_LOG = Path("~/.synthe/approvals.log")
 
 # C0/C1 controls except tab and newline (ESC starts ANSI sequences; CR overwrites a line), DEL,
 # and the bidi controls that reorder what you read (Trojan Source).
@@ -61,6 +86,65 @@ def _short(sha) -> str:
     return sha[:12] if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else clean(sha, one_line=True)
 
 
+def _matches(path: str, patterns) -> bool:
+    """A pattern with a slash matches the path from the repository root; one without matches the file
+    name at any depth (so a nested lockfile or .env counts like a top-level one)."""
+    name = path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatchcase(path if "/" in p else name, p) for p in patterns)
+
+
+def _shortstat(stat) -> tuple[int, int]:
+    """(insertions, deletions) from git's --shortstat line; (0, 0) when absent."""
+    text = stat if isinstance(stat, str) else ""
+    ins = re.search(r"(\d+) insertions?\(\+\)", text)
+    dels = re.search(r"(\d+) deletions?\(-\)", text)
+    return (int(ins.group(1)) if ins else 0, int(dels.group(1)) if dels else 0)
+
+
+def assess(detail: dict) -> dict:
+    """How carefully this push deserves to be read: {"tier": routine|review|high, "reasons": [...]}.
+    Computed only from the broker's record (target, its own diff, file list, commits); never from
+    anything the agent wrote about the push. Reasons are short plain sentences, already cleaned."""
+    eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
+    found: list[tuple[int, str]] = []  # (tier index, reason)
+
+    def flag(tier: str, reason: str):
+        found.append((TIERS.index(tier), reason))
+
+    if ch and ch.get("available") is False:
+        flag("high", "the broker can't show its copy of the change")
+    if ch.get("patch_truncated"):
+        flag("high", "the diff is larger than the broker's display limit")
+    ins, dels = _shortstat(ch.get("stat"))
+    lines = ins + dels
+    if lines >= HIGH_LINES:
+        flag("high", f"{lines} lines changed")
+    elif lines >= REVIEW_LINES:
+        flag("review", f"{lines} lines changed")
+    files = [f for f in ch.get("files") or [] if isinstance(f, dict)]
+    deleted = sum(1 for f in files if str(f.get("status", "")).startswith("D"))
+    if deleted and (deleted >= HIGH_DELETED_FILES or (len(files) >= 4 and deleted * 4 > len(files))):
+        flag("high", f"deletes {deleted} file{'s' if deleted != 1 else ''}")
+    elif deleted:
+        flag("review", f"deletes {deleted} file{'s' if deleted != 1 else ''}")
+    for tier, patterns in (("high", HIGH_PATHS), ("review", REVIEW_PATHS)):
+        hits = [str(f.get("path", "")) for f in files if _matches(str(f.get("path", "")), patterns)]
+        if hits:
+            more = f" and {len(hits) - 1} more" if len(hits) > 1 else ""
+            flag(tier, f"changes {clean(hits[0], True)}{more}")
+    n_commits = len(ch.get("commits") or [])
+    if n_commits >= HIGH_COMMITS:
+        flag("high", f"{n_commits} commits")
+    elif n_commits >= REVIEW_COMMITS:
+        flag("review", f"{n_commits} commits")
+    if eff.get("expected_old") not in (None, "new"):
+        flag("review", "updates an existing branch")
+    if not found:
+        return {"tier": "routine", "reasons": []}
+    found.sort(key=lambda x: -x[0])  # stable: highest tier first, then the order checked
+    return {"tier": TIERS[found[0][0]], "reasons": [r for _, r in found]}
+
+
 def waiting_for_approval(staged: list) -> list:
     return [s for s in staged if s.get("state") == "STAGED" and "approval" in (s.get("waiting_for") or [])]
 
@@ -76,8 +160,14 @@ def _paint(lines: list, ui) -> list:
         if line.startswith("═") or line.startswith("─"):
             out.append(ui.c(line, "muted"))
             in_diff = False  # every section, the diff included, ends with a rule
+        elif line.startswith("━") or line.startswith("▓"):
+            out.append(ui.c(line, "warn", bold=line.startswith("▓")))
+            in_diff = False
         elif line == " A push is waiting for your approval":
             out.append(ui.c(line, "brand", bold=True))
+        elif line.startswith(" High-risk push:") or line.startswith(" Check this push:") \
+                or line.startswith(" Why this is flagged") or line.startswith("   • "):
+            out.append(ui.c(line, "warn", bold=line.startswith(" High-risk")))
         elif line.startswith(" The agent says"):
             out.append(ui.c(line, "warn", bold=True))
         elif line.startswith(" Diff"):
@@ -97,12 +187,32 @@ def _paint(lines: list, ui) -> list:
     return out
 
 
+FRAME = {"routine": "═", "review": "━", "high": "▓"}
+
+
+def headline(risk: dict) -> str:
+    """The card's first line. It changes with the risk, so a push that deserves attention never looks
+    like the routine ones you have learned to skim."""
+    if risk["tier"] == "high":
+        return f" High-risk push: {risk['reasons'][0]}"
+    if risk["tier"] == "review":
+        return f" Check this push: {risk['reasons'][0]}"
+    return " A push is waiting for your approval"
+
+
 def render(detail: dict, full: bool = False, ui=None) -> str:
     """The approval card. Facts first, from the broker's record; the agent's words last, labeled.
     With `ui` on a colour terminal, labels and diff lines are coloured; the text is the same."""
     eff, ch = detail.get("effect") or {}, detail.get("changes") or {}
     old = eff.get("expected_old")
-    lines = ["", "═" * 72, " A push is waiting for your approval", "═" * 72,
+    risk = assess(detail)
+    rule = FRAME[risk["tier"]] * 72
+    lines = ["", rule, headline(risk), rule]
+    if risk["reasons"]:
+        lines.append(" Why this is flagged (from the broker's copy, not the agent's words):")
+        lines += [f"   • {r}" for r in risk["reasons"]]
+        lines.append(rule)
+    lines += [
              f" Proposal     {clean(detail.get('id'), True)}   (handoff {clean(detail.get('handoff_id'), True)})",
              f" Agents       {clean(detail.get('from'), True)} → {clean(detail.get('to'), True)}",
              f" Push         commit {_short(eff.get('commit'))} to {clean(eff.get('remote'), True)} / "
@@ -128,8 +238,6 @@ def render(detail: dict, full: bool = False, ui=None) -> str:
     else:
         lines.append(f" Changes      not shown: {clean(ch.get('note'), True)}")
     lines.append(f" Handoff      expires {clean(detail.get('handoff_expires_at'), True)}")
-    lines += ["─" * 72, " The agent says (its own words, not verified by Synthe):"]
-    lines += [f"   {line}" for line in clean((detail.get("agent_says") or {}).get("purpose")).splitlines() or [""]]
     lines.append("─" * 72)
     if ch.get("available"):
         patch = clean(ch.get("patch") or "").splitlines()
@@ -140,6 +248,10 @@ def render(detail: dict, full: bool = False, ui=None) -> str:
         if ch.get("patch_truncated"):
             lines.append("   … the broker cut the patch at its size limit; read the commit itself before approving")
         lines.append("─" * 72)
+    # The agent's words come last: read the change first, then what the agent says about it.
+    lines.append(" The agent says (its own words, not verified by Synthe):")
+    lines += [f"   {line}" for line in clean((detail.get("agent_says") or {}).get("purpose")).splitlines() or [""]]
+    lines.append("─" * 72)
     return "\n".join(_paint(lines, ui))
 
 
@@ -191,9 +303,91 @@ def touchid_reason(detail: dict) -> str:
     first = ", ".join(clean(f.get("path"), True) for f in files[:3] if isinstance(f, dict))
     more = f" and {len(files) - 3} more" if len(files) > 3 else ""
     what = f"{len(files)} file{'s' if len(files) != 1 else ''}" + (f" ({first}{more})" if first else "")
-    text = (f"approve pushing {clean(eff.get('branch'), True)} at {_short(eff.get('commit'))} "
+    risk = assess(detail)
+    prefix = {"high": "HIGH-RISK: ", "review": "CHECK: "}.get(risk["tier"], "")
+    if risk["reasons"]:
+        what = risk["reasons"][0] + (f", {len(files)} file{'s' if len(files) != 1 else ''}" if files else "")
+    text = (f"{prefix}approve pushing {clean(eff.get('branch'), True)} at {_short(eff.get('commit'))} "
             f"to {clean(eff.get('remote') or 'origin', True)}: {what}")
     return text[:300]
+
+
+def must_view_full_diff(detail: dict) -> bool:
+    """A push that isn't routine and whose diff doesn't fit on the card is approved only after the
+    whole diff was shown (the terminal's version of "route large pushes to a proper review")."""
+    return assess(detail)["tier"] != "routine" and diff_has_more(detail)
+
+
+def confirm_commit(detail: dict, ask=None) -> bool:
+    """High-risk pushes only: type the last characters of the commit hash shown on the card (number
+    matching, the fix for push-approval fatigue). Three misses and nothing is signed."""
+    ask = ask or _ask
+    commit = str((detail.get("effect") or {}).get("commit") or "")
+    want = commit[-CHECK_CHARS:].lower()
+    if len(want) != CHECK_CHARS:
+        return False
+    for _ in range(3):
+        if ask(f" High-risk push. Type the last {CHECK_CHARS} characters of the commit shown above: ") == want:
+            return True
+        print(" That doesn't match the commit on the card.")
+    print(" Not approved. It stays staged.")
+    return False
+
+
+def log_path() -> Path:
+    return Path(os.environ.get("SYNTHE_APPROVALS_LOG") or DEFAULT_LOG).expanduser()
+
+
+def record(detail: dict, decision: str, shown_at: float, decided_at: float | None = None) -> None:
+    """One line per decision in a local file, for --stats. It never leaves this machine and holds no
+    agent text: the proposal id, tier, size and timing only. A write failure never blocks a decision."""
+    risk = assess(detail)
+    ins, dels = _shortstat((detail.get("changes") or {}).get("stat"))
+    entry = {"at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "id": clean(detail.get("id"), True), "tier": risk["tier"], "decision": decision,
+             "lines": ins + dels, "seconds": round((decided_at or time.monotonic()) - shown_at, 1)}
+    try:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def stats(path: Path | None = None) -> str:
+    """Approval rate and time-to-decision by tier, from the local log. A fast approval of a big
+    high-risk push is the pattern of approving without reading; it is called out."""
+    path = path or log_path()
+    rows = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("tier") in TIERS:
+                rows.append(row)
+    except OSError:
+        return "No decisions recorded yet."
+    if not rows:
+        return "No decisions recorded yet."
+    out = [f"{len(rows)} decisions in {path}"]
+    for tier in TIERS:
+        group = [r for r in rows if r["tier"] == tier]
+        if not group:
+            continue
+        approved = [r for r in group if r.get("decision") == "approved"]
+        secs = sorted(float(r.get("seconds") or 0) for r in group)
+        median = secs[len(secs) // 2]
+        out.append(f"  {tier:<8} {len(group):>4} shown, {len(approved) * 100 // len(group):>3}% approved, "
+                   f"median {median:.0f}s to decide")
+    rushed = [r for r in rows if r.get("decision") == "approved" and r["tier"] == "high"
+              and float(r.get("seconds") or 0) < max(2.0, 2.0 * int(r.get("lines") or 0) / 100)]
+    if rushed:
+        out.append(f"  ! {len(rushed)} high-risk approval{'s' if len(rushed) != 1 else ''} took less time "
+                   f"than reading the diff plausibly needs (2s per 100 lines)")
+    return "\n".join(out)
 
 
 def summarize(result: dict, ui=None) -> str:
@@ -230,9 +424,14 @@ def main(argv=None) -> int:
                     help="approve with the passphrase key even if a Touch ID key is set up")
     ap.add_argument("--id", help="go straight to this proposal (idempotency_key/action)")
     ap.add_argument("--list", action="store_true", help="list what waits for an approval, then exit")
+    ap.add_argument("--stats", action="store_true",
+                    help="show your approval rate and time-to-decision by risk, from the local log, then exit")
     ap.add_argument("--expires-in", type=int, default=DEFAULT_EXPIRES_MIN,
                     help=f"minutes the approval stays valid (default {DEFAULT_EXPIRES_MIN}, at most {MAX_EXPIRES_MIN})")
     a = ap.parse_args(argv)
+    if a.stats:
+        print(stats())
+        return 0
     ui = sui.UI()
     if ui.color:
         print(ui.header("approve"))
@@ -265,21 +464,35 @@ def main(argv=None) -> int:
             print(f"synthe-approve: {e.code}: {e}", file=sys.stderr)
             continue
         print(render(detail, ui=ui))
+        shown_at = time.monotonic()
+        viewed_all = not must_view_full_diff(detail)
         while True:
             view = "[v] view the whole diff   " if diff_has_more(detail) else ""
-            choice = _ask(f" [a] approve once   {view}[s] skip   [q] quit > ")
+            approve = "[a] approve once   " if viewed_all else ""
+            if not viewed_all:
+                print(" This push needs a careful read: view the whole diff (v) before approving.")
+            choice = _ask(f" {approve}{view}[s] skip   [q] quit > ")
             if choice == "v":
                 if diff_has_more(detail):
                     print(render(detail, full=True, ui=ui))
+                    viewed_all = True
                 else:
                     print(" The whole diff is already shown above.")
                 continue
+            if choice == "a" and not viewed_all:
+                continue
             break
         if choice == "q":
+            record(detail, "quit", shown_at)
             return 0
         if choice != "a":
+            record(detail, "skipped", shown_at)
             print(" Skipped. It stays staged, and it can't be pushed without an approval.")
             continue
+        if assess(detail)["tier"] == "high" and not confirm_commit(detail):
+            record(detail, "check_failed", shown_at)
+            continue
+        decided_at = time.monotonic()
         touchid = not a.passphrase and Path(a.touchid_key).expanduser().is_file()
         try:
             if touchid:
@@ -294,6 +507,7 @@ def main(argv=None) -> int:
                     print(f" Approving as {clean(key.get('agent'), True)} (key {clean(key.get('kid'), True)}).")
                 approval = build_approval(detail, key, a.expires_in)
             print(summarize(client.call("submit_approval", approval=approval), ui))
+            record(detail, "approved", shown_at, decided_at)
         except st.TouchIDError as e:
             print(f"synthe-approve: not approved: {e}. It stays staged.", file=sys.stderr)
         except (ValueError, ss.KeyFileError) as e:
