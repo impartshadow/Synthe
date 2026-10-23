@@ -194,6 +194,21 @@ def _kinds(patterns, limit: int = 3) -> list:
     return ["CI workflows"] * ci + ["key and secret files"] * secret + other[:limit] + ["..."] * (len(other) > limit)
 
 
+REVIEW_KINDS = (("dependency manifests and lockfiles", ("package", "lock", "requirements", "go.sum", "go.mod", "cargo",
+                                                          "pyproject", "gemfile", "pom.xml", "gradle")),
+                ("Dockerfiles", ("dockerfile",)),
+                ("build scripts", ("setup.py", "makefile", "scripts/", "bin/", ".sh")))
+
+
+def _review_kinds(patterns, limit: int = 3) -> list:
+    """The review tier's path patterns from the broker's rules, in words; a pattern that is none of these
+    kinds (the operator's own, CODEOWNERS) is shown as written."""
+    pats = [synthe_risk.clean(p, True) for p in patterns if isinstance(p, str)]
+    words = [name for name, hints in REVIEW_KINDS if any(h in p.lower() for p in pats for h in hints)]
+    other = [p for p in pats if not any(h in p.lower() for _, hints in REVIEW_KINDS for h in hints)]
+    return words + other[:limit] + ["..."] * (len(other) > limit)
+
+
 def risk_words(tier: str, rules: dict | None) -> str:
     """What makes a push this risky, as the broker's rules (the draft's `risk_rules`) have it, in a parenthesis."""
     r = rules if isinstance(rules, dict) else {}
@@ -202,7 +217,7 @@ def risk_words(tier: str, rules: dict | None) -> str:
         what += [f"{r.get('high_lines', synthe_risk.HIGH_LINES)}+ changed lines", "mass deletions",
                  f"{r.get('high_commits', synthe_risk.HIGH_COMMITS)}+ commits"]
     else:
-        what = _kinds(r.get("review_paths") or synthe_risk.REVIEW_PATHS, 4)
+        what = _review_kinds(r.get("review_paths") or synthe_risk.REVIEW_PATHS)
         what += [f"{r.get('review_lines', synthe_risk.REVIEW_LINES)}+ changed lines", "any deletion"]
     return "(" + ", ".join(what) + ", per the broker's rules)"
 
@@ -217,8 +232,12 @@ def interrupts(body: dict, rules: dict | None = None) -> str:
         return "It lets every risk level through. Only pushes outside these paths still ask you."
     names = " and ".join(f"{TIER_NAMES[t]} pushes {risk_words(t, rules)}" if t != "routine" else "routine pushes"
                          for t in left)
-    return (f"{names[0].upper()}{names[1:]} and pushes outside these paths still ask you. "
+    text = (f"{names[0].upper()}{names[1:]} and pushes outside these paths still ask you. "
             f"The risk check reads paths and sizes, not code.")
+    if "review" in body["auto_approve"] and "high" in left:  # the default: say what goes out, and how to make it ask
+        text += (f" Review-level changes {risk_words('review', rules)} go out without asking you "
+                 f"(synthe-notify digest lists them afterwards); --auto-approve routine makes them ask too.")
+    return text
 
 
 def summary(body: dict, policy: dict | None = None, tz=None, rules: dict | None = None) -> str:

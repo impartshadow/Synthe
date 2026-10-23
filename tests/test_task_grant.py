@@ -137,9 +137,14 @@ def test_the_summary_says_which_pushes_still_interrupt_you_for_each_set_of_tiers
             "template_id": "lane-1"}
     both = sg.summary({**base, "auto_approve": ["routine", "review"]}).splitlines()[1]
     assert both.startswith("Pushes to other branches still ask you. High-risk pushes (CI workflows, ")
-    assert "Review-level" not in both and both.count("still ask you") == 2
+    # the default lane lets review-level changes go out; the text says so and says how to make them ask
+    assert "Review-level changes (dependency manifests and lockfiles, Dockerfiles, build scripts, " in both
+    assert "200+ changed lines, any deletion, per the broker's rules) go out without asking you" in both
+    assert "synthe-notify digest lists them afterwards); --auto-approve routine makes them ask too." in both
+    assert "Review-level pushes" not in both and both.count("still ask you") == 2
+    assert "dependency" not in both.split("Review-level changes")[0]       # dependencies are not among the things that ask
     routine = sg.summary({**base, "auto_approve": ["routine"]}).splitlines()[1]
-    assert "Review-level pushes (Dockerfile" in routine and "and high-risk pushes (CI workflows" in routine
+    assert "Review-level pushes (dependency manifests and lockfiles, Dockerfiles, build scripts" in routine and "and high-risk pushes (CI workflows" in routine
     assert "any deletion" in routine
     everything = sg.summary({**base, "auto_approve": ["routine", "review", "high"]}).splitlines()[1]
     assert "lets every risk level through. Only pushes outside these paths still ask you." in everything
@@ -150,7 +155,7 @@ def test_the_summary_says_which_pushes_still_interrupt_you_for_each_set_of_tiers
              "review_paths": ["package.json"], "review_lines": 50}
     custom = sg.summary({**base, "auto_approve": ["routine"]}, rules=rules).splitlines()[1]
     assert "(CI workflows, infra/*, deploy/*.tf, 100+ changed lines, mass deletions, 5+ commits, per the broker's rules)" in custom
-    assert "(package.json, 50+ changed lines, any deletion, per the broker's rules)" in custom
+    assert "(dependency manifests and lockfiles, 50+ changed lines, any deletion, per the broker's rules)" in custom
     hostile = {"high_paths": ["x\x1b[2Jy"]}
     assert "\x1b" not in sg.summary({**base, "auto_approve": ["routine", "review"]}, rules=hostile)
 

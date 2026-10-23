@@ -266,6 +266,50 @@ def test_a_reviewer_blocked_from_approving_a_high_risk_push_is_not_a_second_alar
     assert sn.describe(r)["level"] == "retry" and sn.select([r]) == []
 
 
+def lane_shipped(seq, tier, reasons, paths=(), branch="agent/x", escalated=False, hours=1, **over):
+    """A push that went out under a risk-aware lane: the receipt carries the lane's `risk` object, escalated false."""
+    now = dt.datetime(2026, 10, 23, 12, tzinfo=dt.timezone.utc)
+    risk = {"tier": tier, "reasons": reasons, "paths": list(paths), "sensitive_paths": len(paths),
+            "auto_approve": ["routine", "review"], "template_id": "lane-1", "commit": "a" * 40, "base": "b" * 40,
+            "rules_digest": "c" * 64, "escalated": escalated}
+    return {"seq": seq, "decision": "executed", "time": (now - dt.timedelta(hours=hours)).isoformat(),
+            "handoff": {"idempotency_key": f"s{seq}"}, "effect": {"action": PUSH, "branch": branch}, "risk": risk, **over}
+
+
+def test_the_digest_lists_what_went_out_under_your_lane_at_the_review_level():
+    now = dt.datetime(2026, 10, 23, 12, tzinfo=dt.timezone.utc)
+    rs = [lane_shipped(1, "review", ["changes package.json"], ["package.json"], "agent/deps"),
+          lane_shipped(2, "review", ["changes Dockerfile and 1 more"], ["Dockerfile", "docker/a.sh"], "agent/img"),
+          lane_shipped(3, "review", ["changes requirements.txt"], ["requirements.txt"]),
+          lane_shipped(4, "review", ["deletes 1 file"], []),
+          lane_shipped(5, "review", ["changes scripts/build.sh"], ["scripts/build.sh"]),
+          lane_shipped(6, "review", ["250 lines changed"], []),
+          lane_shipped(7, "routine", []),                                       # routine: nothing to list
+          lane_shipped(8, "review", ["changes package.json"], ["package.json"], hours=24 * 30),    # outside the week
+          lane_shipped(9, "review", ["changes package.json"], ["package.json"], escalated=True)]   # you approved this one
+    d = sn.build_digest(rs, now=now)
+    assert d["lane_review"] == 6 and d["lane_review_kinds"] == {"build": 3, "delete": 1, "file": 1, "size": 1}
+    text = sn.render_digest(d, {"count": 9, "signer": "synthe-broker", "head": "ab" * 32, "complete": True})
+    assert ("3 dependency or build changes, 1 deletion, 1 change to a sensitive file and 1 larger change went out under "
+            "your lane without asking you (review level, not high-risk):") in text
+    assert "agent/deps: changes package.json" in text and "agent/img: changes Dockerfile and 1 more" in text
+    assert "it reads paths and sizes, not code. synthe-task grant --auto-approve routine would make them ask you." in text
+    one = sn.render_digest(sn.build_digest(rs[:1], now=now), {"count": 1, "signer": "s", "head": None, "complete": True})
+    assert "1 dependency or build change went out under your lane" in one
+    none = sn.render_digest(sn.build_digest(rs[6:7], now=now), {"count": 1, "signer": "s", "head": None, "complete": True})
+    assert "under your lane" not in none
+
+
+def test_a_long_review_list_is_capped_and_hostile_reasons_are_cleaned():
+    now = dt.datetime(2026, 10, 23, 12, tzinfo=dt.timezone.utc)
+    rs = [lane_shipped(i, "review", ["changes " + HOSTILE], [HOSTILE], "agent/" + HOSTILE) for i in range(1, 15)]
+    text = sn.render_digest(sn.build_digest(rs, now=now), {"count": 14, "signer": "s", "head": None, "complete": True})
+    assert "... and 4 more" in text and not re.search("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202e]", text)
+    odd = lane_shipped(1, "review", None)
+    odd["risk"]["paths"] = 7
+    assert sn.build_digest([odd], now=now)["lane_review_kinds"] == {"other": 1}
+
+
 def test_the_digest_says_how_many_pushes_your_lane_sent_to_you_and_why():
     now = dt.datetime(2026, 10, 23, 12, tzinfo=dt.timezone.utc)
     stamp = {"time": (now - dt.timedelta(hours=1)).isoformat()}

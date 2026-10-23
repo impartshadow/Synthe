@@ -110,7 +110,8 @@ def _paint(lines: list, ui) -> list:
         elif line == " A push is waiting for your approval":
             out.append(ui.c(line, "brand", bold=True))
         elif line.startswith(" High-risk push:") or line.startswith(" Check this push:") \
-                or line.startswith(" Why this is flagged") or line.startswith("   • "):
+                or line.startswith(" Why this is flagged") or line.startswith("   • ") \
+                or line.startswith(" Outside your lane") or line.startswith(" Your lane sent this"):
             out.append(ui.c(line, "warn", bold=line.startswith(" High-risk")))
         elif line.startswith(" The agent says"):
             out.append(ui.c(line, "warn", bold=True))
@@ -137,11 +138,41 @@ FRAME = {"routine": "═", "review": "━", "high": "▓"}
 def headline(risk: dict) -> str:
     """The card's first line. It changes with the risk, so a push that deserves attention never looks
     like the routine ones you have learned to skim."""
+    why = risk["reasons"][0] if risk["reasons"] else "the broker rated it above routine"
     if risk["tier"] == "high":
-        return f" High-risk push: {risk['reasons'][0]}"
+        return f" High-risk push: {why}"
     if risk["tier"] == "review":
-        return f" Check this push: {risk['reasons'][0]}"
+        return f" Check this push: {why}"
     return " A push is waiting for your approval"
+
+
+def _strings(value, limit: int = 20) -> list:
+    return [clean(x, one_line=True) for x in value[:limit] if isinstance(x, str)] if isinstance(value, list) else []
+
+
+def lane_lines(detail: dict) -> list:
+    """Why a lane grant sent this push to you, from the broker's record: `lane_scope` when it touches files
+    outside the grant's paths, `risk` (escalated) when the grant doesn't approve its risk tier. Nothing
+    when no lane was involved. Paths and reasons are the broker's, cleaned like everything else here."""
+    scope, risk = _part(detail, "lane_scope"), _part(detail, "risk")
+    out = []
+    if scope:
+        outside = _strings(scope.get("outside_paths"), 10)
+        count = scope.get("outside_count")
+        n = count if isinstance(count, int) and not isinstance(count, bool) and count >= len(outside) else len(outside)
+        covers = _strings(scope.get("path_scope"), 5)
+        out.append(f" Outside your lane: {n} file{'s' if n != 1 else ''}."
+                   + (f" Your lane covers {', '.join(covers)}, so it sent this to you." if covers else
+                      " Your lane sent this to you."))
+        out += [f"   • {p}" for p in outside]
+        if n > len(outside):
+            out.append(f"   … and {n - len(outside)} more")
+    if risk.get("escalated") is True:
+        reasons = _strings(risk.get("reasons"), 5)
+        out.append(" Your lane sent this to you because: " + ("; ".join(reasons) if reasons else
+                   f"it is {clean(risk.get('tier'), one_line=True)} risk, a level the lane does not approve on its own")
+                   + ".")
+    return out
 
 
 def render(detail: dict, full: bool = False, ui=None) -> str:
@@ -156,6 +187,8 @@ def render(detail: dict, full: bool = False, ui=None) -> str:
         lines.append(" Why this is flagged (from the broker's copy, not the agent's words):")
         lines += [f"   • {r}" for r in risk["reasons"]]
         lines.append(rule)
+    if lane_lines(detail):
+        lines += lane_lines(detail) + [rule]
     lines += [
              f" Proposal     {clean(detail.get('id'), True)}   (handoff {clean(detail.get('handoff_id'), True)})",
              f" Agents       {clean(detail.get('from'), True)} → {clean(detail.get('to'), True)}",

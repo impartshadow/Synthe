@@ -45,6 +45,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -59,6 +60,7 @@ WINDOW = 1000            # the broker's `receipts` call returns at most this man
 MAX_RECEIPT_FILE = 256 * 1024 * 1024
 BODY_LIMIT = 230         # desktop banners cut long text; keep it short enough to read at a glance
 BATCH_LIMIT = 3          # more notifications than this in one poll become one summary
+LIST_LIMIT = 10          # lines per list in the digest
 
 # --------------------------------------------------------------------------
 # untrusted text
@@ -944,6 +946,32 @@ def parse_time(text) -> dt.datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
+REVIEW_KINDS = {"build": ("dependency or build change", "dependency or build changes"),
+                "file": ("change to a sensitive file", "changes to sensitive files"),
+                "delete": ("deletion", "deletions"), "size": ("larger change", "larger changes"),
+                "commits": ("multi-commit push", "multi-commit pushes"),
+                "other": ("review-level push", "review-level pushes")}
+
+
+def review_kind(r: dict) -> str | None:
+    """For a push that went out under a lane at the review tier (the receipt's `risk` says the lane approved
+    it, `escalated: false`): what kind of change made it review-level, else None."""
+    risk = r.get("risk") if isinstance(r.get("risk"), dict) else {}
+    if risk.get("tier") != "review" or risk.get("escalated") is not False:
+        return None
+    reasons = _strings(risk.get("reasons"), 80)
+    if path_class(_strings(risk.get("paths"), 70)) == "build":
+        return "build"
+    first = reasons[0] if reasons else ""
+    return ("file" if first.startswith("changes ") else "delete" if first.startswith("deletes ")
+            else "size" if "lines changed" in first else "commits" if first.endswith(" commits") else "other")
+
+
+def review_text(r: dict) -> str:
+    risk = r["risk"]
+    return "; ".join(_strings(risk.get("reasons"), 80)[:3]) or "review-level push"
+
+
 def build_digest(receipts: list, days: int = 7, now: dt.datetime | None = None) -> dict:
     """Counts and one line per stop, from receipts that already verified."""
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -974,7 +1002,15 @@ def build_digest(receipts: list, days: int = 7, now: dt.datetime | None = None) 
         item = {k: e[k] for k in ("seq", "time", "branch", "headline", "why", "codes", "decision", "known")}
         item["text"] = e["body"]
         (stops if e["level"] == "stop" else problems).append(item)
+    lane_review = []   # went out under a lane at the review tier: not worth a message, worth seeing afterwards
+    for r, e in shipped:
+        kind = review_kind(r)
+        if kind and e["id"] not in needed:
+            lane_review.append({"seq": e["seq"], "time": e["time"], "branch": e["branch"], "kind": kind,
+                                "text": review_text(r)})
     return {"days": days, "since": since.isoformat(), "until": now.isoformat(),
+            "lane_review": len(lane_review), "lane_review_kinds": dict(Counter(x["kind"] for x in lane_review)),
+            "lane_review_items": lane_review,
             "pushes_shipped": len(shipped), "shipped_without_asking": sum(1 for r, e in shipped if e["id"] not in needed),
             "needed_you": len(asked), "needed_you_shipped": after_you, "needed_you_still_waiting": still,
             "lane_high_risk": sum(1 for i in asked if sent.get(i) == "risk"),
@@ -1012,6 +1048,17 @@ def render_digest(d: dict, chain: dict) -> str:
         if d["routine_refusals"]:
             lines.append(f"Also {_plural(d['routine_refusals'], 'routine refusal')} (a stale branch, a malformed "
                          f"request) that the agent can simply retry.")
+    if d["lane_review"]:
+        kinds = [f"{n} {REVIEW_KINDS[k][n != 1]}" for k, n in d["lane_review_kinds"].items() if k in REVIEW_KINDS]
+        lines += ["", f"{_and(kinds)} went out under your lane without asking you (review level, not high-risk):"]
+        for it in d["lane_review_items"][:LIST_LIMIT]:
+            when = parse_time(it["time"])
+            stamp = when.astimezone().strftime("%b %d %H:%M") if when else "?"
+            lines.append(f"  {stamp}  {it['branch'] or 'a push'}: {it['text']}")
+        if len(d["lane_review_items"]) > LIST_LIMIT:
+            lines.append(f"  ... and {len(d['lane_review_items']) - LIST_LIMIT} more")
+        lines.append("  Your lane lets these through; it reads paths and sizes, not code. "
+                     "synthe-task grant --auto-approve routine would make them ask you.")
     for title, items in (("Stopped", d["stops"]), ("Needed a look", d["problem_items"])):
         if items:
             lines += ["", f"{title}:"]
