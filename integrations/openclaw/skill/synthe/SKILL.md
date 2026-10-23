@@ -6,8 +6,8 @@ description: Ship code through the Synthe commit barrier. Propose pushes for a h
 # Pushing code through Synthe
 
 This machine uses Synthe, a commit barrier. You can't push to a git remote yourself: you hold no
-GitHub credential, and direct pushes are blocked. The Synthe broker pushes for you, exactly once,
-after the human approves, and records a signed receipt either way.
+GitHub credential, and direct pushes are blocked. The Synthe broker pushes for you
+the exact commit the human approved, and records a signed receipt either way.
 
 ## When you were handed a Synthe handoff
 

@@ -78,7 +78,7 @@ export function blockMessage(hit: Hit): string {
     `Synthe blocked this ${hit.tool} call: it would ${hit.rule === "GitHub publish tool" ? "publish to GitHub" : `run "${hit.rule}"`} ` +
     `directly, around the commit barrier. Push through Synthe instead: commit on your agent branch, then call ` +
     `synthe_propose_effect. The human approves it in their own terminal (synthe-approve), and the broker ` +
-    `pushes it exactly once and writes a signed receipt.`
+    `pushes exactly that commit and writes a signed receipt.`
   );
 }
 

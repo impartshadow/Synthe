@@ -1,7 +1,7 @@
 # synthe-barrier: Synthe's commit barrier for OpenClaw
 
 Blocks recognized direct `git push` and GitHub-publish tool calls, and points the agent to Synthe instead: it
-proposes the push, you approve it after reading the diff, and the Synthe broker pushes it exactly once
+proposes the push, you approve it after reading the diff, and the Synthe broker pushes exactly that commit
 and writes a signed receipt. It also adds a one-line status to each turn: what waits for your
 approval, and the latest receipt.
 

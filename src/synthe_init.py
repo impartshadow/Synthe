@@ -705,6 +705,42 @@ def _json(r: subprocess.CompletedProcess):
         return None
 
 
+def _skill_eligible(info) -> bool:
+    info = info if isinstance(info, dict) else {}
+    return bool(info.get("skill", info).get("eligible")) if isinstance(info.get("skill", info), dict) else False
+
+
+def _openclaw_agents(oc) -> list:
+    """Agent ids from OpenClaw's config (agents.entries), the list the CLI asks for with --agent."""
+    try:
+        cfg = json.loads(oc.config_path().read_text())
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return []
+    entries = (cfg.get("agents") or {}).get("entries") if isinstance(cfg, dict) else None
+    return sorted(a for a in entries) if isinstance(entries, dict) else []
+
+
+def _skill_check(oc) -> tuple:
+    """(status, check, detail) for the synthe skill. With several agents configured, recent OpenClaw
+    refuses `skills info` without --agent ("Multiple agents are configured ..."); that refusal is not a
+    missing skill, so each configured agent is asked in turn (seen live 2026-10-22)."""
+    info = _json(oc.run("skills", "info", "synthe", "--json")) or {}
+    if _skill_eligible(info):
+        return "PASS", "synthe skill", "the synthe skill is installed and eligible"
+    message = str(((info.get("error") or {}) if isinstance(info, dict) else {}).get("message", ""))
+    if "--agent" in message:
+        agents = _openclaw_agents(oc)
+        if not agents:
+            return "WARN", "synthe skill", ("OpenClaw has several agents but none could be listed from its config; "
+                                            "check with: openclaw skills info synthe --agent <id>")
+        missing = [a for a in agents
+                   if not _skill_eligible(_json(oc.run("skills", "info", "synthe", "--agent", a, "--json")) or {})]
+        if not missing:
+            return "PASS", "synthe skill", f"the synthe skill is installed and eligible for every agent ({', '.join(agents)})"
+        return "WARN", "synthe skill", f"the synthe skill is missing or ineligible for agent(s): {', '.join(missing)}"
+    return "WARN", "synthe skill", "the synthe skill is missing or ineligible"
+
+
 def openclaw_checks(oc: OpenClaw | None) -> list:
     out = []
 
@@ -727,10 +763,7 @@ def openclaw_checks(oc: OpenClaw | None) -> list:
     else:
         add("FAIL", "barrier plugin", f"synthe-barrier is not loaded and active (status {plugin.get('status')!r}); "
                                       f"run synthe-init setup again")
-    skill = _json(oc.run("skills", "info", "synthe", "--json")) or {}
-    skill = skill.get("skill", skill)
-    add("PASS" if skill.get("eligible") else "WARN", "synthe skill",
-        "the synthe skill is installed and eligible" if skill.get("eligible") else "the synthe skill is missing or ineligible")
+    add(*_skill_check(oc))
     show = _json(oc.run("mcp", "show", MCP_NAME, "--json"))
     add("PASS" if show else "FAIL", "mcp server", f"OpenClaw has the {MCP_NAME} MCP server" if show
         else f"OpenClaw has no {MCP_NAME} MCP server; run synthe-init setup again")
