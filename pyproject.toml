@@ -40,6 +40,7 @@ py-modules = [
   "synthe_init", "synthe_task", "synthe_ui", "synthe_git_remote", "synthe_touchid",
   "synthe_skill",
   "synthe_lane_templates", "synthe_approver", "synthe_verify", "synthe_notify", "synthe_grant",
+  "synthe_risk",
 ]
 
 [tool.setuptools.data-files]

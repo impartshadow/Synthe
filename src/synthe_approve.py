@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fnmatch
 import json
 import os
 import re
@@ -40,6 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import synthe_client as scl  # noqa: E402
+import synthe_risk  # noqa: E402
 import synthe_sign as ss  # noqa: E402
 import synthe_touchid as st  # noqa: E402
 import synthe_ui as sui  # noqa: E402
@@ -50,36 +50,16 @@ DEFAULT_KEY = Path("~/.synthe/approver.key.json")
 DEFAULT_TOUCHID_KEY = Path("~/.synthe") / st.KEY_NAME
 PREVIEW_LINES = 60
 
-TIERS = ("routine", "review", "high")
-# Thresholds (specs/approval-card-v2.md). Lines are insertions + deletions from the broker's own diff.
-REVIEW_LINES, HIGH_LINES = 200, 400
-HIGH_DELETED_FILES = 10
-REVIEW_COMMITS, HIGH_COMMITS = 10, 30
+# The risk tiers, thresholds and sensitive paths live in synthe_risk.py, shared with the broker, so the
+# card shows the same assessment the broker acts on for a risk-aware lane grant.
+TIERS, HIGH_PATHS, REVIEW_PATHS = synthe_risk.TIERS, synthe_risk.HIGH_PATHS, synthe_risk.REVIEW_PATHS
+REVIEW_LINES, HIGH_LINES = synthe_risk.REVIEW_LINES, synthe_risk.HIGH_LINES
+HIGH_DELETED_FILES = synthe_risk.HIGH_DELETED_FILES
+REVIEW_COMMITS, HIGH_COMMITS = synthe_risk.REVIEW_COMMITS, synthe_risk.HIGH_COMMITS
 CHECK_CHARS = 4  # how much of the commit hash a high-risk approval must type back
-# Paths whose change can run code, ship a dependency, alter CI or hold a secret. A match on CI or a
-# secrets-like name makes the push high risk; the rest make it worth a check.
-HIGH_PATHS = (".github/workflows/*", ".github/actions/*", ".gitlab-ci.yml", ".circleci/*", "Jenkinsfile",
-              "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".env", ".env.*")
-REVIEW_PATHS = ("Dockerfile", "Dockerfile.*", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-                "poetry.lock", "uv.lock", "Cargo.lock", "go.sum", "setup.py", "pyproject.toml", "Makefile",
-                "scripts/*.sh", "bin/*", "CODEOWNERS", ".gitattributes")
 DEFAULT_LOG = Path("~/.synthe/approvals.log")
 
-# C0/C1 controls except tab and newline (ESC starts ANSI sequences; CR overwrites a line), DEL,
-# and the bidi controls that reorder what you read (Trojan Source).
-_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]")
-
-
-def clean(text, one_line: bool = False) -> str:
-    """Agent-controlled text made safe to print: control codes become visible escapes."""
-    s = "" if text is None else str(text)
-    if one_line:
-        s = s.replace("\n", "\\n")
-
-    def esc(m):
-        c = ord(m.group())
-        return f"\\x{c:02x}" if c < 0x100 else f"\\u{c:04x}"
-    return _CONTROL.sub(esc, s)
+clean = synthe_risk.clean  # agent-controlled text made safe to print (control codes become visible escapes)
 
 
 def _full(sha) -> str:
@@ -97,63 +77,16 @@ def _part(detail: dict, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _matches(path: str, patterns) -> bool:
-    """A pattern with a slash matches the path from the repository root; one without matches the file
-    name at any depth (so a nested lockfile or .env counts like a top-level one)."""
-    name = path.rsplit("/", 1)[-1]
-    return any(fnmatch.fnmatchcase(path if "/" in p else name, p) for p in patterns)
-
-
-def _shortstat(stat) -> tuple[int, int]:
-    """(insertions, deletions) from git's --shortstat line; (0, 0) when absent."""
-    text = stat if isinstance(stat, str) else ""
-    ins = re.search(r"(\d+) insertions?\(\+\)", text)
-    dels = re.search(r"(\d+) deletions?\(-\)", text)
-    return (int(ins.group(1)) if ins else 0, int(dels.group(1)) if dels else 0)
+_shortstat = synthe_risk.shortstat
 
 
 def assess(detail: dict) -> dict:
     """How carefully this push deserves to be read: {"tier": routine|review|high, "reasons": [...]}.
     Computed only from the broker's record (target, its own diff, file list, commits); never from
-    anything the agent wrote about the push. Reasons are short plain sentences, already cleaned."""
-    eff, ch = _part(detail, "effect"), _part(detail, "changes")
-    found: list[tuple[int, str]] = []  # (tier index, reason)
-
-    def flag(tier: str, reason: str):
-        found.append((TIERS.index(tier), reason))
-
-    if not isinstance(detail.get("changes"), dict) or ch.get("available") is not True:
-        flag("high", "the broker can't show its copy of the change")
-    if ch.get("patch_truncated"):
-        flag("high", "the diff is larger than the broker's display limit")
-    ins, dels = _shortstat(ch.get("stat"))
-    lines = ins + dels
-    if lines >= HIGH_LINES:
-        flag("high", f"{lines} lines changed")
-    elif lines >= REVIEW_LINES:
-        flag("review", f"{lines} lines changed")
-    files = [f for f in ch.get("files") or [] if isinstance(f, dict)]
-    deleted = sum(1 for f in files if str(f.get("status", "")).startswith("D"))
-    if deleted and (deleted >= HIGH_DELETED_FILES or (len(files) >= 4 and deleted * 4 > len(files))):
-        flag("high", f"deletes {deleted} file{'s' if deleted != 1 else ''}")
-    elif deleted:
-        flag("review", f"deletes {deleted} file{'s' if deleted != 1 else ''}")
-    for tier, patterns in (("high", HIGH_PATHS), ("review", REVIEW_PATHS)):
-        hits = [str(f.get("path", "")) for f in files if _matches(str(f.get("path", "")), patterns)]
-        if hits:
-            more = f" and {len(hits) - 1} more" if len(hits) > 1 else ""
-            flag(tier, f"changes {clean(hits[0], True)}{more}")
-    n_commits = len(ch.get("commits") or [])
-    if n_commits >= HIGH_COMMITS:
-        flag("high", f"{n_commits} commits")
-    elif n_commits >= REVIEW_COMMITS:
-        flag("review", f"{n_commits} commits")
-    if eff.get("expected_old") not in (None, "new"):
-        flag("review", "updates an existing branch")
-    if not found:
-        return {"tier": "routine", "reasons": []}
-    found.sort(key=lambda x: -x[0])  # stable: highest tier first, then the order checked
-    return {"tier": TIERS[found[0][0]], "reasons": [r for _, r in found]}
+    anything the agent wrote about the push. Reasons are short plain sentences, already cleaned.
+    The rules are synthe_risk's; when the broker escalated the push under a risk-aware lane grant, its
+    own assessment (`risk` in the detail) can only raise the tier shown here, never lower it."""
+    return synthe_risk.stricter(synthe_risk.assess(detail), detail.get("risk") if isinstance(detail, dict) else None)
 
 
 def waiting_for_approval(staged: list) -> list:

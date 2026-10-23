@@ -418,11 +418,24 @@ whatever staged proposal it now covers, and the detail view lists the approvals 
 
 By default a human approves every push. A human may instead sign a **lane grant**
 (`src/synthe_lane_templates.py`): for one receiver, `git_push` only, a remote and a branch pattern, the
-paths it may touch, a maximum number of uses, an expiry, and the digests of the receiver policy, the
-trusted approvers and the effects config it was signed against (any change makes it `template_stale`).
-Only a human in the receiver's `trusted_approvers` signs one (Ed25519 passphrase key or Touch ID key);
-any trusted human may revoke it. Uses are reserved under one lock immediately before `git push` and are
-never refunded.
+paths it may touch, optionally a maximum number of uses (`max_uses`, 1-10000) and an expiry (`expires_at`),
+and the digests of the receiver policy, the trusted approvers and the effects config it was signed against
+(any change makes it `template_stale`). Only a human in the receiver's `trusted_approvers` signs one
+(Ed25519 passphrase key or Touch ID key); any trusted human may revoke it. Uses are counted under one lock
+immediately before `git push` and are never refunded.
+
+**Limits are optional (v0.7).** A grant that carries `max_uses` or `expires_at` is held to it exactly as
+before. A grant whose signed body *omits* the field has no such limit: a standing lane, valid until it is
+revoked or goes stale. That is the human's signed choice, not a default the broker fills in: the field's
+absence is covered by the signature (stripping a limit from a signed grant breaks it), and a field that is
+present but malformed (`null`, `0`, a string, a boolean, more than 10000, an empty expiry) is refused
+(`template_malformed`). Uses are still counted for an unlimited grant (`lane_template.use` in the receipt;
+`uses_left: null` in the listing).
+
+A push on a lane's branch that touches **any path outside the grant's `path_scope`** (in any pushed
+commit) is not the grant's to approve: it is staged for a human, like a push with no lane
+(`outside_lane_paths`, below). Paths the receiver policy refuses (`owned_paths`, `allowed_paths`,
+`forbidden_paths`) are denied outright as before, whoever approves; a human's approval never widens them.
 
 A grant **without** a delegate stands in for the per-push approval itself (an unattended lane). A grant
 **with** `"delegate": "<identity>"` hands the per-push review to that approver, typically a reviewing
@@ -520,6 +533,77 @@ delegate yet, so they wait for a human. A delegate that is fooled (prompt inject
 approve what the grant allows; the grant's branch, path, use and time limits bound that, they don't
 remove it.
 
+### Risk-aware lanes (v0.7)
+
+Inside a lane, routine pushes go out with no human; a high-risk one waits for a human. A grant opts in with
+a signed field:
+
+```json
+"auto_approve": ["routine", "review"]
+```
+
+- **Values:** a non-empty list of distinct tiers from `routine`, `review`, `high` (`src/synthe_risk.py`).
+  Anything else (an unknown tier, an empty list, a duplicate, a string) is refused at grant validation
+  (`template_malformed`). The field is part of the signed body, so it can't be widened or dropped after
+  signing (`template_signature_invalid`).
+- **Semantics (an allowlist, fail-closed):** the grant approves, on its own or through its delegate, only
+  the tiers it lists. Any other tier, including one a future release adds, waits for a human.
+- **Default for new grants: `["routine", "review"]`** (`synthe_lane_templates.DEFAULT_AUTO_APPROVE`; the
+  broker's `lane_template_draft` op returns it as `auto_approve_default`). Only a high-risk push interrupts
+  a person. Sign `["routine"]` to also be asked about dependency manifests and lockfiles, Dockerfiles,
+  build scripts, `CODEOWNERS`, any deletion, 200+ changed lines or 10+ commits.
+- **Grants without the field** (signed before v0.7) are not risk-aware: they approve every tier, exactly as
+  before. Re-sign them with the field to get escalation.
+
+**How the broker decides.** Under the lane lock, inside the claim fence, immediately before `git push`
+(after the receiver-policy path checks, before the delegate's approval is read and before a use is
+reserved), the broker classifies the exact range it is about to push, from its own mirror: every path of
+every pushed commit (an intermediate commit that adds a workflow and a later one that removes it still
+counts; renames count both paths), the net line count, deletions and the commit count. Never anything the
+agent wrote. A commit restaged after an earlier classification is classified again at dispatch. If the
+grant doesn't list the tier, nothing is pushed, no use is spent, and the proposal is staged (even without
+`wait_for_approval`), waiting for a human's normal signed approval (`synthe-approve`), which then commits
+it and spends no use either. The tier is also checked when a proposal is staged, so a high-risk push under
+a delegate grant is never put in the delegate's queue (`waiting_for` is `risk`, not `review`); a delegate
+approval submitted for it anyway is refused (`risk_escalated`). Escalation by risk is not sticky: a new
+commit is judged on its own.
+
+**The receipt** of an escalated push has `decision: "staged"`, reasons with `risk_escalated` (and the
+approval code it waits for), `staged.waiting_for: ["approval", "risk"]`, and
+
+```json
+"risk": {"tier": "high", "reasons": ["changes .github/workflows/ci.yml"], "paths": [".github/workflows/ci.yml"],
+         "sensitive_paths": 1, "auto_approve": ["routine", "review"], "template_id": "lane-1",
+         "commit": "<sha>", "base": "<sha>", "rules_digest": "<sha256>", "escalated": true}
+```
+
+(paths and counts only, never file contents; `paths` lists at most 50). A push the grant approved carries
+the same `risk` object with `escalated: false`. A push outside the grant's paths is staged the same way
+with `outside_lane_paths`, `waiting_for: ["approval", "scope"]` and
+`"lane_scope": {"template_id", "path_scope", "outside_paths" (at most 50), "outside_count", "commit"}`.
+`staged`, `staged_detail` and the approval card show both, and the card's tier is never lower than the
+broker's.
+
+**The rules are a policy.** The defaults are the approval card's (`synthe_risk.HIGH_PATHS`,
+`REVIEW_PATHS` and size thresholds). An operator may replace either path list in `broker.json`:
+
+```json
+"effects": {"git_push": {"risk": {"high_paths": [".github/workflows/*", "*.pem", ".env", "infra/*"],
+                                  "review_paths": ["package.json", "*.lock"]}, "remotes": {...}}}
+```
+
+A pattern with a slash matches from the repository root; one without matches the file name at any depth.
+A malformed `risk` section makes every risk-aware grant unusable (`risk_rules_invalid`; pushes then need a
+human). A risk-aware grant's `lineage` also carries `risk_rules_digest` (the effective rules, thresholds
+included), so changing the rules, in `broker.json` or in a new release's defaults, makes it
+`template_stale` and a human re-signs. Get the matching lineage from the `lane_template_draft` op with
+`{"receiver", "auto_approve": [...]}`.
+
+**Limits, plainly.** The classification is a heuristic over paths and sizes. It doesn't read code: a
+malicious change to an ordinary-looking source file (`src/app.py`) is `routine` and goes out unattended. It
+is a tripwire for the changes that most often matter (CI, dependencies, secrets, mass deletions, huge
+diffs), not a review.
+
 ## Reason codes (new in v0.4)
 
 | Code | State | Meaning |
@@ -562,8 +646,11 @@ remove it.
 | `content_malformed` | invalid | v0.5: `files`/`delete`/`base_blobs` have the wrong shape, text isn't UTF-8 or holds a NUL, a path appears twice, a cited blob isn't 40-hex, or the target path isn't a regular file |
 | `content_too_large` | invalid | v0.5: more than `max_content_files` paths (100) or `max_content_mb` (2) of text |
 | `content_base_missing` | blocked | v0.5: a changed or deleted path isn't cited in `base_blobs` (cite `null` for a new file) |
-| `template_malformed`, `template_scope`, `template_unavailable` | invalid/blocked | v0.6: a lane grant has the wrong shape, doesn't cover this receiver/remote/branch/paths, or the named grant isn't usable |
-| `template_signature_invalid`, `template_expired`, `template_stale`, `template_revoked`, `template_exhausted` | blocked | v0.6: the grant's human signature fails, it expired, the policy/approvers/effects changed since it was signed, it was revoked, or its uses are spent |
+| `template_malformed`, `template_scope`, `template_unavailable` | invalid/blocked | v0.6: a lane grant has the wrong shape (v0.7: including an unknown, empty or duplicate `auto_approve` tier, or a present but malformed `max_uses`/`expires_at`), doesn't cover this receiver/remote/branch, or the named grant isn't usable |
+| `template_signature_invalid`, `template_expired`, `template_stale`, `template_revoked`, `template_exhausted` | blocked | v0.6: the grant's human signature fails, it expired, the policy/approvers/effects (v0.7: or a risk-aware grant's risk rules) changed since it was signed, it was revoked, or its uses are spent. A grant that omits `expires_at`/`max_uses` never expires/exhausts |
+| `risk_escalated` | blocked | v0.7: a risk-aware grant (`auto_approve`) doesn't list this push's risk tier. Not an error: the proposal stays staged (`waiting_for` `risk`) for a human's approval; nothing pushed, no use spent, the delegate not asked. The receipt's `risk` says why (tier, reasons, paths) |
+| `outside_lane_paths` | blocked | v0.7: the push touches paths outside its lane grant's `path_scope`. Not an error: staged (`waiting_for` `scope`) for a human's approval; no use spent. The receipt's `lane_scope` lists the paths. (Paths the receiver policy refuses are still `path_*` denials) |
+| `risk_rules_invalid` | invalid | v0.7: `effects.git_push.risk` in `broker.json` is malformed; no risk-aware grant applies until it is fixed |
 | `template_id_reused`, `template_revocation_invalid`, `template_store_corrupt`, `registry_unreadable` | invalid | v0.6: a grant id was reused, a revocation isn't signed by a trusted human, or broker state can't be read |
 | `delegate_invalid` | invalid | v0.6: a grant names a delegate that isn't a registered `model_approver`, or is the receiver |
 | `delegate_malformed`, `delegate_signature_invalid`, `delegate_not_named`, `delegate_is_party` | invalid/blocked | v0.6: a delegate approval/escalation has the wrong shape, its signature fails, its signer isn't the grant's delegate, or the signer is the handoff's sender or receiver |

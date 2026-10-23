@@ -15,6 +15,17 @@ the delegate's own signed approval of that exact commit. The delegate:
   sticks to that proposal (idempotency key + action, whatever commit comes
   next), so re-pushing never buys a second review; only a human approves it.
 A human's own approval always works as before, and consumes no grant use.
+
+A grant may be risk-aware: `"auto_approve": ["routine"]` (signed with the rest of the grant) lists the
+risk tiers (synthe_risk) it approves without a human, on its own or through its delegate. The broker
+classifies what it is about to push, from its own copy of every pushed commit, under the lane lock
+immediately before dispatch; a tier the grant doesn't list stays staged for a human (`risk_escalated`),
+the delegate is not asked, and no use is spent. A grant without the field (signed before risk-aware
+lanes) is not risk-aware: it approves every tier, as before. Likewise a push that touches any path
+outside a grant's path_scope is not the grant's to approve: it waits for a human (`outside_lane_paths`).
+
+`max_uses` and `expires_at` are optional: a signed grant that omits one has no such limit (a standing
+lane, valid until revoked or stale); one that carries a malformed value is refused.
 """
 import datetime as dt
 import hashlib
@@ -25,6 +36,7 @@ from contextlib import contextmanager
 
 import handoff_check as hc
 import synthe_crypto as sc
+import synthe_risk
 
 DOMAIN = b"synthe/approval-template/v1\n"
 REVOKE_DOMAIN = b"synthe/approval-template-revoke/v1\n"
@@ -32,12 +44,18 @@ DELEGATE_DOMAIN = b"synthe/delegate-approval/v1\n"
 ESCALATE_DOMAIN = b"synthe/delegate-escalation/v1\n"
 DELEGATE_KIND = "model_approver"
 MAX_DELEGATE_MINUTES = 60
-FIELDS = {"template_id", "approver", "kid", "receiver", "tool", "params", "path_scope", "max_uses", "expires_at",
-          "lineage", "sig"}
+FIELDS = {"template_id", "approver", "kid", "receiver", "tool", "params", "path_scope", "lineage", "sig"}
 # delegate: who reviews each push; brief: the human's own instructions to that reviewer (signed with the grant,
-# so the reviewer can tell them apart from anything an agent wrote)
-OPTIONAL = {"delegate", "brief"}
+# so the reviewer can tell them apart from anything an agent wrote); auto_approve: the risk tiers the grant
+# approves without a human (an allowlist: a tier it doesn't name, today's or a future one, goes to a human).
+# max_uses / expires_at: limits. Present, they are enforced as always; omitted from the signed grant, there
+# is no such limit (a standing lane, valid until revoked or stale). Present but malformed: refused.
+OPTIONAL = {"delegate", "brief", "auto_approve", "max_uses", "expires_at"}
 MAX_BRIEF = 4000
+MAX_USES = 10000
+# What new grants should carry (grant CLIs, Studio): routine and review-tier pushes go out without a human
+# (through the delegate, if the grant names one); only a high-risk push waits for one.
+DEFAULT_AUTO_APPROVE = ("routine", "review")
 DOC_FIELDS = {"template_id", "approver", "kid", "idempotency_key", "from", "to", "action", "params", "note", "sig"}
 APPROVE_FIELDS = DOC_FIELDS | {"expires_at"}
 ESCALATE_FIELDS = DOC_FIELDS | {"recommendation"}
@@ -69,12 +87,46 @@ def sign(body, key, revoke=False):
     return x
 
 
-def lineage(cfg, registry, receiver):
+def default_auto_approve(delegate=None):
+    """The tiers a new grant should list (`auto_approve`), with a delegate or without one."""
+    return list(DEFAULT_AUTO_APPROVE)
+
+
+def exhausted(s, t):
+    """Every use of a grant with `max_uses` is spent. A grant without the field has no use limit."""
+    return "max_uses" in t and s["uses"].get(t["template_id"], 0) >= t["max_uses"]
+
+
+def auto_approve_ok(v):
+    """A risk-aware grant's tiers: a non-empty list of distinct known tiers. Anything else is refused."""
+    return isinstance(v, list) and bool(v) and len(set(map(str, v))) == len(v) \
+        and all(isinstance(t, str) and t in synthe_risk.TIERS for t in v)
+
+
+def risk_rules(cfg):
+    """The effective risk rules: the operator's effects.git_push.risk over synthe_risk's defaults."""
+    try:
+        return synthe_risk.load_rules((cfg.effects.get("git_push") or {}).get("risk"))
+    except ValueError:
+        fail("risk_rules_invalid")
+
+
+def lineage(cfg, registry, receiver, risk_aware=False):
+    """What a grant was signed against. A risk-aware grant also pins the effective risk rules, so changing
+    them (the operator's lists, or the defaults in a new release) makes it `template_stale`."""
     policy = hc.receiver_policy(registry, receiver) or {}
     trusted = policy.get("trusted_approvers") or []
-    return {"receiver_policy_digest": digest(policy),
-            "approvers_digest": digest({a: registry["agents"].get(a) for a in sorted(trusted)}),
-            "effects_digest": digest({"effects": cfg.effects, "lane_templates": cfg.raw.get("lane_templates")})}
+    out = {"receiver_policy_digest": digest(policy),
+           "approvers_digest": digest({a: registry["agents"].get(a) for a in sorted(trusted)}),
+           "effects_digest": digest({"effects": cfg.effects, "lane_templates": cfg.raw.get("lane_templates")})}
+    if risk_aware:
+        out["risk_rules_digest"] = synthe_risk.rules_digest(risk_rules(cfg))
+    return out
+
+
+def auto_approves(t, tier):
+    """Whether grant `t` approves a push of this tier without a human. Not risk-aware: every tier, as before."""
+    return "auto_approve" not in t or tier in t["auto_approve"]
 
 
 def enabled(cfg, receiver):
@@ -88,9 +140,16 @@ def validate(cfg, registry, x):
         fail("template_malformed")
     if "brief" in x and (not isinstance(x["brief"], str) or not x["brief"].strip() or len(x["brief"]) > MAX_BRIEF):
         fail("template_malformed")
-    if not all(isinstance(x.get(k), str) and x[k] for k in ("template_id", "approver", "kid", "receiver", "expires_at", "sig")):
+    if "auto_approve" in x and not auto_approve_ok(x["auto_approve"]):
         fail("template_malformed")
-    if len(x["template_id"]) > 120 or not isinstance(x["max_uses"], int) or isinstance(x["max_uses"], bool) or not 1 <= x["max_uses"] <= 10000:
+    if not all(isinstance(x.get(k), str) and x[k] for k in ("template_id", "approver", "kid", "receiver", "sig")):
+        fail("template_malformed")
+    if "expires_at" in x and (not isinstance(x["expires_at"], str) or not x["expires_at"]):
+        fail("template_malformed")
+    if "max_uses" in x and (not isinstance(x["max_uses"], int) or isinstance(x["max_uses"], bool)
+                            or not 1 <= x["max_uses"] <= MAX_USES):
+        fail("template_malformed")
+    if len(x["template_id"]) > 120:
         fail("template_malformed")
     if not isinstance(x["params"], dict) or set(x["params"]) != {"remote", "branch_pattern"} or not all(isinstance(v, str) and v for v in x["params"].values()):
         fail("template_malformed")
@@ -109,10 +168,11 @@ def validate(cfg, registry, x):
     # Ed25519 (passphrase key) or ES256 (Touch ID key): the registered key decides which.
     if not _verifies(registry, x, signing_input(x)):
         fail("template_signature_invalid")
-    expiry = hc.parse_ts(x["expires_at"])
-    if expiry is None or expiry <= hc.now_utc():
-        fail("template_expired")
-    if x["lineage"] != lineage(cfg, registry, x["receiver"]):
+    if "expires_at" in x:  # omitted from the signed grant: no expiry, valid until revoked (or stale)
+        expiry = hc.parse_ts(x["expires_at"])
+        if expiry is None or expiry <= hc.now_utc():
+            fail("template_expired")
+    if x["lineage"] != lineage(cfg, registry, x["receiver"], risk_aware="auto_approve" in x):
         fail("template_stale")
 
 
@@ -219,7 +279,7 @@ def select(cfg, registry, receiver, params, *, paths=None, template_id=None):
             validate(cfg, registry, t)
             if tid in s["revoked"]:
                 fail("template_revoked")
-            if s["uses"].get(tid, 0) >= t["max_uses"]:
+            if exhausted(s, t):
                 fail("template_exhausted")
             if params.get("remote") != t["params"]["remote"] or not any_match([t["params"]["branch_pattern"]], params.get("branch", "")):
                 fail("template_scope")
@@ -248,7 +308,8 @@ def reserve(cfg, receiver, params, paths, tid):
     n = s["uses"].get(tid, 0) + 1
     s["uses"][tid] = n
     save(cfg, s)
-    return {"template_id": tid, "use": n, "approver": t["approver"], "expires_at": t["expires_at"]}
+    return {"template_id": tid, "use": n, "approver": t["approver"], "expires_at": t.get("expires_at"),
+            "max_uses": t.get("max_uses")}
 
 
 def view(cfg):
@@ -267,12 +328,12 @@ def view(cfg):
                 validate(cfg, registry, t)
                 if tid in s["revoked"]:
                     fail("template_revoked")
-                if s["uses"].get(tid, 0) >= t["max_uses"]:
+                if exhausted(s, t):
                     fail("template_exhausted")
             except Deny as e:
                 status = e.reason["code"]
             out.append({**{k: v for k, v in t.items() if k != "sig"}, "status": status,
-                        "uses_left": max(0, t["max_uses"] - s["uses"].get(tid, 0))})
+                        "uses_left": max(0, t["max_uses"] - s["uses"].get(tid, 0)) if "max_uses" in t else None})
         return {"templates": out, "enabled_receivers": (cfg.raw.get("lane_templates") or {}).get("receivers", [])}
 
 
@@ -354,7 +415,7 @@ def submit_delegate(cfg, registry, x, staged):
     validate(cfg, registry, t)
     if t["template_id"] in s["revoked"]:
         fail("template_revoked")
-    if s["uses"].get(t["template_id"], 0) >= t["max_uses"]:
+    if exhausted(s, t):
         fail("template_exhausted")
     if x["params"]["remote"] != t["params"]["remote"] or not any_match([t["params"]["branch_pattern"]], x["params"]["branch"]):
         fail("template_scope")
@@ -362,7 +423,8 @@ def submit_delegate(cfg, registry, x, staged):
     exp = hc.parse_ts(x["expires_at"])
     if exp is None or exp <= now:
         fail("delegate_approval_expired")
-    if exp > now + dt.timedelta(minutes=MAX_DELEGATE_MINUTES) or exp > hc.parse_ts(t["expires_at"]):
+    if exp > now + dt.timedelta(minutes=MAX_DELEGATE_MINUTES) \
+            or ("expires_at" in t and exp > hc.parse_ts(t["expires_at"])):  # a grant without expiry: the 60 minutes
         fail("delegate_approval_too_long")
     d = delegate_load(cfg)
     sid = proposal_id(x)
@@ -371,6 +433,11 @@ def submit_delegate(cfg, registry, x, staged):
     h = ((staged or {}).get("packet") or {}).get("handoff") or {}
     if not staged or staged.get("state") != "STAGED" or not _matches(x, h, staged.get("action"), staged.get("params") or {}):
         fail("delegate_approval_stale")
+    held = set(staged.get("waiting_for") or [])  # the broker sent it to a human: not the delegate's to review
+    if "risk" in held:
+        fail("risk_escalated")
+    if "scope" in held:
+        fail("outside_lane_paths")
     d["approvals"][sid] = x
     save(cfg, d, delegate_path(cfg))
     return {"id": sid, "template_id": t["template_id"], "status": "accepted"}

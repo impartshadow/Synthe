@@ -27,13 +27,13 @@ MUTATIONS = {
  "escalation not sticky at commit": ("src/synthe_lane_templates.py", '    if sid in d["escalations"]:\n        fail("delegate_escalated")\n    x = d["approvals"]', '    x = d["approvals"]'),
  "no re-check at dispatch": ("src/synthe_commit.py", '                        if lane.get("delegate"):  # escalated or expired since', '                        if False:  # escalated or expired since'),
  "human approval spends a use": ("src/synthe_commit.py", '                lane = None  # a human\'s approval never spends a grant use\n', '                pass\n'),
- "delegate grant skips the delegate": ("src/synthe_commit.py", '        if not pending and (not lane or lane.get("delegate")):\n', '        if not pending and not lane:\n'),
+ "delegate grant skips the delegate": ("src/synthe_commit.py", '                elif lane.get("delegate"):\n', '                elif False:\n'),
  "revoked grant takes delegate approvals": ("src/synthe_lane_templates.py", '    if t["template_id"] in s["revoked"]:\n        fail("template_revoked")\n', ''),
  "untrusted human revokes": ("src/synthe_lane_templates.py", '        if x.get("approver") != t["approver"] and (x.get("approver") not in trusted or who.get("kind") != "human"):\n', '        if False:\n'),
- "grant expiry ignored": ("src/synthe_lane_templates.py", '    if expiry is None or expiry <= hc.now_utc():\n        fail("template_expired")\n', ''),
- "grant lineage ignored": ("src/synthe_lane_templates.py", '    if x["lineage"] != lineage(cfg, registry, x["receiver"]):\n        fail("template_stale")\n', ''),
- "grant max uses ignored": ("src/synthe_lane_templates.py", '            if s["uses"].get(tid, 0) >= t["max_uses"]:\n                fail("template_exhausted")\n            if params', '            if params'),
- "grant revocation ignored": ("src/synthe_lane_templates.py", '            if tid in s["revoked"]:\n                fail("template_revoked")\n            if s["uses"]', '            if s["uses"]'),
+ "grant expiry ignored": ("src/synthe_lane_templates.py", '        if expiry is None or expiry <= hc.now_utc():\n            fail("template_expired")\n', ''),
+ "grant lineage ignored": ("src/synthe_lane_templates.py", '    if x["lineage"] != lineage(cfg, registry, x["receiver"], risk_aware="auto_approve" in x):\n        fail("template_stale")\n', ''),
+ "grant max uses ignored": ("src/synthe_lane_templates.py", '            if exhausted(s, t):\n                fail("template_exhausted")\n            if params', '            if params'),
+ "grant revocation ignored": ("src/synthe_lane_templates.py", '            if tid in s["revoked"]:\n                fail("template_revoked")\n            if exhausted(s, t)', '            if exhausted(s, t)'),
  "grant path scope ignored": ("src/synthe_lane_templates.py", '            if paths is not None and any(not any_match(t["path_scope"], p) for p in paths):\n', '            if False:\n'),
 }
 

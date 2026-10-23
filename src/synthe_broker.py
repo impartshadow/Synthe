@@ -323,7 +323,8 @@ class Broker:
             grant = lanes.select(self.cfg, registry, h.get("to"), a.get("params") or {})
             if grant:
                 deferred.add(a["name"])
-                expires.append(hc.parse_ts(grant["expires_at"]))
+                if "expires_at" in grant:  # a grant without expiry is valid until revoked
+                    expires.append(hc.parse_ts(grant["expires_at"]))
                 covered.append(grant["template_id"])
             else:
                 try:
@@ -361,7 +362,18 @@ class Broker:
         receiver = args.get("receiver")
         if err or not lanes.enabled(self.cfg, receiver):
             raise Refused("template_scope", "lane templates are not enabled for this receiver")
-        return {"lineage": lanes.lineage(self.cfg, registry, receiver)}
+        # A risk-aware grant (`auto_approve`, what new grants should carry) pins the risk rules in its lineage:
+        # pass the tiers it will list to get that lineage. Without them: the lineage of a grant without the field.
+        auto = args.get("auto_approve")
+        if auto is not None and not lanes.auto_approve_ok(auto):
+            raise Refused("template_malformed",
+                          f"auto_approve must list distinct risk tiers from {list(lanes.synthe_risk.TIERS)}")
+        out = {"lineage": lanes.lineage(self.cfg, registry, receiver, risk_aware=auto is not None),
+               "auto_approve_default": lanes.default_auto_approve(args.get("delegate")),
+               "risk_rules": lanes.risk_rules(self.cfg)}
+        if auto is not None:
+            out["auto_approve"] = list(auto)
+        return out
 
     def op_submit_lane_template(self, args, isolation):
         import synthe_lane_templates as lanes

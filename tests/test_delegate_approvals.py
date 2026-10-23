@@ -186,16 +186,19 @@ def test_out_of_scope_branches_and_paths_are_never_covered(w):
     assert w.remote_ref("feature/x") is None
 
 
-def test_paths_outside_the_grant_are_denied_at_dispatch_without_spending_a_use(w):
+def test_paths_outside_the_grant_go_to_a_human_not_the_delegate_and_spend_no_use(w):
     lanes.submit(w.cfg, grant(w))
     p = w.packet(idem="k2", branch="feature/y", approve=False)
     from test_speculative import speculative_claim
     tok = speculative_claim(w, p)
     sha = w.commit({"tests/t.py": "x\n"}, msg="outside")
-    assert w.propose(p, tok, sha, branch="feature/y", wait_for_approval=True)["decision"] == "staged"
+    r = w.propose(p, tok, sha, branch="feature/y", wait_for_approval=True)
+    assert r["decision"] == "staged" and r["staged"]["waiting_for"] == ["approval", "scope"], r
     out = submit(w, doc(w, sha, idem="k2", branch="feature/y"))
-    assert [c["decision"] for c in out["commits"]] == ["denied"] and "template_scope" in codes(out["commits"][0])
+    assert "outside_lane_paths" in rcodes(out) and out["commits"] == []
     assert w.remote_ref("feature/y") is None and uses_left(w) == 3
+    out = cm.submit_approval(w.cfg, detached(w, p, params={"remote": "origin", "branch": "feature/y", "commit": sha}))
+    assert [c["decision"] for c in out["commits"]] == ["executed"] and uses_left(w) == 3
 
 
 # ---- escalation ----------------------------------------------------------------------------------
