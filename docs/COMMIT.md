@@ -451,6 +451,51 @@ A grant may also carry a `brief` (up to 4000 characters): the human's own instru
 ("small src/ changes only, no new dependencies"). It is signed with the grant, so the reviewer can tell
 it apart from the task text and the diff, which agents wrote.
 
+**Opening a lane yourself: `synthe-task grant`** (`src/synthe_grant.py`; setup offers it as "How
+hands-off?"). One command from your own terminal, no hand-signed JSON:
+
+```bash
+synthe-task grant [--branch 'agent/*'] [--paths 'src/**,tests/**'] [--uses N] [--until 7d]
+                  [--remote origin] [--agent openclaw] [--delegate ID] [--brief TEXT] [--passphrase]
+synthe-task grants [--all]            # open lanes, uses left, expiry; flags the ones to renew
+synthe-task revoke-grant ID
+```
+
+- **Defaults come from your setup**: the remote, the agent, the branch patterns the broker may push, and
+  the receiver policy's `allowed_paths`. **No limits by default**: `--uses` and `--until` are optional.
+  The grant schema requires both fields, so "none" is the largest values the broker accepts: 10000 uses
+  and an expiry of 9999-01-01 (shown as "no limit on pushes" and "no expiry"). `--until` takes a length
+  (`90m`, `12h`, `7d`, `2w`) or a date (`2026-10-30`, end of that day, local time); there is no upper
+  bound, only a minimum of 5 minutes. `--uses` takes 1 to 10000.
+- **It shows before it signs.** For example: "Agent openclaw may push to agent/* changing src/** and
+  tests/**, up to 50 times, until Fri Oct 30 12:00 UTC. Pushes to other branches still ask you. A push
+  on this branch that touches other files is refused, not asked about." Then `Sign this lane grant?
+  [y/N]`, then Touch ID (if enrolled) or your passphrase. There is no `--yes`, and it refuses to run
+  without a terminal, so an agent cannot open a lane for you.
+- **The stops are not caps.** It refuses `main`, `master`, `*`, `**` and any pattern that reaches `main`
+  or `master`; a branch outside what the broker may push; paths outside the receiver policy's
+  `allowed_paths`; and paths on its `forbidden_paths`. The broker enforces the same at every push
+  whatever a grant says. The lineage digests come from the broker (`lane_template_draft`), so they are
+  the ones it will check.
+- **Setup** ends with "How hands-off?" (`synthe-init lane-offer`, run by `finish-setup.sh` once the broker
+  is up). Return picks the recommended lane, which still shows the terms and asks before signing. A
+  run without a terminal grants nothing. Setup also switches `lane_templates` on for the agent in the
+  broker config; with no grant signed that changes nothing. A broker set up before this needs
+  `"lane_templates": {"receivers": ["openclaw"]}` in its `broker.json` (the command says so).
+- **Renewal hints** apply only to lanes that have limits: `synthe-task grants` flags one that expires
+  within 24 hours or has under 10% of its uses left, with the command to make a fresh one. The old
+  grant keeps working until it runs out or you revoke it. A grant goes `stale` when the receiver
+  policy, the trusted approvers (enrolling Touch ID adds a key) or the effects config change after you
+  signed it; it stops working and `grants --all` says so.
+- **An unattended lane is a standing permission.** With no limit and no expiry it stays open until
+  `synthe-task revoke-grant ID`. Nobody reviews each push before it goes out; the broker checks branch,
+  paths and policy, and every push gets a signed receipt that names the grant. It trades review for
+  speed. It does not judge what a diff does, and nothing inside a lane flags a push as high-risk yet.
+  Add `--uses` / `--until` for a ceiling, or `--delegate` to have a reviewing model look at each push.
+- **A push on a lane's branch that touches files outside its paths is denied** (`template_scope`), not
+  queued for approval, and spends no use: the grant is selected by remote and branch, and its paths are
+  checked at dispatch. Push it from a branch the lane doesn't cover to get a normal approval.
+
 **Running a reviewing model** (`src/synthe_approver.py`, its own OS user; the model never sees the key):
 
 ```bash

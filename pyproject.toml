@@ -38,7 +38,7 @@ py-modules = [
   "synthe_broker", "synthe_client", "synthe_mcp", "synthe_a2a", "synthe_approve",
   "synthe_init", "synthe_task", "synthe_ui", "synthe_git_remote", "synthe_touchid",
   "synthe_skill",
-  "synthe_lane_templates", "synthe_approver", "synthe_verify",
+  "synthe_lane_templates", "synthe_approver", "synthe_verify", "synthe_grant",
 ]
 
 [tool.setuptools.data-files]

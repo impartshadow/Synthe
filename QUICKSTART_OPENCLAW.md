@@ -112,12 +112,25 @@ Then it does the rest by itself:
 - installs OpenClaw in the agent's account, with the Synthe plugin, skill and gateway;
 - clones your repo there through the broker, so the agent's account needs no GitHub access, not
   even to read;
-- runs the doctor.
+- runs the doctor;
+- last, asks **How hands-off?** (see below).
 
 **You should see:** the doctor's report near the end, with the level **ENFORCED**, every check `PASS`
 except one expected `WARN` for barrier plugin mode (it notes that `tui --local` skips the plugin). Its last lines suggest OpenClaw's setup wizard; skip that and use step 6.
 
 If the level isn't ENFORCED, stop here: the failing check says what's wrong.
+
+**How hands-off?** The last question of setup:
+
+```
+[1] Ask me before every push
+[2] Agents push without asking; Synthe only interrupts for what it blocks or flags as high-risk (recommended)
+```
+
+Return takes `[2]`. It then shows what it will sign (the agent, the branches, the files, "no limit on
+pushes, no expiry") and asks once more before it asks for your passphrase. Choose `[1]` and this
+quickstart works exactly as written: you approve every push in step 8. A run with no one at the
+keyboard never picks `[2]` for you. You can change your mind any time: see **Next**.
 
 ## 6. Give OpenClaw a model and start it (agent's account)
 
@@ -201,6 +214,32 @@ receipt numbers from step 8 tell you what the broker decided.
 
 ## Next
 
+- **Stop approving every push (a lane).** `[2]` above is this command with your setup's defaults; run
+  it yourself any time, in your own terminal:
+
+  ```bash
+  ~/synthe-venv/bin/synthe-task grant
+  ```
+
+  It shows what you are allowing in plain words, for example "Agent openclaw may push to agent/*
+  changing src/**, with no limit on pushes, with no expiry", then asks and signs with your key (Touch ID
+  if you enrolled it, otherwise your passphrase). Pushes inside the lane go out with no prompt;
+  anything else still asks you. Cap it if you want to: `--uses 50 --until 7d` (also `--branch`,
+  `--paths`, `--remote`, `--agent`, `--delegate`, `--brief`). It refuses `main`, `master`, `*` and
+  `**`, and any path your setup forbids.
+
+  ```bash
+  ~/synthe-venv/bin/synthe-task grants                 # open lanes, uses left, expiry, and which to renew
+  ~/synthe-venv/bin/synthe-task revoke-grant lane-ID   # close one now
+  ```
+
+  Be clear about the trade. A lane with no limit and no expiry is a standing permission until you
+  revoke it, and while it is open nobody reads each push before it goes out. Synthe still checks the
+  branch and the files at every push, refuses what is outside the lane, and signs a receipt for each
+  one, so you can audit afterwards. It does not look at what the diff does: a lane can push bad code
+  inside its paths. Today nothing inside a lane flags a push as high-risk for your review (that is
+  being added); until then, use `--uses` and `--until`, or option `[1]`, if you want a ceiling.
+  Enrolling Touch ID or changing the agent's policy makes existing lanes `stale`; sign a new one.
 - **Approve with Touch ID.** Enroll a Secure Enclave key, then install the updated registry and code
   into the broker:
 

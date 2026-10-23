@@ -7,6 +7,7 @@
                     [--home ~/.synthe] [--no-openclaw] [--yes]
   synthe-init doctor [--home ~/.synthe] [--repo PATH] [--json]
   synthe-init serve  [--home ~/.synthe]          (dev isolation: run the broker in the foreground)
+  synthe-init lane-offer [--home ~/.synthe]      (finish-setup.sh runs it last: "how hands-off?", see synthe_grant.py)
 
 `setup` writes, under --home (default ~/.synthe):
   approver.key.json   your approver key, sealed under a passphrase you type (never plaintext)
@@ -53,6 +54,7 @@ FORBIDDEN_PATHS = [".github/**", "**/*.key.json", "**/.env", "**/*.pem"]
 DEFAULT_MAX_TTL_HOURS = 72          # scenario S22: a handoff is a bearer token while it lives
 DEFAULT_PUSHES_PER_DAY = 20         # study F02 (lite): a ceiling on what one agent can push in a day
 LEVELS = ("ADVISORY", "GUARDED", "ENFORCED")
+LANE_HINT = "Optional, once the broker runs: let routine pushes inside a lane go without asking you"
 
 
 # ---- where things are ---------------------------------------------------------------
@@ -201,6 +203,7 @@ def write_broker(home: Path, *, repo_url: str, branches: list, allowed_paths: li
               "key": f"keys/{BROKER_ID}.key.json", "registry": "registry.json",
               "ledger": "ledger.sqlite3", "receipts": "receipts.jsonl", "workspace": "workspace", "state_dir": "state",
               "source_roots": [], "isolation": {"mode": isolation},
+              "lane_templates": {"receivers": [agent]},   # lets you sign a lane grant; with none signed, nothing changes
               "effects": {"git_push": {"max_commits": 200, "require_approval_commit_pin": True,
                                        "remotes": {"origin": remote}}}}
     (b / "broker.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -291,7 +294,8 @@ def prepare(home: Path, *, repo_url: str, branches: list, allowed_paths: list, a
     enforce = "enforce-linux.sh" if linux else "enforce-macos.sh"
     finish.write_text(f"""#!/bin/bash
 # Finish setting up Synthe (written by synthe-init prepare; holds no secret). Run it yourself, in a
-# terminal: it asks for your approval passphrase, your GitHub token (hidden) and your admin password.
+# terminal: it asks for your approval passphrase, your GitHub token (hidden) and your admin password,
+# then how hands-off you want to be (a lane of pushes that go without asking, or an ask every time).
 set -euo pipefail
 cd {q(root)}
 {q(python)} {q(script_path)} setup --isolation {isolation} --repo-url {q(repo_url)} \\
@@ -300,6 +304,8 @@ cd {q(root)}
 echo
 echo "Now the one admin step (your admin password):"
 sudo bash {q(home / enforce)}
+# The broker is running now, so a lane grant can be signed (it asks first; no answer keeps today's behaviour).
+{q(python)} {q(script_path)} lane-offer --home {q(home)} || true
 """)
     os.chmod(finish, 0o700)
     return finish
@@ -549,6 +555,7 @@ def apply_config(state: Path, stage: Path) -> dict:
         cfg["isolation"]["clients"] = clients
     cfg["workspace"] = patch["workspace"]
     cfg["receiver"] = patch["receiver"]
+    cfg.setdefault("lane_templates", {"receivers": [patch["receiver"]]})  # as write_broker: grants only exist once you sign one
     cfg["ledger"] = "ledger.sqlite3"
     git_push = cfg.setdefault("effects", {}).setdefault("git_push", {})
     git_push.update({"max_commits": 200, "require_approval_commit_pin": True, "remotes": {"origin": patch["remote"]}})
@@ -964,6 +971,9 @@ def main(argv=None) -> int:
     g.add_argument("--yes", action="store_true", help="install the OpenClaw plugin without OpenClaw asking you")
     t = sub.add_parser("touchid", help="approve with Touch ID: make a Secure Enclave key and register it")
     t.add_argument("--home", default="~/.synthe")
+    lo = sub.add_parser("lane-offer", help="ask once whether routine pushes may go without asking you "
+                                           "(run by finish-setup.sh once the broker is up)")
+    lo.add_argument("--home", default="~/.synthe")
     r = sub.add_parser("apply-registry", help=argparse.SUPPRESS)  # run by deploy/macos/upgrade.sh, as root
     r.add_argument("--state", required=True)
     r.add_argument("--stage", required=True)
@@ -985,6 +995,10 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "touchid":
         return touchid_setup(Path(a.home).expanduser())
+    if a.cmd == "lane-offer":  # needs your terminal, not OpenClaw
+        import synthe_grant as sg
+        sg.offer_lane(Path(a.home).expanduser())
+        return 0
     home = Path(a.home).expanduser()
     oc_bin = find_openclaw()
     oc = OpenClaw(oc_bin) if oc_bin else None
@@ -1079,11 +1093,13 @@ def main(argv=None) -> int:
     if script is not None:
         print_next(ui, [("Run the one admin step (it asks for your Mac password)", f"sudo bash {script}"),
                         ("Check the level (expect ENFORCED)", "synthe-init doctor --repo PATH/TO/YOUR/CLONE"),
-                        ("Give OpenClaw a task", task), ("Approve its push after reading the diff", approve)])
+                        ("Give OpenClaw a task", task), ("Approve its push after reading the diff", approve),
+                        (LANE_HINT, "synthe-task grant")])
         return 0
     print_next(ui, [("Start the broker (dev isolation, as you)", f"synthe-init serve --home {home}"),
                     ("Check the level", "synthe-init doctor --repo PATH/TO/YOUR/CLONE"),
-                    ("Give OpenClaw a task", task), ("Approve its push after reading the diff", approve)])
+                    ("Give OpenClaw a task", task), ("Approve its push after reading the diff", approve),
+                    (LANE_HINT, "synthe-task grant")])
     return 0
 
 
