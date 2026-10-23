@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 MUTATIONS = {
-    "agent text printed raw": ("src/synthe_approve.py", "    return _CONTROL.sub(esc, s)\n", "    return s\n"),
+    "agent text printed raw": ("src/synthe_risk.py", "    return _CONTROL.sub(esc, s)\n", "    return s\n"),
     "approval does not pin the commit": ("src/synthe_approve.py", '{**params, "commit": commit}, budget=budget)',
                                     "params, budget=budget)"),
     "approval lifetime unbounded": ("src/synthe_approve.py", "    if not 0 < expires_in_min <= MAX_EXPIRES_MIN:\n",
@@ -31,7 +31,7 @@ MUTATIONS = {
                                  "    if False:\n"),
     "plaintext approver key accepted": ("src/synthe_sign.py", "        if require_encrypted:\n            raise KeyFileError(",
                                         "        if False:\n            raise KeyFileError("),
-    "risk never assessed": ("src/synthe_approve.py", "    if not found:\n        return {\"tier\": \"routine\", \"reasons\": []}",
+    "risk never assessed": ("src/synthe_risk.py", "    if not found:\n        return {\"tier\": \"routine\", \"reasons\": []}",
                             "    if True:\n        return {\"tier\": \"routine\", \"reasons\": []}"),
     "high-risk check skipped": ("src/synthe_approve.py",
                                 '        if assess(detail)["tier"] == "high" and not confirm_commit(detail):',
@@ -46,8 +46,8 @@ MUTATIONS = {
     "card hides the commit the check asks for": ("src/synthe_approve.py",
                                                  "{_full(eff.get('commit')) if risk['tier'] == 'high' else _short(eff.get('commit'))}",
                                                  "{_short(eff.get('commit'))}"),
-    "missing evidence treated as routine": ("src/synthe_approve.py",
-                                            'if not isinstance(detail.get("changes"), dict) or ch.get("available") is not True:',
+    "missing evidence treated as routine": ("src/synthe_risk.py",
+                                            'if not isinstance(changes, dict) or ch.get("available") is not True:',
                                             'if ch.get("available") is False:'),
     "touch id prompt hides the risk": ("src/synthe_approve.py",
                                        '    prefix = {"high": "HIGH-RISK: ", "review": "CHECK: "}.get(risk["tier"], "")',
