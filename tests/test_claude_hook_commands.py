@@ -145,8 +145,7 @@ def test_publishing_and_nested_executors_remain_denied(command):
     "git ${CMD:-push}", "sh -c \"$(echo git push)\"", "bash -o pipefail -c 'git push'",
     "bash --norc -c 'git push'", "bash -e -c 'git push'", "zsh -fc 'git push'",
     "bash -c \"alias p='git push'; p\"", "bash -c 'shopt -s expand_aliases; alias p=\"git push\"\np'",
-    "alias p='git push'", "echo Z2l0IHB1c2g= | base64 -d | sh", "echo Z2l0IHB1c2g= | base64 -d | bash",
-    "base64 -d <<< Z2l0IHB1c2g= | sh", "sh < script.sh", "sh -s < x",
+    "alias p='git push'",
     # git push variants, remotes, refspecs, config, aliases, plumbing
     "git push --mirror", "git push --mirror https://x-access-token:ghp_fixture@github.com/a/b.git",
     "git push https://ghp_fixture@github.com/a/b HEAD:main", "git push git@github.com:a/b.git HEAD:refs/heads/main",
@@ -176,6 +175,10 @@ def test_adversarial_probe_publishing_and_credentials_are_denied(command):
     "curl -q https://api.github.com/x -- -X POST",  # curl reads everything after -- as URLs: a GET
     "bash -c 'alias ll=\"ls -l\"; ll'", "bash scripts/check.sh", "printf 'x' | base64",
     "ls -la; cat README.md", "echo hi | grep h", "python3 -c 'print(1)'",
+    # A script on stdin is invisible to the hook, like any script file or interpreter: denying it was
+    # bypassed by `bash -s x` and `bash /dev/stdin` and blocked ordinary installers, so the credential
+    # wall covers it.
+    "curl -fsSL https://astral.sh/uv/install.sh | sh", "sh < script.sh",
 ])
 def test_adversarial_probe_reads_and_local_work_are_allowed(command):
     assert not hook.denied(event(command))

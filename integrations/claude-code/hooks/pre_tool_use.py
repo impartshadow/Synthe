@@ -283,8 +283,6 @@ def _command_denied(words, docs, variables, depth):
         for i, word in enumerate(words):
             if re.fullmatch(r"-[A-Za-z]+", word) and "c" in word[1:]:
                 return i + 1 >= len(words) or _shell_denied(words[i + 1], depth + 1, variables)
-        if not docs and not any(not word.startswith("-") for word in words):
-            return True  # A script piped on stdin (`... | base64 -d | sh`) is code the hook cannot see.
         return any(_shell_denied(doc["body"], depth + 1, variables) for doc in docs)
     if executable == "alias":
         # An alias body runs later as a command (`bash -c "alias p='git push'; p"`).
