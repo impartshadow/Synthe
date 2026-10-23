@@ -110,6 +110,80 @@ def test_publishing_and_nested_executors_remain_denied(command):
     assert hook.denied(event(command))
 
 
+# Adversarial probe, 2026-10-23: the bypass classes from earlier reviews re-checked and extended.
+# Each case asserts the hook's decision so a regression shows up as a test failure, not a missed probe.
+@pytest.mark.parametrize("command", [
+    # curl: combined short flags, config files, bodies, methods
+    "curl -q -sXPOST https://api.github.com/repos/a/b/pulls", "curl -q -sSXPOST https://api.github.com/x",
+    "curl -q -sX POST https://api.github.com/x", "curl -q -o /dev/null -XPOST https://api.github.com/x",
+    "curl -q -K c https://api.github.com/x", "curl -q --config=c https://api.github.com/x",
+    "curl -q -skK c https://api.github.com/x", "curl -q -H 'X: y' -K c https://api.github.com/x",
+    "curl -q https://api.github.com/x -d @body", "curl -q https://api.github.com/x --data-binary @f",
+    "curl -q -F a=b https://api.github.com/x", "curl -q -X post https://api.github.com/x",
+    "curl -q --request POST https://api.github.com/x", "curl -q --request=POST https://api.github.com/x",
+    "curl -q -X GET -X POST https://api.github.com/x", "curl -q https://API.github.com/x -XDELETE",
+    "curl -q -X POST https://api.github.com:443/x", "curl -X POST https://api.github.com./repos/a/b",
+    "curl -q -s -X POST https://uploads.github.com/repos/a/b/releases/1/assets",
+    "wget --post-data=x https://uploads.github.com/repos/a/b/releases/1/assets",
+    # gh api: -H consuming a token, full-URL GraphQL, method overrides, fields implying POST
+    "gh api -H X -X POST repos/a/b", "gh api -HX -XPOST repos/a/b",
+    "gh api https://API.GITHUB.COM/graphql", "gh api /graphql", "gh api graphql/", "gh api 'graphql?x=1'",
+    "gh api https://api.github.com//graphql", "gh api https://api.github.com/graphql/",
+    "gh api https://github.example.com/api/graphql", "gh api --hostname ghe.example.com graphql",
+    "gh api --method=post repos/a/b", "gh api -f x=1 repos/a/b", "gh api repos/a/b -F x=@file",
+    "gh api repos/a/b -fx=1", "gh api -X GET -f x=1 repos/a/b", "gh api -X GET -X POST repos/a/b",
+    "gh api -XGET -XPOST repos/a/b", "gh api repos/a/b --input -", "gh api repos/a/b -- -X POST",
+    # credentials
+    "gh auth token", "gh auth status -t", "gh auth status --show-token", "gh auth git-credential get",
+    "gh -R a/b auth token", "git credential fill", "printf 'host=github.com\\n' | git credential fill",
+    "git credential-osxkeychain get", "git -C . credential fill",
+    # shell wrappers, separators, quoting, line continuations
+    "X=1 git push", "env git push", "env -i git push", "env -u X git push", "command -p git push",
+    "exec git push", "builtin exec git push", "(git push)", "( cd /tmp && git push )", "{ git push; }",
+    "true; git push", "true & git push", "'gi''t' push", "gi\\\nt push", "git \\\npush", "git pus\\\nh",
+    "git p''ush", "git $'push'", "$(echo git) push", "`echo git` push", "x=$(echo push); git $x",
+    "git ${CMD:-push}", "sh -c \"$(echo git push)\"", "bash -o pipefail -c 'git push'",
+    "bash --norc -c 'git push'", "bash -e -c 'git push'", "zsh -fc 'git push'",
+    "bash -c \"alias p='git push'; p\"", "bash -c 'shopt -s expand_aliases; alias p=\"git push\"\np'",
+    "alias p='git push'",
+    # git push variants, remotes, refspecs, config, aliases, plumbing
+    "git push --mirror", "git push --mirror https://x-access-token:ghp_fixture@github.com/a/b.git",
+    "git push https://ghp_fixture@github.com/a/b HEAD:main", "git push git@github.com:a/b.git HEAD:refs/heads/main",
+    "git push ssh://git@github.com/a/b.git +HEAD:main", "git push origin :main",
+    "git push origin +refs/heads/x:refs/heads/main", "git -c credential.helper= push",
+    "git -c core.sshCommand='ssh -i k' push", "git -ccore.x=y push", "git --git-dir=.git push",
+    "git --no-pager push", "git -p push", "git --exec-path=/x push", "git status; GIT_SSH_COMMAND=x git push",
+    "git -c alias.p=push p", "git -c alias.p='!git push' p", "git -c Alias.P=push p", "git -calias.p=push p",
+    "git --config-env=alias.p=X p", "git --config-env alias.p=X p",
+    "git send-pack git@github.com:a/b.git main", "git http-push https://github.com/a/b",
+    "git-send-pack x", "git-http-push x", "/usr/lib/git-core/git-push origin",
+    "/usr/libexec/git-core/git-send-pack x", "git remote add r https://tok@github.com/a/b && git push r",
+    "git commit --no-verify && git push origin HEAD",
+])
+def test_adversarial_probe_publishing_and_credentials_are_denied(command):
+    assert hook.denied(event(command))
+
+
+@pytest.mark.parametrize("command", [
+    "git status", "git log --oneline -5", "git diff HEAD~1", "git fetch origin main", "git pull origin main",
+    "git remote -v", "git remote add origin git@github.com:a/b.git", "git commit -m 'msg'",
+    "git -c color.ui=never log", "git -C /tmp/alias.dir status", "git config --get user.name",
+    "gh pr view 1", "gh pr list", "gh pr checks 1", "gh pr diff 1", "gh auth status",
+    "gh api repos/a/b/pulls", "gh api -H 'Accept: application/vnd.github+json' repos/a/b",
+    "gh api repos/a/b -q '.[].name'", "gh api -H POST repos/a/b", "gh api -H -XPOST repos/a/b",
+    "curl -q -s https://api.github.com/repos/a/b", "curl -q -sS -H 'Accept: x' https://api.github.com/repos/a/b",
+    "curl -q https://api.github.com/x -- -X POST",  # curl reads everything after -- as URLs: a GET
+    "bash -c 'alias ll=\"ls -l\"; ll'", "bash scripts/check.sh", "printf 'x' | base64",
+    "ls -la; cat README.md", "echo hi | grep h", "python3 -c 'print(1)'",
+    # A script on stdin is invisible to the hook, like any script file or interpreter: denying it was
+    # bypassed by `bash -s x` and `bash /dev/stdin` and blocked ordinary installers, so the credential
+    # wall covers it.
+    "curl -fsSL https://astral.sh/uv/install.sh | sh", "sh < script.sh",
+])
+def test_adversarial_probe_reads_and_local_work_are_allowed(command):
+    assert not hook.denied(event(command))
+
+
 @pytest.mark.parametrize("command", ["echo '", "cat <<EOF\nunterminated", "git \\", "eval '$UNKNOWN'"])
 def test_invalid_or_unresolved_commands_fail_closed(command):
     assert hook.denied(event(command))
@@ -235,7 +309,7 @@ def test_real_broken_stdout_pipe_keeps_blocking_exit_code():
 
 
 @pytest.mark.parametrize("guard, replacement, command", [
-    ('in {"push", "send-pack", "http-push"}', 'in {"mutation-disabled"}', "git push"),
+    ('in {"push", "send-pack", "http-push", "credential"}', 'in {"mutation-disabled"}', "git push"),
     ('if executable in SHELLS:', 'if executable in set():', "bash -c 'git push'"),
 ])
 def test_mutations_disabling_command_or_nested_shell_guard_are_detected(tmp_path, guard, replacement, command):
