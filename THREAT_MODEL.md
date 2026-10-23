@@ -203,7 +203,7 @@ keeps the sealed Ed25519 key as a recovery fallback. Details: [`docs/TOUCHID.md`
 ## v0.6: lane grants and delegate approvers
 
 A human may sign a bounded grant (receiver, remote, branch pattern, paths, uses, expiry, policy
-lineage). With a `delegate`, each push under it also needs that delegate's own signed approval of the
+lineage; since v0.7 uses and expiry are optional, see below). With a `delegate`, each push under it also needs that delegate's own signed approval of the
 exact staged commit: a reviewing model approves in the human's place, inside limits the human signed.
 Without a delegate, the grant itself approves (an unattended lane). Details:
 [`docs/COMMIT.md`](docs/COMMIT.md) "Lane grants and delegate approvers".
@@ -215,7 +215,7 @@ Without a delegate, the grant itself approves (an unattended lane). Details:
 | A delegate pre-approves a commit it never saw, or the agent swaps the commit after review | the approval pins the remote, branch and commit of the broker's staged record, and is matched again at commit time and at dispatch |
 | An agent re-pushes until the reviewer says yes | an escalation sticks to the proposal (key + action) for every later commit; only a human approves it |
 | Escalation or revocation races the push | the delegate approval and the grant are read again under the lane lock immediately before `git push`; a use is reserved only after that |
-| A long-lived delegate approval is replayed | at most 60 minutes, never past the grant; the grant's uses, expiry and lineage still apply |
+| A long-lived delegate approval is replayed | at most 60 minutes (also under a grant without expiry), never past the grant; the grant's uses, expiry and lineage still apply |
 | Policy or approvers change after the grant was signed | the grant carries their digests: any change makes it `template_stale` |
 
 Limits (say these plainly): a delegate model can be fooled, for example by instructions planted in
@@ -225,6 +225,48 @@ or prompt produced the decision. The delegate key must live in its own process a
 isolation), never in an agent's; a delegate key an agent can read is an agent approving itself. A grant
 without a delegate has no per-push reviewer at all: it trades review for speed within its limits.
 Content proposals are not delegated yet (they wait for a human).
+
+## v0.7: risk-aware and standing lanes
+
+A grant may list the risk tiers it approves without a human (`"auto_approve": ["routine", "review"]`, the
+default for new grants; `src/synthe_risk.py`, shared with the approval card). Anything else, and any push
+that touches a path outside the grant, is staged for a human instead of pushed. A grant may also omit its
+use limit and expiry: a standing lane. Details: [`docs/COMMIT.md`](docs/COMMIT.md) "Risk-aware lanes".
+
+| Threat | Mechanism | Reason code |
+|---|---|---|
+| A CI workflow, dependency file or secret-like file slips through an unattended lane | the broker classifies the exact range it is about to push, on its own mirror, under the lane lock immediately before dispatch; a tier the grant doesn't list stays staged for a human, no use spent | `risk_escalated` |
+| The risky file hides in an intermediate commit and the tip looks clean | every path of every pushed commit is classified, not the net diff; renames count both paths | `risk_escalated` |
+| The agent describes the push as harmless | the classification reads only the broker's copy (paths, line counts, deletions, commit count); agent text is never an input | — |
+| A commit is restaged after it was classified | dispatch classifies again, under the lane lock, whatever was classified at staging | `risk_escalated` |
+| A fooled delegate approves a high-risk push | the tier is checked before the delegate is asked and again before its approval is read at dispatch; a delegate approval for an escalated push is refused | `risk_escalated` |
+| The agent re-proposes until the grant takes it, or the sweeper re-dispatches an escalated push | an escalated proposal is covered only by a human approval; a new commit is classified on its own merits | — |
+| A grant's tiers widened, or the field dropped, after signing | `auto_approve` is in the signed body; unknown, empty or duplicate tiers are refused | `template_signature_invalid`, `template_malformed` |
+| The risk rules are loosened after a grant was signed | a risk-aware grant's lineage pins the digest of the effective rules (operator lists and built-in defaults) | `template_stale` |
+| A push on the lane's branch touches files outside the grant | staged for a human like any push without a lane (no use spent); receiver-policy paths are still denied outright | `outside_lane_paths`, `path_forbidden`, ... |
+| A limit stripped from a signed grant, or "unlimited" smuggled in as a malformed value | only an absent field means "no limit", and absence is covered by the signature; present but malformed limits are refused | `template_signature_invalid`, `template_malformed` |
+
+Limits (say these plainly):
+
+- **Risk is a heuristic.** It reads paths and sizes, not code. A malicious change to an ordinary-looking
+  source file (`src/app.py`), small enough and in few enough commits, is `routine` and goes out unattended.
+  The tiers catch the changes that most often matter (CI, dependency manifests and lockfiles, build
+  scripts, secrets-like files, deletions, very large diffs); they are not a review. With the default
+  `["routine", "review"]`, dependency and lockfile changes, Dockerfiles, build scripts, `CODEOWNERS`,
+  small deletions and diffs of 200-399 lines also go out unattended; sign `["routine"]` to be asked about
+  them.
+- **Patterns are the operator's policy.** An operator who replaces the path lists can weaken them; the
+  grant then goes stale and a human re-signs, but nothing judges whether the new list is wise.
+- **Splitting.** Many small routine pushes are each routine. The grant's branch and path limits, and its
+  use limit if it has one, bound that.
+- **Grants without `auto_approve`** (signed before v0.7) approve every tier, as before.
+- **A standing lane is a standing permission.** A grant signed without `max_uses` or `expires_at` keeps
+  approving until a human revokes it or it goes stale. What still bounds it: its receiver, remote and
+  branch pattern; its paths (anything outside goes to a human); the receiver policy (owned, allowed and
+  forbidden paths, denied outright); risk escalation; fast-forward only; revocation by any trusted human;
+  and staleness when the policy, approvers, effects config or risk rules change. Nothing bounds how many
+  pushes it carries or for how long; an agent that is compromised while the lane stands can use it until
+  someone notices. Prefer limits for lanes nobody watches.
 
 ## Out of scope: what it does NOT stop (be honest about these)
 

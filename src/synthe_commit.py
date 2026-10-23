@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import handoff_check as hc  # noqa: E402
 import synthe_crypto as sc  # noqa: E402
 import synthe_plan as sp    # noqa: E402
+import synthe_risk          # noqa: E402
 import synthe_sign as ss    # noqa: E402
 
 VERSION = "0.6.0"
@@ -927,7 +928,9 @@ class GitPush:
         if _git(["-C", mirror, "cat-file", "-t", commit], check=False).stdout.strip() != "commit":
             return {"available": False, "note": "the broker's mirror no longer holds this commit"}
         if base is None:
-            new = _git(["-C", mirror, "rev-list", "--reverse", commit, "--not", "--all"],
+            # What the remote already has: its fetched refs only. Not --all: the proposal's own ref (and an
+            # agent's sandbox refs) reach the commit itself, which left only the tip commit on the card.
+            new = _git(["-C", mirror, "rev-list", "--reverse", commit, "--not", "--glob=refs/synthe/remotes/*"],
                        check=False).stdout.split()
             first = new[0] if new else commit
             parent = _git(["-C", mirror, "rev-parse", "--verify", "-q", f"{first}^"], check=False).stdout.strip()
@@ -940,12 +943,25 @@ class GitPush:
         diff = ["-C", mirror, "diff", "--no-color", "--no-ext-diff", "--no-textconv", base, commit]
         fields = _git(diff[:3] + ["-z", "--name-status", "--no-renames", base, commit], check=False).stdout.split("\0")
         files = [{"status": s, "path": p} for s, p in zip(fields[0::2], fields[1::2]) if s and p]
+        # Every path every pushed commit touches, not just the net diff (renames as delete + add): the
+        # remote receives each intermediate commit, so a workflow added and removed again still counts.
+        out = iter(_git(["-C", mirror, "log", "-z", "--format=", "--name-status", "--no-renames", "-m", *span],
+                        check=False).stdout.split("\0"))
+        touched = []
+        for status in out:
+            status = status.strip("\n")
+            path = next(out, "") if status else ""
+            if status and path:
+                touched.append({"status": status, "path": path})
+        touched = list({(t["status"], t["path"]): t for t in touched}.values())
+        count = _git(["-C", mirror, "rev-list", "--count", *span], check=False).stdout.strip()
         stat = _git(diff[:3] + ["--shortstat", base, commit], check=False).stdout.strip()
         patch = _git(diff, check=False).stdout
         truncated = len(patch.encode("utf-8", "surrogateescape")) > max_patch
         if truncated:
             patch = patch.encode("utf-8", "surrogateescape")[:max_patch].decode("utf-8", "replace")
         return {"available": True, "base": base, "commit": commit, "commits": commits, "files": files,
+                "touched": touched, "commit_count": int(count) if count.isdigit() else len(commits),
                 "stat": stat, "patch": patch, "patch_truncated": truncated}
 
     def bundle_ref(self, name, ref, have: str | None = None) -> dict:
@@ -1203,7 +1219,8 @@ class GitPush:
         if dry_run:
             return {"before": before, "observed": {"commits": len(commits), "paths": paths, "base": base_sha}}
         if getattr(self, "authorize_dispatch", None):
-            self.authorize_dispatch(paths)
+            # the exact range about to be pushed: a lane grant judges it here (paths, risk tier), at dispatch
+            self.authorize_dispatch(paths, {"base": base_sha, "commit": commit})
         lease = f"--force-with-lease=refs/heads/{branch}:{before or ''}"
         push = _git([*pre, "-C", str(self.mirror), "push", "--porcelain", "--no-verify", lease, url,
                      f"{commit}:refs/heads/{branch}"], env=env, check=False)
@@ -1338,6 +1355,60 @@ DELEGATE_WAIT_CODES = {"delegate_approval_missing", "delegate_approval_expired",
                        "delegate_escalated"}
 
 
+# A lane grant that doesn't cover a push sends it to a human (waiting_for label: the reason code).
+ESCALATION_WAIT = {"outside_lane_paths": "scope", "risk_escalated": "risk"}
+
+
+class LaneEscalated(Deny):
+    """The lane's grant doesn't cover this push: it touches paths outside the grant (`outside_lane_paths`),
+    or it is a risk tier a risk-aware grant doesn't approve (`risk_escalated`). It stays staged for a human's
+    normal approval: nothing pushed, no use spent, the delegate not asked. `fields` go into the receipt
+    (`lane_scope` or `risk`). Raised under the lane lock, from the broker's own copy of the push."""
+
+    def __init__(self, code: str, message: str, fields: dict):
+        super().__init__("blocked", code, message)
+        self.fields = fields
+
+
+def _risk_message(risk: dict) -> str:
+    return (f"needs a human: a {risk['tier']}-risk push ({'; '.join(risk['reasons'][:3])}); grant "
+            f"'{risk['template_id']}' approves only {' and '.join(risk['auto_approve'])} pushes without one")
+
+
+def _lane_escalation(cfg: BrokerConfig, eff, grant: dict, paths: list, base: str, commit: str):
+    """(LaneEscalated or None, receipt fields) for pushing `commit` over `base` under `grant`. Paths outside
+    the grant's path_scope go to a human (a push the lane doesn't cover is treated like any other push; the
+    receiver policy and forbidden_paths were checked before this and still deny outright). Then, for a
+    risk-aware grant, the risk tier."""
+    outside = [p for p in paths if not any_match(grant["path_scope"], p)]
+    if outside:
+        scope = {"template_id": grant["template_id"], "path_scope": list(grant["path_scope"]),
+                 "outside_paths": outside[:synthe_risk.MAX_RISK_PATHS], "outside_count": len(outside),
+                 "commit": commit}
+        shown = ", ".join(synthe_risk.clean(p, True) for p in outside[:3]) + (" ..." if len(outside) > 3 else "")
+        return LaneEscalated("outside_lane_paths", f"needs a human: {len(outside)} path(s) outside grant "
+                                                   f"'{grant['template_id']}' ({shown})", {"lane_scope": scope}), \
+            {"lane_scope": scope}
+    if "auto_approve" not in grant:
+        return None, {}
+    risk = _lane_risk(cfg, eff, grant, base, commit)
+    esc = LaneEscalated("risk_escalated", _risk_message(risk), {"risk": risk}) if risk["escalated"] else None
+    return esc, {"risk": risk}
+
+
+def _lane_risk(cfg: BrokerConfig, eff, grant: dict, base: str, commit: str) -> dict:
+    """The broker's own classification (synthe_risk) of pushing `commit` over `base` under a risk-aware
+    grant: every path of every commit in the range, from its mirror, never the agent's description. Paths
+    and counts only, never file contents. `escalated`: the grant doesn't list this tier."""
+    import synthe_lane_templates as lanes
+    rules = lanes.risk_rules(cfg)
+    found = synthe_risk.assess_change(eff.describe(commit, base), rules)
+    return {"tier": found["tier"], "reasons": found["reasons"], "paths": found["paths"],
+            "sensitive_paths": found["sensitive_paths"], "auto_approve": list(grant["auto_approve"]),
+            "template_id": grant["template_id"], "commit": commit, "base": base,
+            "rules_digest": synthe_risk.rules_digest(rules), "escalated": not lanes.auto_approves(grant, found["tier"])}
+
+
 # --------------------------------------------------------------------------
 # detached approvals (v0.5): signed apart from the packet, stored append-only
 
@@ -1423,7 +1494,7 @@ def staged_view(cfg: BrokerConfig, idempotency_key: str | None = None) -> list:
                 out.append({"idempotency_key": key, "action": action, "handoff_id": rec.get("handoff_id"),
                             **{k: rec.get(k) for k in ("state", "params", "waiting_for", "commits_from",
                                                        "staged_at", "receipt_seq", "last_receipt_seq",
-                                                       "attempts", "updated_at")}})
+                                                       "attempts", "updated_at", "risk", "lane_scope")}})
     return out
 
 
@@ -1453,6 +1524,9 @@ def staged_detail(cfg: BrokerConfig, staged_id: str, max_patch: int = 200_000) -
            "effect": {k: params.get(k) for k in ("remote", "branch", "commit", "expected_old")},
            "packet": {k: v for k, v in packet.items() if k in ("handoff", "signature")},
            "agent_says": {"purpose": h.get("purpose")}}
+    for k in ("risk", "lane_scope"):  # why its grant sent it to a human (the card shows it)
+        if isinstance(rec.get(k), dict):
+            out[k] = rec[k]
     # The budget the approval will bind: the packet's explicit authority.budget
     # with the receiver's defaults.budget merged in, exactly as the checker
     # applies them (apply_receiver_defaults). From the broker's own registry
@@ -1620,8 +1694,11 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
 
         # 3. a trusted human approved exactly this effect (in the packet, or detached); under a grant that
         #    names a delegate, otherwise the delegate approved this exact commit. A grant without a delegate
-        #    stands in for the approval itself (checked again, and a use reserved, at dispatch).
-        if not pending and (not lane or lane.get("delegate")):
+        #    stands in for the approval itself (checked again, and a use reserved, at dispatch). A human's
+        #    approval is looked for first under any grant: a push the grant sent to a human (outside its
+        #    paths, or too risky) is committed by that human's approval, never by the grant.
+        human_gap = None  # why no human approval covers this yet (what an escalation then waits for)
+        if not pending:
             try:
                 receipt["approvals"] = _approvals_for(h, registry, action, etype, params, at, extra,
                                                       require_commit_pin=_needs_commit_pin(cfg, etype))
@@ -1629,9 +1706,10 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
             except Deny as d:
                 if d.reason["code"] not in APPROVAL_CODES:
                     raise
+                human_gap = d.reason
                 if not lane:
                     pending = [d.reason]
-                else:
+                elif lane.get("delegate"):
                     try:
                         receipt["approvals"] = [lanes.delegate_approval(cfg, registry, h, action, params, lane)]
                     except Deny as dd:
@@ -1686,9 +1764,11 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
             if _staged and _staged.get("content_parent") not in (None, prep["parent"]):
                 prep["rebased_onto"] = prep["parent"]
         scope = _scope(registry, h)
-        if pending:
+        if pending:  # a grant still in play also says now whether it covers the push (who is asked meanwhile)
             return _stage(cfg, finish, packet, h, token, action, params, prep, eff, scope, pending, origin,
-                          receipt["commits_from"], fingerprint, _staged)
+                          receipt["commits_from"], fingerprint, _staged, human_gap=human_gap,
+                          classify=(lambda paths, base, commit: _lane_escalation(cfg, eff, lane, paths, base, commit))
+                          if lane else None)
 
         # 5. inside the claim fence: live check, effect, observe, receipt
         try:
@@ -1699,7 +1779,7 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
                 # Revalidate and reserve under the shared lane lock at dispatch.
                 # Revocation cannot race a push after returning successfully.
                 if lane:
-                    def authorize(paths):
+                    def authorize(paths, pushing):
                         # Signed registry: enforced once a genesis key is pinned
                         # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
                         current_registry, error = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
@@ -1711,6 +1791,13 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
                                                   as_receiver=cfg.receiver_id)
                         if not valid:
                             raise _DenyMany(why)
+                        # Does the grant cover the exact range being pushed, now (its paths; for a risk-aware
+                        # grant, its tier)? A restaged commit is judged anew.
+                        grant = lanes.select(cfg, current_registry, h.get("to"), params, template_id=lane["template_id"])
+                        escalation, seen = _lane_escalation(cfg, eff, grant, paths, pushing["base"], pushing["commit"])
+                        receipt.update(seen)
+                        if escalation:  # before the delegate is asked, before a use is spent
+                            raise escalation
                         if lane.get("delegate"):  # escalated or expired since: nothing is pushed, no use spent
                             receipt["approvals"] = [lanes.delegate_approval(cfg, current_registry, h, action, params, lane)]
                         receipt["lane_template"] = lanes.reserve(cfg, h.get("to"), params, paths, lane["template_id"])
@@ -1738,6 +1825,11 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
                     out = {**receipt, "decision": decision, "receipt_error": str(exc)}
                 laps.lap("receipt")
             laps.lap("fence")  # recording the effect on the claim, under the lock
+        except LaneEscalated as esc:
+            # The grant doesn't cover this push: nothing was pushed and no use spent. Held staged until a
+            # human approves it (a normal human approval, which spends no use either).
+            return _stage(cfg, finish, packet, h, token, action, params, prep, eff, scope, [_gap(human_gap, action),
+                          esc.reason], origin, receipt["commits_from"], fingerprint, _staged, escalated=esc)
         except hc.FenceError as exc:
             # A concurrent identical proposal may have completed while this
             # one waited for the fence. Re-read the exact stored result before
@@ -1777,12 +1869,23 @@ def _replay_problem(cfg, h, token, action) -> dict | None:
     return None
 
 
+def _gap(human_gap, action) -> dict:
+    """The approval an escalated push waits for (so `synthe-approve` lists it)."""
+    return human_gap or {"state": "blocked", "code": "approval_missing",
+                         "message": f"'{action}' needs a human's approval"}
+
+
 def _stage(cfg, finish, packet, h, token, action, params, prep, eff, scope, pending, origin, commits_from,
-           effect_fingerprint, staged) -> dict:
+           effect_fingerprint, staged, human_gap=None, classify=None, escalated=None) -> dict:
     """Hold a proposal that waits only for its approval or an upstream. It must
     be this claim's (token, RESERVED, effect not yet run) and pass every live
     check now; it is pinned to the remote state it saw, so any later move is
-    caught (remote_moved) when it commits."""
+    caught (remote_moved) when it commits.
+
+    Under a lane grant (`classify`), the broker also checks now whether the grant covers the push (its
+    paths; a risk-aware grant's tiers): if not, it waits for a human, and the delegate is not asked.
+    `escalated`: the LaneEscalated dispatch already raised. Either way dispatch judges it again; this only
+    decides who is asked meanwhile."""
     key = h["idempotency_key"]
     with hc.LockedLedger(cfg.ledger_path) as locked:
         entry = locked.ledger.get(key)
@@ -1802,7 +1905,16 @@ def _stage(cfg, finish, packet, h, token, action, params, prep, eff, scope, pend
     # Content proposals are re-checked by the blobs they cite (and rebased when
     # those are unchanged), so they aren't pinned to the tip seen now.
     pinned = prep["expected_old"] or ("cited-blobs" if prep.get("content") else preview["before"] or "new")
+    if escalated is None and classify is not None:
+        found, _ = classify(preview["observed"]["paths"], preview["observed"]["base"], prep["commit"])
+        if found is not None:
+            escalated = found
+            gap = [] if any(r["code"] in APPROVAL_CODES for r in pending) else [_gap(human_gap, action)]
+            pending = gap + [r for r in pending if r["code"] not in DELEGATE_WAIT_CODES - {"delegate_escalated"}] \
+                + [found.reason]
+    fields = escalated.fields if escalated is not None else {}
     waiting = sorted({"approval" if r["code"] in APPROVAL_CODES else "escalated" if r["code"] == "delegate_escalated"
+                      else ESCALATION_WAIT[r["code"]] if r["code"] in ESCALATION_WAIT
                       else "review" if r["code"] in DELEGATE_WAIT_CODES else "dependency" for r in pending})
     sid = f"{key}/{action}"
     with _staged_store(cfg) as box:
@@ -1816,12 +1928,12 @@ def _stage(cfg, finish, packet, h, token, action, params, prep, eff, scope, pend
     out = finish("staged", list(pending) + [note],
                  staged={"id": sid, "waiting_for": waiting, "expected_old": pinned,
                          **({"supersedes": supersedes} if supersedes else {})},
-                 observed=preview["observed"])
+                 observed=preview["observed"], **fields)
     now = hc.now_utc().isoformat()
     with _staged_store(cfg) as box:
         box["data"].setdefault(key, {})[action] = {
             "id": sid, "state": "STAGED", "handoff_id": h.get("id"), "packet": packet, "claim_token": token,
-            "action": action, "commits_from": commits_from,
+            "action": action, "commits_from": commits_from, **fields,
             "params": params if prep.get("content") and not prep["expected_old"] else {**params, "expected_old": pinned},
             "effect_fingerprint": effect_fingerprint,
             "origin": origin, "waiting_for": waiting, "receipt_seq": out.get("seq"),
@@ -1857,14 +1969,17 @@ def _staged_ready(cfg: BrokerConfig, rec: dict) -> bool:
                               defer_approvals=mediated if lane else mediated - {action}, as_receiver=cfg.receiver_id)
     if not ok:
         return not _approval_only(reasons, info, action)
-    if not lane or lane.get("delegate"):
+    # Sent to a human by its grant: only a human's approval covers it now, neither the grant nor its delegate
+    # (else the sweeper would re-dispatch it, and re-escalate it, forever).
+    held = bool(set(ESCALATION_WAIT.values()) & set(rec.get("waiting_for") or []))
+    if not lane or lane.get("delegate") or held:
         try:
             _approvals_for(h, registry, action, etype, rec["params"], at, extra,
                            require_commit_pin=_needs_commit_pin(cfg, etype))
         except Deny as d:
             if d.reason["code"] not in APPROVAL_CODES:
                 return True
-            if not lane:
+            if not lane or held:
                 return False
             try:
                 lanes.delegate_approval(cfg, registry, h, action, rec["params"], lane)
@@ -2074,7 +2189,8 @@ def delegate_grant(cfg: BrokerConfig, staged_id) -> dict:
     return {"id": staged_id, "state": rec.get("state"), "template_id": t.get("template_id"),
             "delegate": t.get("delegate"), "granted_by": t.get("approver"),
             # the human's own words to the reviewer, signed with the grant, and the limits it signed
-            "brief": t.get("brief"), "limits": {k: t.get(k) for k in ("params", "path_scope", "max_uses", "expires_at")}
+            "brief": t.get("brief"),
+            "limits": {k: t.get(k) for k in ("params", "path_scope", "max_uses", "expires_at", "auto_approve")}
             if t else None, "decisions": lanes.delegate_view(cfg, staged_id)}
 
 

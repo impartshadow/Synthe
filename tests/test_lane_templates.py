@@ -39,8 +39,18 @@ def test_no_grant_still_needs_approval(w):
 def test_actual_paths_not_agent_declared_paths(w):
     lanes.submit(w.cfg,grant(w))
     r=push(w,files={'tests/outside.py':'no'})
-    assert r['decision']=='denied' and 'template_scope' in codes(r)
+    # outside the grant's paths: not the grant's to approve, so it waits for a human (tests/test_risk_lanes.py)
+    assert r['decision']=='staged' and 'outside_lane_paths' in codes(r)
+    assert r['lane_scope']['outside_paths']==['tests/outside.py'] and w.remote_ref('feature/a') is None
     assert lanes.view(w.cfg)['templates'][0]['uses_left']==2
+
+def test_reserve_itself_refuses_paths_outside_the_grant(w):
+    # The broker stages such a push for a human before it gets here (outside_lane_paths); reserve is the last line.
+    lanes.submit(w.cfg,grant(w))
+    with lanes.locked(w.cfg):
+        with pytest.raises(cm.Deny,match='template scope'):
+            lanes.reserve(w.cfg,'builder',{'remote':'origin','branch':'feature/x'},['src/app.py','tests/x.py'],'lane-1')
+    assert lanes.load(w.cfg)['uses'].get('lane-1',0)==0
 
 def test_revoked_and_exhausted_cannot_execute(w):
     lanes.submit(w.cfg,grant(w,max_uses=1))
