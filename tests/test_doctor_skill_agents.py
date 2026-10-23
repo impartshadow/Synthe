@@ -66,3 +66,25 @@ def test_multiple_agents_with_no_readable_config_warn_with_the_command_to_run(tm
 def test_other_failures_are_still_a_missing_skill(tmp_path):
     oc = FakeOpenClaw(tmp_path, ["main"], {}, top={"ok": False, "error": {"message": "unknown skill synthe"}})
     assert si._skill_check(oc) == ("WARN", "synthe skill", "the synthe skill is missing or ineligible")
+
+
+def _wire(tmp_path, monkeypatch, oc):
+    integ = tmp_path / "integ"
+    (integ / "skill" / "synthe").mkdir(parents=True)
+    monkeypatch.setattr(si, "integration_dir", lambda: integ)
+    steps = si.wire_openclaw(oc, tmp_path / "home", True)
+    return [a for a in oc.calls if a[:2] == ("skills", "install")], steps
+
+
+def test_setup_installs_the_skill_for_each_configured_agent(tmp_path, monkeypatch):
+    oc = FakeOpenClaw(tmp_path, ["coordinator", "writer"], {})
+    installs, steps = _wire(tmp_path, monkeypatch, oc)
+    assert [a[a.index("--agent") + 1] for a in installs] == ["coordinator", "writer"]
+    assert {name for name, _, _ in steps} >= {"skill (coordinator)", "skill (writer)"}
+
+
+def test_setup_without_listed_agents_installs_the_skill_once(tmp_path, monkeypatch):
+    oc = FakeOpenClaw(tmp_path, [], {})
+    oc.cfg.unlink()
+    installs, _ = _wire(tmp_path, monkeypatch, oc)
+    assert len(installs) == 1 and "--agent" not in installs[0]
