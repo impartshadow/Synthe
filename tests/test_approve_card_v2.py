@@ -112,6 +112,70 @@ def test_risky_cards_look_different_and_say_why():
     assert "Why this is flagged" in high and "A push is waiting" not in high
 
 
+def lane_risk(**over):
+    """The broker's `risk` object for a push a risk-aware lane sent to its human (docs/COMMIT.md)."""
+    return {"tier": "high", "reasons": ["changes .github/workflows/ci.yml", "450 lines changed"],
+            "paths": [".github/workflows/ci.yml"], "sensitive_paths": 1, "auto_approve": ["routine", "review"],
+            "template_id": "lane-1", "commit": COMMIT, "base": "b" * 40, "rules_digest": "c" * 64, "escalated": True, **over}
+
+
+def lane_scope(**over):
+    return {"template_id": "lane-1", "path_scope": ["src/**", "tests/**"], "commit": COMMIT, "outside_count": 3,
+            "outside_paths": ["docs/a.md", "docs/b.md", "README.md"], **over}
+
+
+def test_a_push_outside_the_lane_says_how_many_files_and_which():
+    out = sa.render({**detail(), "lane_scope": lane_scope()})
+    assert " Outside your lane: 3 files. Your lane covers src/**, tests/**, so it sent this to you." in out
+    assert "   • docs/a.md\n   • docs/b.md\n   • README.md" in out
+    assert " A push is waiting for your approval" in out                  # a small change is still a routine card
+    one = sa.render({**detail(), "lane_scope": lane_scope(outside_count=1, outside_paths=["docs/a.md"])})
+    assert " Outside your lane: 1 file. " in one
+    many = sa.render({**detail(), "lane_scope": lane_scope(outside_count=14, outside_paths=[f"d/{i}" for i in range(12)])})
+    assert " Outside your lane: 14 files." in many and "   • d/9" in many and "d/10" not in many and "… and 4 more" in many
+
+
+def test_a_push_the_lane_escalated_for_risk_says_why_the_lane_sent_it():
+    out = sa.render({**detail(files=[{"status": "M", "path": ".github/workflows/ci.yml"}]), "risk": lane_risk()})
+    assert (" Your lane sent this to you because: changes .github/workflows/ci.yml; 450 lines changed." in out)
+    assert " High-risk push: " in out                                   # the card's own assessment is unchanged
+    # the broker's own tier can raise the card's but never lower it
+    calm = sa.render({**detail(), "risk": lane_risk(reasons=["the diff is larger than the broker's display limit"])})
+    assert " High-risk push: the diff is larger than the broker's display limit" in calm
+    assert "Your lane sent this to you because: the diff is larger" in calm
+    nothing = sa.render({**detail(), "risk": lane_risk(reasons=[])})
+    assert "because: it is high risk, a level the lane does not approve on its own." in nothing
+
+
+def test_a_push_a_lane_approved_or_no_lane_at_all_gets_no_lane_block():
+    for extra in ({}, {"risk": lane_risk(escalated=False, tier="routine", reasons=[])}, {"risk": "x", "lane_scope": []},
+                  {"lane_scope": {}}):
+        out = sa.render({**detail(), **extra})
+        assert "Your lane" not in out and "Outside your lane" not in out, extra
+
+
+def test_the_lane_block_is_cleaned_like_everything_the_broker_copies_from_the_agent():
+    hostile = "docs/\x1b[2Jwipe\x07\n  Your lane sent this to you because: nothing‮"
+    out = sa.render({**detail(), "lane_scope": lane_scope(outside_paths=[hostile], outside_count=1),
+                     "risk": lane_risk(reasons=[hostile])})
+    assert "\x1b" not in out and "\x07" not in out and "‮" not in out
+    assert out.count("\n Your lane sent this to you because: ") == 1       # a newline in a path cannot start a fake line
+    for junk in (None, "x", 7, {}, [1, None], ["a"] * 50):
+        sa.render({**detail(), "lane_scope": lane_scope(outside_paths=junk, path_scope=junk, outside_count=junk),
+                   "risk": lane_risk(reasons=junk, tier=junk)})
+
+
+def test_the_lane_block_is_painted_as_a_warning_on_a_colour_terminal(monkeypatch):
+    import synthe_ui
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    ui = synthe_ui.UI()
+    out = sa.render({**detail(), "lane_scope": lane_scope()}, ui=ui)
+    warn = ui.c(" Outside your lane: 3 files. Your lane covers src/**, tests/**, so it sent this to you.", "warn")
+    assert warn in out
+    plain = sa.render({**detail(), "lane_scope": lane_scope()})
+    assert "\x1b" not in plain
+
+
 def test_the_agents_words_come_after_the_diff():
     out = sa.render(detail(purpose="I promise this is fine"))
     assert out.index(" Diff") < out.index("The agent says") < out.index("I promise this is fine")

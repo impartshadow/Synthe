@@ -3,21 +3,24 @@
 """Lane grants from your own terminal, in one command (behind `synthe-task grant|grants|revoke-grant`).
 
   synthe-task grant [--branch 'agent/*'] [--paths 'src/**,tests/**'] [--uses 50] [--until 7d]
-                    [--remote origin] [--agent openclaw] [--delegate ID] [--brief TEXT] [--passphrase]
+                    [--auto-approve routine,review] [--remote origin] [--agent openclaw] [--delegate ID]
+                    [--brief TEXT] [--passphrase]
   synthe-task grants [--all]
   synthe-task revoke-grant ID
 
 A lane grant (synthe_lane_templates.py) lets pushes inside its limits go out without asking you each
-time: one agent, git_push only, a branch pattern, the files it may touch, a number of uses, an expiry.
-`grant` fills what it can from your setup (remote, agent, branches, allowed paths), shows what you are
-about to allow in plain words, asks, then signs with your key (Touch ID if you enrolled one, otherwise
-your passphrase) and hands it to the broker. The broker computes the lineage digests the grant is
-signed against and re-checks everything at every push; this file only builds, shows and signs.
+time: one agent, git_push only, a branch pattern, the files it may touch, the risk tiers it approves, and
+optionally a number of uses and an expiry. `grant` fills what it can from your setup (remote, agent,
+branches, allowed paths), shows what you are about to allow in plain words, asks, then signs with your key
+(Touch ID if you enrolled one, otherwise your passphrase) and hands it to the broker. The broker computes
+the lineage digests the grant is signed against and re-checks everything at every push; this file only
+builds, shows and signs.
 
-By default a lane has no use limit and no expiry: it stays open until you revoke it. --uses and --until
-cap it if you want one. (The grant schema requires both, so "none" is the largest values the broker
-accepts: 10000 uses and the year 9999.) What a lane never covers are the stops: main, master and patterns
-that reach them, and the policy's forbidden paths.
+By default a lane has no use limit and no expiry: it stays open until you revoke it. A grant that omits
+`max_uses` or `expires_at` has no such limit; --uses and --until add one. It approves routine and review
+pushes on its own (`auto_approve`, the broker's default; --auto-approve routine,review,high overrides it):
+a high-risk push, and a push that touches files outside the lane's paths, wait for you. What a lane never
+covers are the stops: main, master and patterns that reach them, and the policy's forbidden paths.
 
 Only you can run it: it needs a terminal you are typing in, and the signature needs your passphrase or
 your finger. There is no --yes. An unattended lane trades review for speed within its limits: while it
@@ -38,12 +41,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import handoff_check as hc  # noqa: E402
 import synthe_client as scl  # noqa: E402
 import synthe_lane_templates as lanes  # noqa: E402
+import synthe_risk  # noqa: E402
 import synthe_sign as ss  # noqa: E402
 import synthe_touchid as touchid  # noqa: E402
 import synthe_ui as sui  # noqa: E402
 
-UNLIMITED_USES = 10000      # the schema needs a number; this is the most the broker accepts (lanes.validate)
-NO_EXPIRY = dt.datetime(9999, 1, 1, tzinfo=dt.timezone.utc)   # ...and a date: no upper bound is checked
+MAX_USES = lanes.MAX_USES   # what --uses may cap a lane at; a lane with no cap carries no max_uses at all
+# Lanes opened before limits were optional used these in place of "none": still shown as no limit / no expiry.
+LEGACY_NO_LIMIT = 10000
+NO_EXPIRY = dt.datetime(9999, 1, 1, tzinfo=dt.timezone.utc)   # --until this far out is the same as leaving it out
 MIN_MINUTES = 5
 REFUSED_BRANCHES = ("main", "master")   # also anything that matches them: '*', '**', 'ma*'
 RENEW_WITHIN = dt.timedelta(hours=24)
@@ -62,6 +68,7 @@ EXPLAIN = {
                                   "after enrolling Touch ID the admin step must run first)",
     "delegate_invalid": "the delegate isn't a registered model approver (see docs/COMMIT.md)",
     "template_malformed": "the broker found the grant malformed",
+    "risk_rules_invalid": "the risk rules in the broker's config are malformed (effects.git_push.risk); fix them first",
 }
 
 
@@ -76,11 +83,27 @@ def _join(items: list) -> str:
 
 
 def unlimited_uses(t: dict) -> bool:
-    return t["max_uses"] >= UNLIMITED_USES
+    return t.get("max_uses") is None or t["max_uses"] >= LEGACY_NO_LIMIT
 
 
-def no_expiry(end: dt.datetime) -> bool:
-    return end >= NO_EXPIRY
+def no_expiry(end: dt.datetime | None) -> bool:
+    return end is None or end >= NO_EXPIRY
+
+
+def expiry_of(t: dict) -> dt.datetime | None:
+    """When a grant ends; None for a grant that carries no `expires_at`."""
+    return hc.parse_ts(t["expires_at"]) if t.get("expires_at") else None
+
+
+def parse_tiers(value) -> list:
+    """--auto-approve: the risk tiers the grant approves on its own, as the broker wants them (distinct, known)."""
+    items = [x.lower() for x in (_csv(value) if isinstance(value, str) else list(value or []))]
+    bad = [x for x in items if x not in synthe_risk.TIERS]
+    if bad or not items:
+        raise SystemExit(f"--auto-approve {value if isinstance(value, str) else ','.join(map(str, items))!r}: "
+                         + (f"unknown tier {bad[0]!r}; " if bad else "name at least one tier; ")
+                         + f"choose from {', '.join(synthe_risk.TIERS)} (e.g. routine,review)")
+    return [t for t in synthe_risk.TIERS if t in items]
 
 
 def parse_until(text: str, now: dt.datetime, tz=None) -> dt.datetime:
@@ -156,16 +179,77 @@ def _local(when: dt.datetime, tz=None) -> str:
     return f"{d:%a %b} {d.day} {d:%H:%M %Z}".strip()
 
 
-def summary(body: dict, policy: dict | None = None, tz=None) -> str:
-    """What this grant allows, in plain words, for the person about to sign it."""
-    n, until = body["max_uses"], hc.parse_ts(body["expires_at"])
+TIER_NAMES = {"routine": "routine", "review": "review-level", "high": "high-risk"}
+CI_HINTS = (".github/", ".gitlab-ci", ".circleci", "jenkinsfile", "azure-pipelines", ".buildkite")
+SECRET_HINTS = (".pem", ".key", "id_rsa", "id_ed25519", ".env", "secret", "credential")
+
+
+def _kinds(patterns, limit: int = 3) -> list:
+    """A tier's path patterns from the broker's rules, in words: CI workflows and key files by name, any other
+    pattern (the operator's own) as written."""
+    pats = [synthe_risk.clean(p, True) for p in patterns if isinstance(p, str)]
+    ci = any(h in p.lower() for p in pats for h in CI_HINTS)
+    secret = any(h in p.lower() for p in pats for h in SECRET_HINTS)
+    other = [p for p in pats if not any(h in p.lower() for h in CI_HINTS + SECRET_HINTS)]
+    return ["CI workflows"] * ci + ["key and secret files"] * secret + other[:limit] + ["..."] * (len(other) > limit)
+
+
+REVIEW_KINDS = (("dependency manifests and lockfiles", ("package", "lock", "requirements", "go.sum", "go.mod", "cargo",
+                                                          "pyproject", "gemfile", "pom.xml", "gradle")),
+                ("Dockerfiles", ("dockerfile",)),
+                ("build scripts", ("setup.py", "makefile", "scripts/", "bin/", ".sh")))
+
+
+def _review_kinds(patterns, limit: int = 3) -> list:
+    """The review tier's path patterns from the broker's rules, in words; a pattern that is none of these
+    kinds (the operator's own, CODEOWNERS) is shown as written."""
+    pats = [synthe_risk.clean(p, True) for p in patterns if isinstance(p, str)]
+    words = [name for name, hints in REVIEW_KINDS if any(h in p.lower() for p in pats for h in hints)]
+    other = [p for p in pats if not any(h in p.lower() for _, hints in REVIEW_KINDS for h in hints)]
+    return words + other[:limit] + ["..."] * (len(other) > limit)
+
+
+def risk_words(tier: str, rules: dict | None) -> str:
+    """What makes a push this risky, as the broker's rules (the draft's `risk_rules`) have it, in a parenthesis."""
+    r = rules if isinstance(rules, dict) else {}
+    if tier == "high":
+        what = _kinds(r.get("high_paths") or synthe_risk.HIGH_PATHS)
+        what += [f"{r.get('high_lines', synthe_risk.HIGH_LINES)}+ changed lines", "mass deletions",
+                 f"{r.get('high_commits', synthe_risk.HIGH_COMMITS)}+ commits"]
+    else:
+        what = _review_kinds(r.get("review_paths") or synthe_risk.REVIEW_PATHS)
+        what += [f"{r.get('review_lines', synthe_risk.REVIEW_LINES)}+ changed lines", "any deletion"]
+    return "(" + ", ".join(what) + ", per the broker's rules)"
+
+
+def interrupts(body: dict, rules: dict | None = None) -> str:
+    """What still asks you inside this lane, in plain words."""
+    if "auto_approve" not in body:
+        return ("This grant is not risk-aware: it lets every kind of push through, high-risk ones included. "
+                "Pushes outside these paths still ask you.")
+    left = [t for t in synthe_risk.TIERS if t not in body["auto_approve"]]
+    if not left:
+        return "It lets every risk level through. Only pushes outside these paths still ask you."
+    names = " and ".join(f"{TIER_NAMES[t]} pushes {risk_words(t, rules)}" if t != "routine" else "routine pushes"
+                         for t in left)
+    text = (f"{names[0].upper()}{names[1:]} and pushes outside these paths still ask you. "
+            f"The risk check reads paths and sizes, not code.")
+    if "review" in body["auto_approve"] and "high" in left:  # the default: say what goes out, and how to make it ask
+        text += (f" Review-level changes {risk_words('review', rules)} go out without asking you "
+                 f"(synthe-notify digest lists them afterwards); --auto-approve routine makes them ask too.")
+    return text
+
+
+def summary(body: dict, policy: dict | None = None, tz=None, rules: dict | None = None) -> str:
+    """What this grant allows, in plain words, for the person about to sign it. `rules` are the broker's risk
+    rules (from the draft), so the words about what counts as high-risk are the ones it will apply."""
+    n, until = body.get("max_uses"), expiry_of(body)
     where = body["params"]["branch_pattern"] + ("" if body["params"]["remote"] == "origin"
                                                   else f" on {body['params']['remote']}")
     limit = "with no limit on pushes" if unlimited_uses(body) else "once" if n == 1 else f"up to {n} times"
     lines = [f"Agent {body['receiver']} may push to {where} changing {_join(body['path_scope'])}, {limit}, "
              + ("with no expiry." if no_expiry(until) else f"until {_local(until, tz)}."),
-             "Pushes to other branches still ask you. A push on this branch that touches other files is refused, "
-             "not asked about."]
+             "Pushes to other branches still ask you. " + interrupts(body, rules)]
     if "delegate" in body:
         lines.append(f"Each push in the lane is reviewed by {body['delegate']} instead of you; it can send a push "
                      f"back to you. It may approve what a fooled reviewer would: the limits above are the bound.")
@@ -184,18 +268,20 @@ def summary(body: dict, policy: dict | None = None, tz=None) -> str:
 # ---- building, signing, submitting -----------------------------------------------------------
 
 def plan(s: dict, *, client, branch: str, paths: list, uses: int | None = None, until: str | None = None,
-         remote: str = "origin",
+         remote: str = "origin", auto_approve=None,
          receiver: str | None = None, delegate: str | None = None, brief: str | None = None,
          now: dt.datetime | None = None, template_id: str | None = None, tz=None) -> tuple[dict, str]:
     """The unsigned grant and its summary, after every check that can be made before you sign. `s` is
-    synthe_task.setup_of(home). The broker supplies the lineage digests (op lane_template_draft)."""
+    synthe_task.setup_of(home). The broker supplies the lineage digests (op lane_template_draft) and, when
+    `auto_approve` (the risk tiers the lane approves on its own) is not given, the tiers a new grant carries.
+    No `uses` / `until` means the grant carries no `max_uses` / `expires_at`: that limit does not exist."""
     now = (now or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0)
     receiver = receiver or s["receiver"]
     if receiver != s["receiver"]:
         raise SystemExit(f"--agent {receiver!r}: this setup has one agent, {s['receiver']!r}")
-    uses = UNLIMITED_USES if uses is None else uses
-    if not isinstance(uses, int) or isinstance(uses, bool) or not 1 <= uses <= UNLIMITED_USES:
-        raise SystemExit(f"--uses: between 1 and {UNLIMITED_USES} (leave it out for no limit)")
+    if uses is not None and (not isinstance(uses, int) or isinstance(uses, bool) or not 1 <= uses <= MAX_USES):
+        raise SystemExit(f"--uses: between 1 and {MAX_USES} (leave it out for no limit)")
+    tiers = parse_tiers(auto_approve) if auto_approve is not None else None
     if brief is not None and (not brief.strip() or len(brief) > lanes.MAX_BRIEF):
         raise SystemExit(f"--brief: say something, in up to {lanes.MAX_BRIEF} characters")
     remotes = {"origin": s["remote"].get("branches") or []}
@@ -205,23 +291,33 @@ def plan(s: dict, *, client, branch: str, paths: list, uses: int | None = None, 
             raise SystemExit(f"--remote {remote!r}: the broker has no such remote")
     branch = check_branch(branch, remotes[remote])
     paths = check_paths(paths, s["policy"])
-    end = parse_until(until, now, tz) if until is not None else NO_EXPIRY
+    end = parse_until(until, now, tz) if until is not None else None
     if receiver not in (client.call("lane_templates").get("enabled_receivers") or []):
         raise SystemExit(f"lane grants aren't switched on for {receiver} on this broker. Setups from before they "
                          f"existed need \"lane_templates\": {{\"receivers\": [\"{receiver}\"]}} in "
                          f"{s.get('broker_config') or 'the broker config'}, then a broker restart")
     body = {"template_id": template_id or f"lane-{now:%Y%m%d}-{secrets.token_hex(3)}", "receiver": receiver,
-            "tool": "git_push", "params": {"remote": remote, "branch_pattern": branch}, "path_scope": paths,
-            "max_uses": uses, "expires_at": end.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            "tool": "git_push", "params": {"remote": remote, "branch_pattern": branch}, "path_scope": paths}
+    if uses is not None:
+        body["max_uses"] = uses
+    if end is not None and not no_expiry(end):   # an expiry past the year 9999 is no expiry at all
+        body["expires_at"] = end.strftime("%Y-%m-%dT%H:%M:%SZ")
     if delegate:
         body["delegate"] = delegate
     if brief:
         body["brief"] = brief
     try:
-        body["lineage"] = client.call("lane_template_draft", receiver=receiver)["lineage"]
+        draft = client.call("lane_template_draft", receiver=receiver, **({"delegate": delegate} if delegate else {}),
+                            **({"auto_approve": tiers} if tiers else {}))
+        if tiers is None:  # the broker's default for a new grant; its lineage must be for exactly these tiers
+            tiers = draft.get("auto_approve_default")
+            tiers = parse_tiers(tiers) if isinstance(tiers, list) and tiers else list(lanes.DEFAULT_AUTO_APPROVE)
+            draft = client.call("lane_template_draft", receiver=receiver, auto_approve=tiers,
+                                **({"delegate": delegate} if delegate else {}))
+        body["auto_approve"], body["lineage"] = tiers, draft["lineage"]
     except scl.BrokerError as e:
         raise SystemExit(f"the broker can't prepare a grant: {e.code}: {e.message}")
-    return body, summary(body, s["policy"], tz)
+    return body, summary(body, s["policy"], tz, draft.get("risk_rules"))
 
 
 def unlock_key(home: Path, sender: str, reason: str, passphrase: bool = False, prompt=ss.prompt_passphrase) -> dict:
@@ -278,7 +374,7 @@ def issue(home: Path, *, client=None, key=None, confirm=None, out=print, passphr
         return None
     key = key or unlock_key(home, s["sender"], text.splitlines()[0], passphrase)
     result = submit(client, body, key)
-    end = hc.parse_ts(body["expires_at"])
+    end = expiry_of(body)
     out(f"Lane open: {body['template_id']} ({'no use limit' if unlimited_uses(body) else str(body['max_uses']) + ' uses'}, "
         f"{'no expiry' if no_expiry(end) else 'until ' + _local(end)}).\n"
         f"See it with synthe-task grants; close it any time with synthe-task revoke-grant {body['template_id']}.")
@@ -300,8 +396,10 @@ def renew_command(t: dict) -> str:
     cmd = ["synthe-task", "grant", "--branch", t["params"]["branch_pattern"], "--paths", ",".join(t["path_scope"])]
     if not unlimited_uses(t):
         cmd += ["--uses", str(t["max_uses"])]
-    if not no_expiry(hc.parse_ts(t["expires_at"])):
+    if not no_expiry(expiry_of(t)):
         cmd += ["--until", "7d"]
+    if t.get("auto_approve") and t["auto_approve"] != list(lanes.DEFAULT_AUTO_APPROVE):
+        cmd += ["--auto-approve", ",".join(t["auto_approve"])]
     if t["params"]["remote"] != "origin":
         cmd += ["--remote", t["params"]["remote"]]
     if t.get("delegate"):
@@ -317,15 +415,25 @@ def list_grants(client, now: dt.datetime | None = None) -> list:
     now = now or dt.datetime.now(dt.timezone.utc)
     rows = []
     for t in client.call("lane_templates").get("templates") or []:
-        end = hc.parse_ts(t["expires_at"])
+        end = expiry_of(t)
         hints = []
         if t["status"] == "active":   # a lane with no limit has nothing to run out of
             if not no_expiry(end) and end - now <= RENEW_WITHIN:
                 hints.append(f"expires in {_left(end - now)}")
             if not unlimited_uses(t) and t["uses_left"] < RENEW_USES * t["max_uses"]:
                 hints.append(f"only {t['uses_left']} of {t['max_uses']} uses left")
-        rows.append({**t, "left": end - now, "hints": hints, "renew": renew_command(t)})
-    return sorted(rows, key=lambda r: r["left"], reverse=True)
+        rows.append({**t, "left": None if end is None else end - now, "hints": hints, "renew": renew_command(t)})
+    return sorted(rows, key=lambda r: dt.timedelta.max if r["left"] is None else r["left"], reverse=True)
+
+
+def alone(t: dict) -> str:
+    """Which pushes this grant lets through without asking you, and which still ask."""
+    if "auto_approve" not in t:
+        return "not risk-aware: every kind of push goes out, high-risk ones too; pushes outside its paths ask you"
+    left = [TIER_NAMES.get(x, str(x)) for x in synthe_risk.TIERS if x not in t["auto_approve"]]
+    ask = (_join(left) + " pushes and ") if left else ""
+    return (f"goes out on its own: {_join([TIER_NAMES.get(x, str(x)) for x in t['auto_approve']])}; "
+            f"{ask}pushes outside its paths ask you")
 
 
 def render_grants(rows: list, show_all: bool = False, ui=None, tz=None) -> str:
@@ -342,11 +450,12 @@ def render_grants(rows: list, show_all: bool = False, ui=None, tz=None) -> str:
             out.append(f"{ui.c(r['template_id'], 'brand', bold=True)}  {ui.c(state, 'ok' if r['status'] == 'active' else 'muted')}")
             out.append(f"  {r['receiver']} may push to {r['params']['branch_pattern']} changing "
                        f"{', '.join(r['path_scope'])}{who}")
-            end = hc.parse_ts(r["expires_at"])
+            end = expiry_of(r)
             until = "" if no_expiry(end) else _local(end, tz)
             uses = "no use limit" if unlimited_uses(r) else f"{r['uses_left']} of {r['max_uses']} uses left"
             out.append(f"  {uses}, " + ("no expiry (open until you revoke it)" if no_expiry(end) else
                        f"until {until} (in {_left(r['left'])})" if r["status"] == "active" else f"ended or ends {until}"))
+            out.append("  " + alone(r))
             if r["hints"]:
                 out.append("  " + ui.c("renew soon: " + "; ".join(r["hints"]), "warn", bold=True))
                 out.append(f"  renew: {r['renew']}")
@@ -403,7 +512,8 @@ def offer_lane(home: Path, *, interactive: bool | None = None, ask=input, out=pr
     behaviour, and the only outcome without a person at a terminal: nothing is ever granted silently).
     At a terminal, Return alone picks [2], the recommended choice; it still shows the terms and asks before
     anything is signed. Option 2 is the same code as `synthe-task grant` with the defaults from your setup:
-    its branches and allowed paths, no use limit, no expiry (until you revoke it)."""
+    its branches and allowed paths, the broker's default risk tiers (routine and review go out alone, high-risk
+    and out-of-path pushes ask you), no use limit, no expiry (until you revoke it)."""
     if interactive is None:
         interactive = _terminal()
     later = "Open a lane any time: synthe-task grant"
@@ -439,7 +549,9 @@ def add_parsers(sub) -> None:
     g = sub.add_parser("grant", help="let routine pushes inside a lane go without asking you (signs a lane grant)")
     g.add_argument("--branch", help="branch pattern, e.g. 'agent/*' (default: your setup's branches)")
     g.add_argument("--paths", help="comma-separated globs the agent may change (default: your setup's allowed paths)")
-    g.add_argument("--uses", type=int, help=f"cap the number of pushes, 1 to {UNLIMITED_USES} (default: no limit)")
+    g.add_argument("--uses", type=int, help=f"cap the number of pushes, 1 to {MAX_USES} (default: no limit)")
+    g.add_argument("--auto-approve", metavar="TIERS", help="risk tiers that go out without asking you, from routine,"
+                   " review, high (default: the broker's, routine,review: high-risk pushes still ask you)")
     g.add_argument("--until", help="cap how long it stays open: 90m, 12h, 7d, 2w, or a date (default: no expiry; "
                                    "it stays open until you revoke it)")
     g.add_argument("--remote", default="origin")
@@ -479,7 +591,8 @@ def run(a) -> int:
                              f"{len(patterns)}: {', '.join(patterns) or 'none'})")
         issue(home, client=client, passphrase=a.passphrase, branch=patterns[0],
               paths=_csv(a.paths) if a.paths else list(s["policy"].get("allowed_paths") or []), uses=a.uses,
-              until=a.until, remote=a.remote, receiver=a.agent, delegate=a.delegate, brief=a.brief)
+              until=a.until, remote=a.remote, receiver=a.agent, delegate=a.delegate, brief=a.brief,
+              auto_approve=a.auto_approve)
     except scl.BrokerError as e:
         raise SystemExit(f"synthe-task: {e.code}: {e.message}")
     return 0

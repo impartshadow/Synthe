@@ -45,6 +45,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -59,6 +60,7 @@ WINDOW = 1000            # the broker's `receipts` call returns at most this man
 MAX_RECEIPT_FILE = 256 * 1024 * 1024
 BODY_LIMIT = 230         # desktop banners cut long text; keep it short enough to read at a glance
 BATCH_LIMIT = 3          # more notifications than this in one poll become one summary
+LIST_LIMIT = 10          # lines per list in the digest
 
 # --------------------------------------------------------------------------
 # untrusted text
@@ -236,6 +238,12 @@ MESSAGES = {
     "template_exhausted": ("problem", "a lane grant has no pushes left",
                            "Its allowance is used up. Grant more, or approve pushes yourself."),
     "template_id_reused": ("stop", "someone reused the id of an existing lane grant", "Grant ids are never reused."),
+    "risk_escalated": ("retry", "your lane sent a push to you instead of letting it through",
+                       "It is a riskier kind than the lane approves on its own, so only your approval commits it."),
+    "outside_lane_paths": ("retry", "a push touches files outside your lane, so it was sent to you",
+                           "A lane only covers the files you signed it for; anything else needs your approval."),
+    "risk_rules_invalid": ("problem", "Synthe's risk rules are malformed, so lane pushes wait for you",
+                           "Nothing goes out on its own until the rules in the broker's config are fixed."),
     "template_revocation_invalid": ("stop", "a revocation not signed by a trusted person was ignored",
                                     "Only your signature can revoke a grant."),
     "template_store_corrupt": ("problem", "Synthe cannot read its record of lane grants",
@@ -411,6 +419,61 @@ def listed_paths(reasons) -> list[str]:
     return out
 
 
+# What a lane's own escalation says (the receipt's `risk` and `lane_scope` objects). The broker wrote them,
+# but they carry agent-influenced text (paths), so every string is cleaned and every field type-checked.
+TIER_WORDS = {"routine": "routine", "review": "review-level", "high": "high-risk"}
+PATH_VERBS = {"ci": "changes a CI workflow", "secret": "changes a file that looks like it holds secrets or keys",
+              "build": "changes a build or dependency file"}
+ESCALATIONS = ("risk_escalated", "outside_lane_paths")
+SEE_DIFF = "Run synthe-approve to see the diff."
+
+
+def _strings(x, limit: int, n: int = 50) -> list[str]:
+    return [clean(p, limit) for p in x[:n] if isinstance(p, str)] if isinstance(x, list) else []
+
+
+def _count(x, floor: int) -> int:
+    return x if isinstance(x, int) and not isinstance(x, bool) and x >= floor else floor
+
+
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def risk_words(r: dict, branch: str) -> tuple[str, str]:
+    """(headline, why) for a push your lane sent to you because of its risk."""
+    risk = r.get("risk") if isinstance(r.get("risk"), dict) else {}
+    who = branch or "this push"
+    tier = risk.get("tier") if isinstance(risk.get("tier"), str) and risk["tier"] in TIER_WORDS else None
+    paths, reasons = _strings(risk.get("paths"), 70), _strings(risk.get("reasons"), 80)
+    kind = path_class(paths)
+    if kind:  # the path reasons ("changes x and 2 more") are covered by naming the kind of file
+        extra = [x for x in reasons if not x.startswith("changes ")][:3]
+        said = f"{who} {PATH_VERBS[kind]} ({paths[0]}{', …' if len(paths) > 1 else ''})" + "".join(f"; {x}" for x in extra)
+    elif reasons:
+        said = f"{who}: " + "; ".join(reasons[:3])
+    else:
+        said = f"{who} is a {TIER_WORDS.get(tier, 'riskier')} push"
+    lets = [t for t in _strings(risk.get("auto_approve"), 20, 3) if t in TIER_WORDS]
+    why = (f"Your lane lets {_and([TIER_WORDS[t] for t in lets])} work through; this one is {TIER_WORDS[tier]}."
+           if lets and tier else "Your lane sends this kind of push to you.")
+    return f"Needs you: {said}", f"{why} {SEE_DIFF}"
+
+
+def scope_words(r: dict, branch: str) -> tuple[str, str]:
+    """(headline, why) for a push that touches files outside your lane."""
+    scope = r.get("lane_scope") if isinstance(r.get("lane_scope"), dict) else {}
+    who = branch or "this push"
+    outside, covers = _strings(scope.get("outside_paths"), 70), _strings(scope.get("path_scope"), 70, 3)
+    n = _count(scope.get("outside_count"), len(outside))
+    said = f"{who} changes {n} file{'s' if n != 1 else ''} outside your lane" if n else f"{who} changes files outside your lane"
+    if outside:
+        said += f" ({outside[0]}{', …' if n > 1 else ''})"
+    more = " …" if isinstance(scope.get("path_scope"), list) and len(scope["path_scope"]) > 3 else ""
+    why = f"Your lane covers {_and(covers)}{more}; anything else asks you." if covers else "Your lane does not cover them."
+    return f"Needs you: {said}", f"{why} {SEE_DIFF}"
+
+
 # --------------------------------------------------------------------------
 # one receipt -> what to tell the person (or nothing)
 
@@ -468,7 +531,7 @@ def describe(r: dict) -> dict:
     out = {"seq": r.get("seq"), "time": _s(r.get("time")), "kind": clean(kind, 40) if isinstance(kind, str) else None,
            "decision": clean(decision, 40), "id": proposal_id(r), "branch": _where(r), "level": "quiet",
            "codes": [clean(x.get("code"), 60) for x in reasons], "title": "", "body": "", "known": True,
-           "headline": "", "why": ""}
+           "headline": "", "why": "", "lane": None}
     observed = r.get("observed") if isinstance(r.get("observed"), dict) else {}
     paths = observed.get("paths") if isinstance(observed.get("paths"), list) else []
     on = f" on '{out['branch']}'" if out["branch"] else ""
@@ -484,6 +547,16 @@ def describe(r: dict) -> dict:
             or any(w in low for w in ("await", "pending", "needs_human", "needs_approval"))):
         if decision == "staged" and waits and not set(waits) - QUIET_WAITS:
             return out  # held for its reviewer or another task: Synthe settles that without you
+        codes = {x.get("code") for x in reasons}
+        if decision == "staged" and "risk_rules_invalid" in codes:
+            return say("problem", f"Needs a look: pushes under your lane are waiting for you{on} because the risk "
+                                  f"rules in the broker's config are malformed", "Fix them and the lane works again.")
+        if decision == "staged" and "risk_escalated" in codes:
+            out["lane"] = "risk"
+            return say("waiting", *risk_words(r, out["branch"]))
+        if decision == "staged" and "outside_lane_paths" in codes:
+            out["lane"] = "scope"
+            return say("waiting", *scope_words(r, out["branch"]))
         who = ", ".join(WAIT_WORDS.get(w, clean(w, 30)) for w in waits if w not in QUIET_WAITS) or "you"
         what = f"a push{on}" + (f" ({len(paths)} file{'s' if len(paths) != 1 else ''})" if paths else "")
         if "escalat" in low:
@@ -873,6 +946,32 @@ def parse_time(text) -> dt.datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
+REVIEW_KINDS = {"build": ("dependency or build change", "dependency or build changes"),
+                "file": ("change to a sensitive file", "changes to sensitive files"),
+                "delete": ("deletion", "deletions"), "size": ("larger change", "larger changes"),
+                "commits": ("multi-commit push", "multi-commit pushes"),
+                "other": ("review-level push", "review-level pushes")}
+
+
+def review_kind(r: dict) -> str | None:
+    """For a push that went out under a lane at the review tier (the receipt's `risk` says the lane approved
+    it, `escalated: false`): what kind of change made it review-level, else None."""
+    risk = r.get("risk") if isinstance(r.get("risk"), dict) else {}
+    if risk.get("tier") != "review" or risk.get("escalated") is not False:
+        return None
+    reasons = _strings(risk.get("reasons"), 80)
+    if path_class(_strings(risk.get("paths"), 70)) == "build":
+        return "build"
+    first = reasons[0] if reasons else ""
+    return ("file" if first.startswith("changes ") else "delete" if first.startswith("deletes ")
+            else "size" if "lines changed" in first else "commits" if first.endswith(" commits") else "other")
+
+
+def review_text(r: dict) -> str:
+    risk = r["risk"]
+    return "; ".join(_strings(risk.get("reasons"), 80)[:3]) or "review-level push"
+
+
 def build_digest(receipts: list, days: int = 7, now: dt.datetime | None = None) -> dict:
     """Counts and one line per stop, from receipts that already verified."""
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -882,6 +981,7 @@ def build_digest(receipts: list, days: int = 7, now: dt.datetime | None = None) 
     inside = [(r, e, t) for r, e, t in events if t is not None and t >= since]
     shipped = [(r, e) for r, e, t in inside if r.get("decision") == "executed"]
     asked = {e["id"] for r, e, t in inside if e["level"] == "waiting" and e["id"]}
+    sent = {e["id"]: e["lane"] for r, e, t in inside if e["lane"] and e["id"]}   # why your lane sent it to you
     last = {}  # where each push that needed a person stands now
     for r, e, t in events:
         if e["id"] in asked and r.get("kind") in (None, "effect", "delegate_escalation"):
@@ -902,9 +1002,19 @@ def build_digest(receipts: list, days: int = 7, now: dt.datetime | None = None) 
         item = {k: e[k] for k in ("seq", "time", "branch", "headline", "why", "codes", "decision", "known")}
         item["text"] = e["body"]
         (stops if e["level"] == "stop" else problems).append(item)
+    lane_review = []   # went out under a lane at the review tier: not worth a message, worth seeing afterwards
+    for r, e in shipped:
+        kind = review_kind(r)
+        if kind and e["id"] not in needed:
+            lane_review.append({"seq": e["seq"], "time": e["time"], "branch": e["branch"], "kind": kind,
+                                "text": review_text(r)})
     return {"days": days, "since": since.isoformat(), "until": now.isoformat(),
+            "lane_review": len(lane_review), "lane_review_kinds": dict(Counter(x["kind"] for x in lane_review)),
+            "lane_review_items": lane_review,
             "pushes_shipped": len(shipped), "shipped_without_asking": sum(1 for r, e in shipped if e["id"] not in needed),
             "needed_you": len(asked), "needed_you_shipped": after_you, "needed_you_still_waiting": still,
+            "lane_high_risk": sum(1 for i in asked if sent.get(i) == "risk"),
+            "lane_outside_paths": sum(1 for i in asked if sent.get(i) == "scope"),
             "stopped": len(stops), "problems": len(problems), "routine_refusals": retries,
             "stops": stops, "problem_items": problems}
 
@@ -930,9 +1040,25 @@ def render_digest(d: dict, chain: dict) -> str:
             gone = d["needed_you"] - d["needed_you_shipped"] - d["needed_you_still_waiting"]
             lines.append(f"Of the {d['needed_you']} that needed you: {d['needed_you_shipped']} shipped after you approved, "
                          f"{d['needed_you_still_waiting']} still waiting" + (f", {gone} did not ship." if gone else "."))
+        if d["lane_high_risk"] or d["lane_outside_paths"]:
+            why = [f"{n} {what}" for n, what in ((d["lane_high_risk"], "riskier than your lane lets through"),
+                                                 (d["lane_outside_paths"], "outside your lane's files")) if n]
+            lines.append(f"Your lane sent {d['lane_high_risk'] + d['lane_outside_paths']} of them to you: "
+                         + " and ".join(why) + ". Everything else in the lane went out on its own.")
         if d["routine_refusals"]:
             lines.append(f"Also {_plural(d['routine_refusals'], 'routine refusal')} (a stale branch, a malformed "
                          f"request) that the agent can simply retry.")
+    if d["lane_review"]:
+        kinds = [f"{n} {REVIEW_KINDS[k][n != 1]}" for k, n in d["lane_review_kinds"].items() if k in REVIEW_KINDS]
+        lines += ["", f"{_and(kinds)} went out under your lane without asking you (review level, not high-risk):"]
+        for it in d["lane_review_items"][:LIST_LIMIT]:
+            when = parse_time(it["time"])
+            stamp = when.astimezone().strftime("%b %d %H:%M") if when else "?"
+            lines.append(f"  {stamp}  {it['branch'] or 'a push'}: {it['text']}")
+        if len(d["lane_review_items"]) > LIST_LIMIT:
+            lines.append(f"  ... and {len(d['lane_review_items']) - LIST_LIMIT} more")
+        lines.append("  Your lane lets these through; it reads paths and sizes, not code. "
+                     "synthe-task grant --auto-approve routine would make them ask you.")
     for title, items in (("Stopped", d["stops"]), ("Needed a look", d["problem_items"])):
         if items:
             lines += ["", f"{title}:"]

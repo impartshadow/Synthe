@@ -150,3 +150,55 @@ def test_the_mcp_surface_is_review_only(w):
         ok = call("synthe_review_decide", {"id": f"k1/{PUSH}", "decision": "approve", "commit": sha,
                                            "note": "matches the task"})["result"]["structuredContent"]
     assert [c["decision"] for c in ok["commits"]] == ["executed"]
+
+
+# -- `synthe-approver grant`: the body a human signs ----------------------------------------------------
+
+GRANT = ["grant", "--id", "review-2", "--receiver", "builder", "--delegate", DELEGATE, "--branch", "feature/*",
+         "--paths", "src/**"]
+
+
+def printed(capsys):
+    cap = capsys.readouterr()
+    return json.loads(cap.out), cap.err
+
+
+def test_the_grant_body_has_the_risk_tiers_the_brokers_lineage_and_no_limits_unless_asked(w, capsys):
+    with daemon(w.cfg) as url:
+        assert sap.main([*GRANT, "--broker", url]) == 0
+        body, err = printed(capsys)
+    assert "placeholder" not in err                                      # (the daemon logs to the same stderr)
+    assert body["auto_approve"] == ["routine", "review"] and body["delegate"] == DELEGATE
+    assert "max_uses" not in body and "expires_at" not in body            # omitted: no limit, valid until revoked
+    assert body["lineage"] == lanes.lineage(w.cfg, w.registry, "builder", risk_aware=True)
+    assert "risk_rules_digest" in body["lineage"]
+
+
+def test_the_grant_body_takes_tiers_and_caps_when_you_give_them(w, capsys):
+    with daemon(w.cfg) as url:
+        assert sap.main([*GRANT, "--broker", url, "--auto-approve", "review,routine", "--max-uses", "5", "--hours", "24",
+                         "--brief", "src only"]) == 0
+        body, _ = printed(capsys)
+    assert body["auto_approve"] == ["routine", "review"] and body["max_uses"] == 5 and body["brief"] == "src only"
+    assert dt.datetime.strptime(body["expires_at"], "%Y-%m-%dT%H:%M:%SZ") .replace(tzinfo=dt.timezone.utc) > dt.datetime.now(dt.timezone.utc)
+    assert body["lineage"] == lanes.lineage(w.cfg, w.registry, "builder", risk_aware=True)
+
+
+def test_the_grant_body_without_broker_access_says_the_lineage_is_a_placeholder(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("SYNTHE_BROKER", raising=False)
+    monkeypatch.setattr(scl, "configured_broker", lambda: None)
+    assert sap.main(GRANT) == 0
+    body, err = printed(capsys)
+    assert body["lineage"] == sap.LINEAGE_PLACEHOLDER and body["auto_approve"] == ["routine", "review"]
+    assert err.startswith("# lineage left as a placeholder (broker_unset:") and "refuses a grant" in err
+    assert sap.main([*GRANT, "--broker", f"unix://{tmp_path}/nobody.sock"]) == 0
+    body, err = printed(capsys)
+    assert body["lineage"] == sap.LINEAGE_PLACEHOLDER and "lineage left as a placeholder" in err
+
+
+@pytest.mark.parametrize("extra", [["--auto-approve", "severe"], ["--auto-approve", ""], ["--max-uses", "0"],
+                                   ["--max-uses", "10001"], ["--hours", "0"]])
+def test_the_grant_body_refuses_what_the_broker_would(extra, capsys):
+    with pytest.raises(SystemExit) as e:
+        sap.main([*GRANT, *extra])
+    assert e.value.code == 2 and capsys.readouterr().out == ""
