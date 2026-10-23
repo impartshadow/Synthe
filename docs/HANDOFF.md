@@ -23,13 +23,11 @@ Dockerfiles and build scripts go out without asking under the default lane (revi
 weekly digest lists them afterwards; only high-risk pushes (CI workflows, secret-like files, large
 deletions or diffs) and out-of-lane pushes ask the person.
 
-## Known failing on this branch right now (fix in the integration task)
+## Test status
 
-1. `tests/test_task_grant.py::test_a_push_on_the_lanes_branch_but_outside_its_paths_is_refused_not_asked_about`:
-   behaviour changed on purpose; out-of-lane pushes now ask the person. Update the test and the
-   "refused, not asked about" wording.
-2. `tests/test_notify.py::test_every_reason_code_has_a_message`: add messages for `risk_escalated`,
-   `outside_lane_paths`, `risk_rules_invalid`.
+The integration merge (escalation notifications, risk-tier grants without encoded limits, approval
+card wording) fixed the two earlier failures: lanes, risk, notify, approve and approver tests pass
+(338). The full suite has not been re-run since; run it first.
 
 Environment-only failures in the cloud sandbox (it runs as root, package not installed): 19 in
 `tests/test_install_entrypoint.py`, 4 in `tests/test_plugin_mcp_startup.py`. They should pass on a Mac.
@@ -37,26 +35,36 @@ Baseline before this work: 1648 passed, those 23 failed.
 
 ## Still to do
 
-### A. Integration (smaller; do first)
-- Fix the two tests above. Notifier texts for escalations, built from the receipt's `risk` /
-  `lane_scope` objects ("Needs you: this push changes a CI workflow (.github/workflows/ci.yml)").
-- `synthe-task grant`: send `auto_approve` (default from the broker's `lane_template_draft` op,
-  `--auto-approve` to override), get lineage via `lane_template_draft {"receiver", "auto_approve"}`,
-  and OMIT `max_uses` / `expires_at` when no `--uses` / `--until` (remove the 10000 / 9999-01-01
-  encoding). Summary text lists what still asks the person, derived from the broker's real high-tier
-  rules, and must not claim dependency changes ask.
-- `synthe-approver grant`: include `auto_approve` and real lineage.
-- Approval card (`src/synthe_approve.py`): say "outside your lane: N files" and "your lane sent this to
-  you because: …".
+### A. Integration (items 1–4 DONE and merged; finish 5–7)
+- DONE: escalation notifications, `synthe-task grant` with `auto_approve` and omitted limits,
+  `synthe-approver grant`, approval card wording, digest lists review-tier pushes.
 - `synthe-notify install-agent / uninstall-agent` (macOS LaunchAgent, Linux `systemd --user`); setup
   offers to turn notifications on (in the person's account, never the agent's); install script lists
   `synthe-notify`.
-- Digest: list review-tier pushes that went out under a lane ("3 dependency changes went out").
 - Quickstart rewritten around install → choose the autonomous lane + notifications → work → only hear
   from Synthe when it matters.
 
-### B. Self-issued tasks (larger, security-critical)
-Implement `docs/design/SELF_ISSUED_TASKS.md` with these overrides: no default limits (max tasks,
+### B. Self-issued tasks (larger, security-critical; about half written)
+A previous session wrote most of the code but no new tests and no docs. It is saved as
+`docs/handoff/self-issue-wip.patch` (one commit, based on f1fe05c; it applies cleanly to this branch
+with `git am -3 docs/handoff/self-issue-wip.patch`). Written: checker (new signing domain
+`synthe/handoff-signature/self-issued/v1`, `trusted_senders`, the `self_issue_*` checks), grant
+field `self_issue` with optional limits, broker `issue_task` op with `task_issue` receipts and
+`task_origin` on later receipts, revoke/expiry kill unlanded tasks, issuer key in setup,
+git-remote-synthe issuing on a plain push. Known breakages in the patch (4 tests):
+`test_git_push_proposal.py::test_a_push_with_no_task_for_the_branch_is_refused_and_says_what_to_do`
+and `::test_an_expired_task_is_not_used` (map `self_issue_not_granted` back to `no_task_for_branch`
+with a lane hint in git-remote-synthe), and two in `test_task_grant.py` that compare the
+`lane_templates` config exactly (it now carries `self_issue`). Still to write: `tests/test_self_issue.py`
+(end to end), `tests/test_self_issue_mutations.py`, SPEC.md v0.7, THREAT_MODEL.md, docs/COMMIT.md,
+docs/REDTEAM.md, `schema/handoff.schema.json` (`issued_under_grant`; `additionalProperties: false`
+rejects it today), `scripts/redteam_live.py` battery, notifier support for `task_issue_refused` and the
+`self_issue_*` codes, `--self-issue` on `synthe-task grant`. Re-copy `src/handoff_check.py` and
+`src/synthe_crypto.py` into `github-action/checker/` after checker changes. Decision noted: for
+self-issued tasks an out-of-lane push is refused (`path_outside_scope`), not escalated, because the
+task's paths sit inside the grant's; only human-signed tasks escalate with `outside_lane_paths`.
+
+The full brief: implement `docs/design/SELF_ISSUED_TASKS.md` with these overrides: no default limits (max tasks,
 open tasks, rate all optional); revoking or expiring the grant kills unlanded self-issued tasks;
 default purpose on a plain `git push` is the tip commit's subject (`-o synthe.purpose=` overrides);
 self-issue requires the grant not to auto-approve "high" (or to have a delegate); separate

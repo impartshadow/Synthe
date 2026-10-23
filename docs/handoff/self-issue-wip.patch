@@ -1,0 +1,2057 @@
+From 1e60fbb711189b152087294ed8a70627e6df2e47 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 20:07:47 +0000
+Subject: [PATCH] WIP: self-issued tasks inside a human-signed lane (broker,
+ checker, helper)
+
+Checker: trusted_senders ceiling (sender_not_trusted), self-issued signing
+domain, issued_under_grant shape/purpose checks, step 2b issuance checks.
+Broker: issue_task op with task_issue receipts, issue store, optional limits,
+grant re-checks at claim/propose/staged/dispatch, task_origin on receipts.
+Setup: synthe-issuer key and registry entry, trusted_senders by default.
+git-remote-synthe: issue fallback with persisted request_id, push options.
+Tests and docs not yet written.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NnrcvVvFKeuF1GegUYTuoM
+---
+ deploy/docker/setup.py                 |   1 +
+ deploy/linux/install.sh                |   3 +-
+ deploy/linux/systemd_test.sh           |   1 +
+ deploy/macos/install.sh                |   3 +-
+ github-action/checker/handoff_check.py | 172 +++++++++-
+ github-action/checker/synthe_crypto.py |  27 ++
+ src/handoff_check.py                   | 172 +++++++++-
+ src/synthe_broker.py                   |  96 ++++--
+ src/synthe_commit.py                   | 458 +++++++++++++++++++++++--
+ src/synthe_crypto.py                   |  27 ++
+ src/synthe_git_remote.py               | 184 +++++++++-
+ src/synthe_init.py                     |  48 ++-
+ src/synthe_lane_templates.py           | 167 ++++++++-
+ src/synthe_plan.py                     |  14 +
+ src/synthe_sign.py                     |   4 +-
+ tests/test_task_grant.py               |   2 +-
+ 16 files changed, 1296 insertions(+), 83 deletions(-)
+
+diff --git a/deploy/docker/setup.py b/deploy/docker/setup.py
+index 6d82461..2187268 100755
+--- a/deploy/docker/setup.py
++++ b/deploy/docker/setup.py
+@@ -101,6 +101,7 @@ def stage(a, out: Path) -> dict:
+         "forbidden": ["force_push"],
+         "approval_required_for": ["git_push"],
+         "trusted_approvers": sorted(approvers),
++        "trusted_senders": sorted(approvers),   # v0.7: only these humans sign this agent's tasks
+         "budget": {"tokens": 500000, "usd": 25, "minutes": 240},
+         "require_signatures": True, "require_signed_approvals": True,
+         "require_planned_actions": True,
+diff --git a/deploy/linux/install.sh b/deploy/linux/install.sh
+index 6f1bf4b..4024d68 100755
+--- a/deploy/linux/install.sh
++++ b/deploy/linux/install.sh
+@@ -6,7 +6,8 @@
+ #
+ # Creates the system user `synthe`, copies the code to /opt/synthe/src (root-
+ # owned, so neither the broker nor an agent can change it), makes a venv with
+-# `cryptography` (constant-time Ed25519), creates the broker key and config in
++# `cryptography` (constant-time Ed25519), creates the broker key, the task issuer
++# key (v0.7: it signs tasks the broker issues under a lane grant) and config in
+ # /var/lib/synthe (0700, owned by synthe) with isolation mode "user" and
+ # clients = [AGENT_USER], and installs the systemd unit. It does NOT start the
+ # broker: add the registry and the GitHub token first (printed at the end).
+diff --git a/deploy/linux/systemd_test.sh b/deploy/linux/systemd_test.sh
+index ff4c547..72c28f7 100755
+--- a/deploy/linux/systemd_test.sh
++++ b/deploy/linux/systemd_test.sh
+@@ -67,6 +67,7 @@ check "/var/lib/synthe is 0700 synthe" test "$(stat -c '%a %U' /var/lib/synthe)"
+ check "the broker key is 0600 synthe" test "$(stat -c '%a %U' /var/lib/synthe/keys/synthe-broker.key.json)" = "600 synthe"
+ out=$(as agent1 cat /var/lib/synthe/keys/synthe-broker.key.json 2>&1 || true)
+ check "agent1 cannot read the key: ${out##*: }" grep -q "Permission denied" <<<"$out"
++check "the task issuer key is 0600 synthe" test "$(stat -c '%a %U' /var/lib/synthe/keys/synthe-issuer.key.json)" = "600 synthe"
+ 
+ C=(python3 /opt/synthe/src/synthe_client.py --broker unix:///run/synthe/broker.sock)
+ as agent1 git config --global --add safe.directory /srv/git/remote.git
+diff --git a/deploy/macos/install.sh b/deploy/macos/install.sh
+index d933cf9..e1400c0 100755
+--- a/deploy/macos/install.sh
++++ b/deploy/macos/install.sh
+@@ -7,7 +7,8 @@
+ #
+ # Creates the hidden user and group `_synthe` (uid/gid below 500), copies the
+ # code to /Library/Synthe/src (root-owned), makes /Library/Synthe/venv with
+-# `cryptography`, creates the broker key and config in /var/db/synthe (0700,
++# `cryptography`, creates the broker key, the task issuer key (v0.7: it signs
++# tasks the broker issues under a lane grant) and config in /var/db/synthe (0700,
+ # owned by _synthe) with isolation mode "user" and clients = [AGENT_USER], and
+ # installs /Library/LaunchDaemons/com.synthe.broker.plist. The plist is world-
+ # readable, so it never holds a token: the GitHub token goes in a 0600 file
+diff --git a/github-action/checker/handoff_check.py b/github-action/checker/handoff_check.py
+index 11b1d83..18fecfc 100755
+--- a/github-action/checker/handoff_check.py
++++ b/github-action/checker/handoff_check.py
+@@ -881,7 +881,8 @@ def parse_utc(value) -> tuple[dt.datetime | None, str | None]:
+ 
+ 
+ _LIST_SETS = ("forbidden", "approval_required_for", "forbidden_paths")  # restrictions: union
+-_LIST_CEILINGS = ("allowed_tools", "trusted_approvers")    # grants: intersection
++# grants: intersection. trusted_senders (v0.7): who may sign a task for this receiver; absent = anyone registered
++_LIST_CEILINGS = ("allowed_tools", "trusted_approvers", "trusted_senders")
+ _FLAGS = ("require_signatures", "require_signed_approvals", "verify_evidence",
+           "require_planned_actions", "exclusive_paths",
+           "require_capability_declaration", "require_topology")  # v0.6
+@@ -892,6 +893,134 @@ def _is_number(v) -> bool:
+     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+ 
+ 
++# v0.7 self-issued tasks (SPEC section 16): a handoff the broker's task issuer signed under a lane grant
++# a human signed, which it embeds verbatim (`issued_under_grant`). The grant's `self_issue` object names
++# the issuer and may narrow what such a task can be; these are its defaults.
++ISSUER_KIND = "task_issuer"
++SELF_ISSUE_DEFAULT_TOOLS = ("edit_files", "git_push")
++# A task's lifetime when its grant names no task_hours: the grant's own expiry, or, for a grant without
++# one (a standing lane), 30 days. The receiver's max_ttl_hours still caps it, like any handoff.
++SELF_ISSUE_DEFAULT_TASK_HOURS = 720
++SELF_ISSUE_DEFAULT_PURPOSE_CHARS = 280
++SELF_ISSUE_MAX_PURPOSE_CHARS = 1000
++_ISSUED_FIELDS = {"grant", "issue", "issued_at", "request_id"}
++
++
++def self_issue_purpose_limit(grant) -> int:
++    si = grant.get("self_issue") if isinstance(grant, dict) else None
++    n = si.get("max_purpose_chars") if isinstance(si, dict) else None
++    ok = isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= SELF_ISSUE_MAX_PURPOSE_CHARS
++    return n if ok else SELF_ISSUE_DEFAULT_PURPOSE_CHARS
++
++
++def self_issue_purpose_problem(text, limit: int = SELF_ISSUE_DEFAULT_PURPOSE_CHARS) -> str | None:
++    """Why an agent-written purpose can't go into a self-issued task, or None. It is shown to people and
++    reviewers as data, so it is one line of NFC text with no control or format characters (no terminal
++    escapes, no bidi overrides, no line or paragraph separators), within the grant's length limit."""
++    import unicodedata
++    if not isinstance(text, str) or not text.strip():
++        return "the purpose is empty"
++    if unicodedata.normalize("NFC", text) != text:
++        return "the purpose is not NFC-normalized text"
++    for ch in text:
++        cat = unicodedata.category(ch)
++        if cat[0] == "C" or cat in ("Zl", "Zp"):
++            return f"the purpose contains a control or format character (U+{ord(ch):04X})"
++    if len(text) > limit:
++        return f"the purpose is {len(text)} characters; this lane allows {limit}"
++    return None
++
++
++def _issued_shape(iug) -> str | None:
++    """Why `issued_under_grant` is malformed, or None."""
++    if not isinstance(iug, dict) or set(iug) != _ISSUED_FIELDS:
++        return "issued_under_grant must hold exactly grant, issue, issued_at and request_id"
++    if not isinstance(iug["grant"], dict):
++        return "issued_under_grant.grant must be the lane grant object"
++    n = iug["issue"]
++    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
++        return "issued_under_grant.issue must be a positive whole number"
++    if parse_utc(iug["issued_at"])[0] is None:
++        return "issued_under_grant.issued_at must be a timestamp with a UTC offset"
++    rid = iug["request_id"]
++    if not isinstance(rid, str) or not rid or len(rid) > 128:
++        return "issued_under_grant.request_id must be a non-empty string of at most 128 characters"
++    return None
++
++
++def _check_issuance(h: dict, h_signed: dict, registry: dict | None, policy: dict | None, reasons: list) -> None:
++    """Step 2b (v0.7): a self-issued handoff is inside the human-signed grant it embeds. Pure: no broker
++    state, so revocation, use counts and the issue record are the broker's checks (SPEC section 16)."""
++    iug = h_signed["issued_under_grant"]
++    g = iug["grant"]
++    pol = policy or {}
++    who = ((registry or {}).get("agents") or {}).get(g.get("approver"))
++    good = False
++    if g.get("approver") in (pol.get("trusted_approvers") or []) and isinstance(who, dict) \
++            and who.get("kind") == "human" and g.get("tool") == "git_push" and isinstance(g.get("sig"), str):
++        try:
++            sc = _crypto()
++            good = sc.verify_approval(registry, g.get("approver"), g.get("kid"),
++                                      sc.approval_template_signing_input(g), sc.unb64u(g["sig"]))
++        except Exception:
++            good = False
++    if not good:
++        fail("blocked", "self_issue_grant_invalid",
++             f"the lane grant this task was issued under does not carry a valid signature of a human trusted "
++             f"for '{h.get('to')}' (signed as {g.get('approver')!r})", reasons)
++        return
++    si = g.get("self_issue")
++    if not isinstance(si, dict) or g.get("receiver") != h.get("to") or si.get("issuer") != h.get("from"):
++        fail("blocked", "self_issue_not_granted",
++             f"lane grant {g.get('template_id')!r} does not let {h.get('from')!r} issue tasks to {h.get('to')!r}",
++             reasons)
++        return
++    if ((h_signed.get("authority") or {}).get("approvals") or []):
++        fail("invalid", "self_issued_approval_present",
++             "a self-issued task never carries an approval: its push is approved by the grant, its reviewer or "
++             "a human, never by the task itself", reasons)
++    problems = []
++    gp = g.get("params") if isinstance(g.get("params"), dict) else {}
++    pushes = [a for a in h.get("planned_actions") or [] if isinstance(a, dict) and a.get("tool") == "git_push"]
++    if len(pushes) != 1:
++        problems.append("it must plan exactly one git_push")
++    else:
++        p = pushes[0].get("params") if isinstance(pushes[0].get("params"), dict) else {}
++        if p.get("remote") != gp.get("remote") or not isinstance(p.get("branch"), str) \
++                or not isinstance(gp.get("branch_pattern"), str) or not glob_match(gp["branch_pattern"], p["branch"]):
++            problems.append(f"it pushes {p.get('remote')}:{p.get('branch')}, outside the grant's "
++                            f"{gp.get('remote')}:{gp.get('branch_pattern')}")
++    scope_paths = [s for s in g.get("path_scope") or [] if isinstance(s, str)] \
++        if isinstance(g.get("path_scope"), list) else []
++    owned = [o for o in (h.get("scope") or {}).get("owned_paths") or [] if isinstance(o, str)]
++    outside = [o for o in owned if not any(_glob_covers(s, o) for s in scope_paths)]
++    if not owned or outside:
++        problems.append(f"its paths {outside or owned} are not inside the grant's path_scope {scope_paths}")
++    tools = si.get("tools") if isinstance(si.get("tools"), list) else list(SELF_ISSUE_DEFAULT_TOOLS)
++    used = set((h.get("authority") or {}).get("allowed_tools") or []) | {
++        a.get("tool") for a in h.get("planned_actions") or [] if isinstance(a, dict)}
++    if used - set(tools):
++        problems.append(f"it uses tools the grant doesn't let a self-issued task use: {sorted(map(str, used - set(tools)))}")
++    extra = [f for f in ("capability", "sender_role", "receiver_role") if f in h_signed]
++    if extra:
++        problems.append(f"it declares {extra}, which a self-issued task may not")
++    if problems:
++        fail("blocked", "self_issue_scope", f"this self-issued task is outside its grant: {problems[0]}", reasons)
++    exp, _ = parse_utc((h.get("acceptance") or {}).get("expires_at"))
++    issued, _ = parse_utc(iug["issued_at"])
++    hours = si.get("task_hours")
++    if not (_is_number(hours) and hours > 0):
++        hours = None if "expires_at" in g else SELF_ISSUE_DEFAULT_TASK_HOURS
++    bounds = [issued + dt.timedelta(hours=hours)] if hours is not None and issued is not None else []
++    if "expires_at" in g:
++        gexp, _ = parse_utc(g["expires_at"])
++        bounds.append(gexp)
++    if exp is not None and (issued is None or exp < issued or any(b is None or exp > b for b in bounds)):
++        fail("blocked", "self_issue_ttl",
++             f"this self-issued task stays valid until {h['acceptance']['expires_at']}, past what its grant "
++             f"allows (the grant's expiry, or task_hours after it was issued)", reasons)
++
++
+ def _cap_strs(cap: dict, field: str) -> list:
+     """The string entries of a capability list dimension (robust to malformed
+     entries: the shape check reports those, this just never crashes)."""
+@@ -1454,7 +1583,8 @@ def _is_sha256(value) -> bool:
+ # Functions this checker needs from synthe_crypto.py. An older copy next to a
+ # newer checker must fail closed with a clear reason, not crash mid-check.
+ _CRYPTO_REQUIRED = ("find_key", "usable_keys", "agent_kids", "kid_is_revoked",
+-                    "topology_signing_input")
++                    "topology_signing_input", "handoff_signing_input", "approval_template_signing_input",
++                    "verify_approval")
+ 
+ 
+ def _crypto():
+@@ -1521,7 +1651,9 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
+         raw = sc.unb64u(sig["sig"])
+     except Exception:
+         raw = b""
+-    if not sc.verify_bytes(key, sc.packet_signing_input(h_signed), raw):
++    # v0.7: the signed handoff picks its domain (self-issued or ordinary), so a stripped or added
++    # `issued_under_grant` never verifies, and a checker without this rule rejects self-issued ones.
++    if not sc.verify_bytes(key, sc.handoff_signing_input(h_signed), raw):
+         fail("invalid", "signature_invalid",
+              "packet signature does not verify (packet altered after signing, or wrong key)", reasons)
+         return
+@@ -1849,6 +1981,18 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
+         fail("invalid", "topology_declaration_missing",
+              "receiver policy requires sender_role and receiver_role; the packet declares "
+              "no team roles", reasons)
++    # v0.7: a self-issued handoff (SPEC section 16): its issuance record, and the agent-written purpose
++    # shown to people and reviewers as data.
++    issued = "issued_under_grant" in h_signed
++    if issued:
++        why = _issued_shape(h_signed["issued_under_grant"])
++        if why:
++            fail("invalid", "malformed:issued_under_grant", why, reasons)
++        else:
++            why = self_issue_purpose_problem(h["purpose"], self_issue_purpose_limit(
++                h_signed["issued_under_grant"]["grant"]))
++            if why:
++                fail("invalid", "self_issue_purpose_invalid", why, reasons)
+     if reasons:
+         return False, reasons
+ 
+@@ -1863,6 +2007,24 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
+                 fail("invalid", f"alias_not_canonical:{role}",
+                      f"{role} '{who}' is an alias of '{agents[who]['alias_of']}'; use the canonical id", reasons)
+     _verify_packet_signature(packet, h_signed, registry, policy, reasons, info)
++    # v0.7: who may sign a task for this receiver. A task issuer signs only self-issued handoffs, which
++    # carry the human grant they were issued under (checked in 2b); everyone else is bound by the
++    # receiver's trusted_senders ceiling, when it has one (absent: any registered sender, as before).
++    if registry is not None:
++        sender_kind = (registry.get("agents", {}).get(h["from"]) or {}).get("kind")
++        if sender_kind == ISSUER_KIND and not issued:
++            fail("invalid", "issuer_requires_grant",
++                 f"'{h['from']}' is a task issuer: it signs only tasks issued under a lane grant", reasons)
++        elif issued and sender_kind != ISSUER_KIND:
++            fail("invalid", "issuer_invalid",
++                 f"'{h['from']}' is not a registered task issuer, so it cannot issue a task under a grant", reasons)
++        senders = (policy or {}).get("trusted_senders")
++        if senders is not None and h["from"] not in senders and not (issued and sender_kind == ISSUER_KIND):
++            fail("blocked", "sender_not_trusted",
++                 f"'{h['from']}' is not a trusted sender for receiver '{h['to']}'", reasons)
++    # 2b. (v0.7) issuance: a self-issued task stays inside the human-signed grant it embeds.
++    if issued:
++        _check_issuance(h, h_signed, registry, policy, reasons)
+ 
+     # 3. duplication (idempotency claim state machine)
+     key = h["idempotency_key"]
+@@ -2209,6 +2371,10 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
+                 ledger[h["idempotency_key"]]["depends_on"] = list(h["depends_on"])
+             if info.get("approvals_deferred"):
+                 ledger[h["idempotency_key"]]["approvals_deferred"] = list(info["approvals_deferred"])
++            iug = h.get("issued_under_grant")
++            if isinstance(iug, dict):  # v0.7: which grant, and which of its issues, this task is
++                ledger[h["idempotency_key"]]["self_issued"] = {
++                    "template_id": (iug.get("grant") or {}).get("template_id"), "issue": iug.get("issue")}
+             locked.dirty = True
+             out = _result(ok, reasons, h, info)
+             out["claim"] = {"epoch": epoch, "token": token}
+diff --git a/github-action/checker/synthe_crypto.py b/github-action/checker/synthe_crypto.py
+index 5247610..3fc0366 100755
+--- a/github-action/checker/synthe_crypto.py
++++ b/github-action/checker/synthe_crypto.py
+@@ -38,6 +38,13 @@ ALG = "Ed25519"
+ ALG_ES256 = "ES256"
+ APPROVAL_ALGS = (ALG, ALG_ES256)  # packets and receipts stay Ed25519
+ PACKET_SIG_DOMAIN = "synthe/handoff-signature/v1"
++# v0.7: a handoff the broker issued under a human-signed lane grant (it carries `issued_under_grant`).
++# Its own domain, so a checker that predates self-issued tasks fails closed on one (signature_invalid),
++# and stripping or adding the field breaks the signature.
++SELF_ISSUED_SIG_DOMAIN = "synthe/handoff-signature/self-issued/v1"
++# A lane grant's human signature (synthe_lane_templates.py); the checker verifies the grant a
++# self-issued handoff embeds with the same rule.
++APPROVAL_TEMPLATE_DOMAIN = "synthe/approval-template/v1"
+ APPROVAL_SIG_DOMAIN = "synthe/approval-signature/v2"
+ # Retired approval scheme: never signs anymore. Verified only so an approval
+ # signed before the budget binding is rejected with
+@@ -249,6 +256,26 @@ def packet_signing_input(handoff: dict) -> bytes:
+     return PACKET_SIG_DOMAIN.encode() + b"\n" + canonical_json(handoff)
+ 
+ 
++def self_issued_signing_input(handoff: dict) -> bytes:
++    """Bytes the task issuer signs for a self-issued handoff (v0.7): its own domain tag + canonical JSON."""
++    return SELF_ISSUED_SIG_DOMAIN.encode() + b"\n" + canonical_json(handoff)
++
++
++def handoff_signing_input(handoff: dict) -> bytes:
++    """The signing input a handoff's signature covers, chosen by the SIGNED handoff itself: one that holds
++    `issued_under_grant` is self-issued (v0.7), anything else is an ordinary packet. Removing the field
++    from an issued handoff, or adding it to an ordinary one, therefore breaks its signature."""
++    if isinstance(handoff, dict) and "issued_under_grant" in handoff:
++        return self_issued_signing_input(handoff)
++    return packet_signing_input(handoff)
++
++
++def approval_template_signing_input(grant: dict) -> bytes:
++    """Bytes a human signs for a lane grant: domain tag + canonical JSON of everything but `sig`."""
++    return APPROVAL_TEMPLATE_DOMAIN.encode() + b"\n" + canonical_json(
++        {k: v for k, v in grant.items() if k != "sig"})
++
++
+ def approval_signing_input(approval: dict, handoff: dict) -> bytes:
+     """Bytes an approver signs (v2). The approval is bound to one handoff's
+     idempotency key and its sender/receiver, so it cannot be replayed onto a
+diff --git a/src/handoff_check.py b/src/handoff_check.py
+index 11b1d83..18fecfc 100755
+--- a/src/handoff_check.py
++++ b/src/handoff_check.py
+@@ -881,7 +881,8 @@ def parse_utc(value) -> tuple[dt.datetime | None, str | None]:
+ 
+ 
+ _LIST_SETS = ("forbidden", "approval_required_for", "forbidden_paths")  # restrictions: union
+-_LIST_CEILINGS = ("allowed_tools", "trusted_approvers")    # grants: intersection
++# grants: intersection. trusted_senders (v0.7): who may sign a task for this receiver; absent = anyone registered
++_LIST_CEILINGS = ("allowed_tools", "trusted_approvers", "trusted_senders")
+ _FLAGS = ("require_signatures", "require_signed_approvals", "verify_evidence",
+           "require_planned_actions", "exclusive_paths",
+           "require_capability_declaration", "require_topology")  # v0.6
+@@ -892,6 +893,134 @@ def _is_number(v) -> bool:
+     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+ 
+ 
++# v0.7 self-issued tasks (SPEC section 16): a handoff the broker's task issuer signed under a lane grant
++# a human signed, which it embeds verbatim (`issued_under_grant`). The grant's `self_issue` object names
++# the issuer and may narrow what such a task can be; these are its defaults.
++ISSUER_KIND = "task_issuer"
++SELF_ISSUE_DEFAULT_TOOLS = ("edit_files", "git_push")
++# A task's lifetime when its grant names no task_hours: the grant's own expiry, or, for a grant without
++# one (a standing lane), 30 days. The receiver's max_ttl_hours still caps it, like any handoff.
++SELF_ISSUE_DEFAULT_TASK_HOURS = 720
++SELF_ISSUE_DEFAULT_PURPOSE_CHARS = 280
++SELF_ISSUE_MAX_PURPOSE_CHARS = 1000
++_ISSUED_FIELDS = {"grant", "issue", "issued_at", "request_id"}
++
++
++def self_issue_purpose_limit(grant) -> int:
++    si = grant.get("self_issue") if isinstance(grant, dict) else None
++    n = si.get("max_purpose_chars") if isinstance(si, dict) else None
++    ok = isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= SELF_ISSUE_MAX_PURPOSE_CHARS
++    return n if ok else SELF_ISSUE_DEFAULT_PURPOSE_CHARS
++
++
++def self_issue_purpose_problem(text, limit: int = SELF_ISSUE_DEFAULT_PURPOSE_CHARS) -> str | None:
++    """Why an agent-written purpose can't go into a self-issued task, or None. It is shown to people and
++    reviewers as data, so it is one line of NFC text with no control or format characters (no terminal
++    escapes, no bidi overrides, no line or paragraph separators), within the grant's length limit."""
++    import unicodedata
++    if not isinstance(text, str) or not text.strip():
++        return "the purpose is empty"
++    if unicodedata.normalize("NFC", text) != text:
++        return "the purpose is not NFC-normalized text"
++    for ch in text:
++        cat = unicodedata.category(ch)
++        if cat[0] == "C" or cat in ("Zl", "Zp"):
++            return f"the purpose contains a control or format character (U+{ord(ch):04X})"
++    if len(text) > limit:
++        return f"the purpose is {len(text)} characters; this lane allows {limit}"
++    return None
++
++
++def _issued_shape(iug) -> str | None:
++    """Why `issued_under_grant` is malformed, or None."""
++    if not isinstance(iug, dict) or set(iug) != _ISSUED_FIELDS:
++        return "issued_under_grant must hold exactly grant, issue, issued_at and request_id"
++    if not isinstance(iug["grant"], dict):
++        return "issued_under_grant.grant must be the lane grant object"
++    n = iug["issue"]
++    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
++        return "issued_under_grant.issue must be a positive whole number"
++    if parse_utc(iug["issued_at"])[0] is None:
++        return "issued_under_grant.issued_at must be a timestamp with a UTC offset"
++    rid = iug["request_id"]
++    if not isinstance(rid, str) or not rid or len(rid) > 128:
++        return "issued_under_grant.request_id must be a non-empty string of at most 128 characters"
++    return None
++
++
++def _check_issuance(h: dict, h_signed: dict, registry: dict | None, policy: dict | None, reasons: list) -> None:
++    """Step 2b (v0.7): a self-issued handoff is inside the human-signed grant it embeds. Pure: no broker
++    state, so revocation, use counts and the issue record are the broker's checks (SPEC section 16)."""
++    iug = h_signed["issued_under_grant"]
++    g = iug["grant"]
++    pol = policy or {}
++    who = ((registry or {}).get("agents") or {}).get(g.get("approver"))
++    good = False
++    if g.get("approver") in (pol.get("trusted_approvers") or []) and isinstance(who, dict) \
++            and who.get("kind") == "human" and g.get("tool") == "git_push" and isinstance(g.get("sig"), str):
++        try:
++            sc = _crypto()
++            good = sc.verify_approval(registry, g.get("approver"), g.get("kid"),
++                                      sc.approval_template_signing_input(g), sc.unb64u(g["sig"]))
++        except Exception:
++            good = False
++    if not good:
++        fail("blocked", "self_issue_grant_invalid",
++             f"the lane grant this task was issued under does not carry a valid signature of a human trusted "
++             f"for '{h.get('to')}' (signed as {g.get('approver')!r})", reasons)
++        return
++    si = g.get("self_issue")
++    if not isinstance(si, dict) or g.get("receiver") != h.get("to") or si.get("issuer") != h.get("from"):
++        fail("blocked", "self_issue_not_granted",
++             f"lane grant {g.get('template_id')!r} does not let {h.get('from')!r} issue tasks to {h.get('to')!r}",
++             reasons)
++        return
++    if ((h_signed.get("authority") or {}).get("approvals") or []):
++        fail("invalid", "self_issued_approval_present",
++             "a self-issued task never carries an approval: its push is approved by the grant, its reviewer or "
++             "a human, never by the task itself", reasons)
++    problems = []
++    gp = g.get("params") if isinstance(g.get("params"), dict) else {}
++    pushes = [a for a in h.get("planned_actions") or [] if isinstance(a, dict) and a.get("tool") == "git_push"]
++    if len(pushes) != 1:
++        problems.append("it must plan exactly one git_push")
++    else:
++        p = pushes[0].get("params") if isinstance(pushes[0].get("params"), dict) else {}
++        if p.get("remote") != gp.get("remote") or not isinstance(p.get("branch"), str) \
++                or not isinstance(gp.get("branch_pattern"), str) or not glob_match(gp["branch_pattern"], p["branch"]):
++            problems.append(f"it pushes {p.get('remote')}:{p.get('branch')}, outside the grant's "
++                            f"{gp.get('remote')}:{gp.get('branch_pattern')}")
++    scope_paths = [s for s in g.get("path_scope") or [] if isinstance(s, str)] \
++        if isinstance(g.get("path_scope"), list) else []
++    owned = [o for o in (h.get("scope") or {}).get("owned_paths") or [] if isinstance(o, str)]
++    outside = [o for o in owned if not any(_glob_covers(s, o) for s in scope_paths)]
++    if not owned or outside:
++        problems.append(f"its paths {outside or owned} are not inside the grant's path_scope {scope_paths}")
++    tools = si.get("tools") if isinstance(si.get("tools"), list) else list(SELF_ISSUE_DEFAULT_TOOLS)
++    used = set((h.get("authority") or {}).get("allowed_tools") or []) | {
++        a.get("tool") for a in h.get("planned_actions") or [] if isinstance(a, dict)}
++    if used - set(tools):
++        problems.append(f"it uses tools the grant doesn't let a self-issued task use: {sorted(map(str, used - set(tools)))}")
++    extra = [f for f in ("capability", "sender_role", "receiver_role") if f in h_signed]
++    if extra:
++        problems.append(f"it declares {extra}, which a self-issued task may not")
++    if problems:
++        fail("blocked", "self_issue_scope", f"this self-issued task is outside its grant: {problems[0]}", reasons)
++    exp, _ = parse_utc((h.get("acceptance") or {}).get("expires_at"))
++    issued, _ = parse_utc(iug["issued_at"])
++    hours = si.get("task_hours")
++    if not (_is_number(hours) and hours > 0):
++        hours = None if "expires_at" in g else SELF_ISSUE_DEFAULT_TASK_HOURS
++    bounds = [issued + dt.timedelta(hours=hours)] if hours is not None and issued is not None else []
++    if "expires_at" in g:
++        gexp, _ = parse_utc(g["expires_at"])
++        bounds.append(gexp)
++    if exp is not None and (issued is None or exp < issued or any(b is None or exp > b for b in bounds)):
++        fail("blocked", "self_issue_ttl",
++             f"this self-issued task stays valid until {h['acceptance']['expires_at']}, past what its grant "
++             f"allows (the grant's expiry, or task_hours after it was issued)", reasons)
++
++
+ def _cap_strs(cap: dict, field: str) -> list:
+     """The string entries of a capability list dimension (robust to malformed
+     entries: the shape check reports those, this just never crashes)."""
+@@ -1454,7 +1583,8 @@ def _is_sha256(value) -> bool:
+ # Functions this checker needs from synthe_crypto.py. An older copy next to a
+ # newer checker must fail closed with a clear reason, not crash mid-check.
+ _CRYPTO_REQUIRED = ("find_key", "usable_keys", "agent_kids", "kid_is_revoked",
+-                    "topology_signing_input")
++                    "topology_signing_input", "handoff_signing_input", "approval_template_signing_input",
++                    "verify_approval")
+ 
+ 
+ def _crypto():
+@@ -1521,7 +1651,9 @@ def _verify_packet_signature(packet: dict, h_signed: dict, registry: dict | None
+         raw = sc.unb64u(sig["sig"])
+     except Exception:
+         raw = b""
+-    if not sc.verify_bytes(key, sc.packet_signing_input(h_signed), raw):
++    # v0.7: the signed handoff picks its domain (self-issued or ordinary), so a stripped or added
++    # `issued_under_grant` never verifies, and a checker without this rule rejects self-issued ones.
++    if not sc.verify_bytes(key, sc.handoff_signing_input(h_signed), raw):
+         fail("invalid", "signature_invalid",
+              "packet signature does not verify (packet altered after signing, or wrong key)", reasons)
+         return
+@@ -1849,6 +1981,18 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
+         fail("invalid", "topology_declaration_missing",
+              "receiver policy requires sender_role and receiver_role; the packet declares "
+              "no team roles", reasons)
++    # v0.7: a self-issued handoff (SPEC section 16): its issuance record, and the agent-written purpose
++    # shown to people and reviewers as data.
++    issued = "issued_under_grant" in h_signed
++    if issued:
++        why = _issued_shape(h_signed["issued_under_grant"])
++        if why:
++            fail("invalid", "malformed:issued_under_grant", why, reasons)
++        else:
++            why = self_issue_purpose_problem(h["purpose"], self_issue_purpose_limit(
++                h_signed["issued_under_grant"]["grant"]))
++            if why:
++                fail("invalid", "self_issue_purpose_invalid", why, reasons)
+     if reasons:
+         return False, reasons
+ 
+@@ -1863,6 +2007,24 @@ def validate(packet: dict, *, registry: dict | None, ledger: dict,
+                 fail("invalid", f"alias_not_canonical:{role}",
+                      f"{role} '{who}' is an alias of '{agents[who]['alias_of']}'; use the canonical id", reasons)
+     _verify_packet_signature(packet, h_signed, registry, policy, reasons, info)
++    # v0.7: who may sign a task for this receiver. A task issuer signs only self-issued handoffs, which
++    # carry the human grant they were issued under (checked in 2b); everyone else is bound by the
++    # receiver's trusted_senders ceiling, when it has one (absent: any registered sender, as before).
++    if registry is not None:
++        sender_kind = (registry.get("agents", {}).get(h["from"]) or {}).get("kind")
++        if sender_kind == ISSUER_KIND and not issued:
++            fail("invalid", "issuer_requires_grant",
++                 f"'{h['from']}' is a task issuer: it signs only tasks issued under a lane grant", reasons)
++        elif issued and sender_kind != ISSUER_KIND:
++            fail("invalid", "issuer_invalid",
++                 f"'{h['from']}' is not a registered task issuer, so it cannot issue a task under a grant", reasons)
++        senders = (policy or {}).get("trusted_senders")
++        if senders is not None and h["from"] not in senders and not (issued and sender_kind == ISSUER_KIND):
++            fail("blocked", "sender_not_trusted",
++                 f"'{h['from']}' is not a trusted sender for receiver '{h['to']}'", reasons)
++    # 2b. (v0.7) issuance: a self-issued task stays inside the human-signed grant it embeds.
++    if issued:
++        _check_issuance(h, h_signed, registry, policy, reasons)
+ 
+     # 3. duplication (idempotency claim state machine)
+     key = h["idempotency_key"]
+@@ -2209,6 +2371,10 @@ def check(packet, *, registry: dict | None, ledger_path: Path | None,
+                 ledger[h["idempotency_key"]]["depends_on"] = list(h["depends_on"])
+             if info.get("approvals_deferred"):
+                 ledger[h["idempotency_key"]]["approvals_deferred"] = list(info["approvals_deferred"])
++            iug = h.get("issued_under_grant")
++            if isinstance(iug, dict):  # v0.7: which grant, and which of its issues, this task is
++                ledger[h["idempotency_key"]]["self_issued"] = {
++                    "template_id": (iug.get("grant") or {}).get("template_id"), "issue": iug.get("issue")}
+             locked.dirty = True
+             out = _result(ok, reasons, h, info)
+             out["claim"] = {"epoch": epoch, "token": token}
+diff --git a/src/synthe_broker.py b/src/synthe_broker.py
+index e340fb5..7def26a 100755
+--- a/src/synthe_broker.py
++++ b/src/synthe_broker.py
+@@ -30,7 +30,12 @@ Protocol: one JSON request line, one JSON response line, per connection.
+   request  {"op": "...", "args": {...}, "auth": "<token, tcp only>"}
+   response {"ok": true, "result": ...} | {"ok": false, "error": {"code", "message"}}
+ Ops: hello, claim, complete, policy, bundle_bases, propose, receipts, and
+-(v0.5) submit_approval, staged, read_file, list_files; (v0.7) submit_task.
++(v0.5) submit_approval, staged, read_file, list_files; (v0.7) submit_task, issue_task.
++
++Self-issued tasks (v0.7): `issue_task` asks the broker for a task under a lane grant that allows it
++(`self_issue`): the broker signs it with its task issuer key, which lives here next to the broker key,
++and receipts the decision. `git push` with no human-signed task for the branch does this through
++git-remote-synthe, then claims and proposes as usual.
+ 
+ Speculative commit (v0.5): `claim` and `propose` take "wait_for_approval":
+ true. The claim then succeeds while the approval of a broker-mediated effect
+@@ -140,6 +145,9 @@ def isolation_problems(cfg: cm.BrokerConfig) -> list:
+                 return
+ 
+     secret(cfg.key_path, "broker key", "broker_key_exposed")
++    issuer = (cfg.raw.get("lane_templates") or {}).get("self_issue")
++    if isinstance(issuer, dict) and isinstance(issuer.get("key_file"), str):  # v0.7: signs self-issued tasks
++        secret(cfg.rel(issuer["key_file"]), "task issuer key", "broker_key_exposed")
+     for name, remote in ((cfg.effects.get("git_push") or {}).get("remotes") or {}).items():
+         for label, r in ((f"remote '{name}'", remote), (f"the fetch_from source of '{name}'", remote.get("fetch_from"))):
+             if isinstance(r, dict) and r.get("token_file"):
+@@ -152,6 +160,7 @@ def isolation_problems(cfg: cm.BrokerConfig) -> list:
+     guarded(cfg.approvals_path, "detached approvals")
+     guarded(cfg.state_dir / "lane-templates.json", "lane templates")
+     guarded(cfg.state_dir / "delegate-approvals.json", "delegate approvals")
++    guarded(cfg.state_dir / "self-issued.json", "self-issued tasks")
+     if cfg.staged_path.exists():  # holds the claim tokens of staged proposals
+         secret(cfg.staged_path, "staged proposals", "broker_credentials_exposed")
+     return out
+@@ -247,6 +256,13 @@ class Broker:
+         packet = args.get("packet")
+         h = packet.get("handoff") if isinstance(packet, dict) else None
+         extra, defer = (), None
++        if isinstance(h, dict) and "issued_under_grant" in h:
++            # v0.7: a self-issued task claims only while its grant is live and the broker issued exactly it.
++            import synthe_lane_templates as lanes
++            try:
++                lanes.check_issued(self.cfg, registry, h)
++            except cm.Deny as d:
++                return hc._reject(d.reason["state"], d.reason["code"], d.reason["message"])
+         if isinstance(h, dict):
+             extra = cm.load_approvals(self.cfg, h)
+             if args.get("wait_for_approval") is True:
+@@ -371,6 +387,8 @@ class Broker:
+         out = {"lineage": lanes.lineage(self.cfg, registry, receiver, risk_aware=auto is not None),
+                "auto_approve_default": lanes.default_auto_approve(args.get("delegate")),
+                "risk_rules": lanes.risk_rules(self.cfg)}
++        issuer = lanes.issuer_config(self.cfg)  # v0.7: what a grant's `self_issue.issuer` must name here
++        out["self_issue_default"] = {"issuer": issuer["issuer"]} if issuer else None
+         if auto is not None:
+             out["auto_approve"] = list(auto)
+         return out
+@@ -383,7 +401,25 @@ class Broker:
+ 
+     def op_revoke_lane_template(self, args, isolation):
+         import synthe_lane_templates as lanes
+-        return lanes.revoke(self.cfg, args.get("revocation") or {})
++        out = lanes.revoke(self.cfg, args.get("revocation") or {})
++        # v0.7: the grant's self-issued tasks die with it; a staged one is denied now, with a receipt.
++        cm.retry_staged(self.cfg, sweep=True)
++        return out
++
++    def op_issue_task(self, args, isolation):
++        """(v0.7) A task under a lane grant that allows self-issue, for this broker's receiver: signed by the
++        broker's task issuer key and receipted (task_issued / task_issue_refused). Replaying a request_id
++        returns the same task. With "claim": true the broker then claims it (a separate step: the claim
++        stays the one admission path) and returns the claim under "claim"."""
++        claim = args.get("claim") is True
++        request = {k: v for k, v in args.items() if k != "claim"}
++        problem = cm.issue_request_problem(request)
++        if problem:
++            raise Refused("request_malformed", problem)
++        out = cm.issue_task(self.cfg, request, origin={"isolation": isolation, "via": self.transport})
++        if claim and out.get("decision") == "task_issued":
++            out["claim"] = self.op_claim({"packet": out["packet"], "wait_for_approval": True}, isolation)
++        return out
+ 
+     def op_submit_approval(self, args, isolation):
+         """A human's detached approval (synthe_sign.py approve --detached). It is
+@@ -442,38 +478,12 @@ class Broker:
+         if not isinstance(sender, dict) or sender.get("kind") != "human":
+             raise Refused("task_sender_not_human", "submitted tasks must be signed by a registered human")
+ 
+-        tasks = self.cfg.workspace / "tasks"
+-        if tasks.is_symlink():
+-            raise Refused("task_path_invalid", "the workspace tasks directory must not be a symlink")
+-        tasks.mkdir(parents=True, exist_ok=True)
+-        # The broker runs with umask 077 (the LaunchDaemon's), so set the modes: the agent must read its task.
+-        if tasks.stat().st_uid == self.uid:
+-            os.chmod(tasks, 0o755)
++        try:  # the same file rules as a self-issued task's (cm.write_task_file)
++            created = cm.write_task_file(self.cfg, rel, raw)
++        except cm.Deny as d:
++            raise Refused(d.reason["code"], d.reason["message"])
+         target = hc.resolve_in_workspace(self.cfg.workspace, rel)
+-        if target is None or target.parent != tasks.resolve() or target.is_symlink():
+-            raise Refused("task_path_invalid", "task artifact path escapes the broker workspace")
+-
+-        created = False
+         try:
+-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+-            try:
+-                fd = os.open(target, flags, 0o644)
+-            except FileExistsError:
+-                if target.is_symlink() or not target.is_file():
+-                    raise Refused("task_conflict", "the task path exists but is not a regular file")
+-                st = target.stat()
+-                if st.st_uid != self.uid or st.st_mode & 0o022:
+-                    raise Refused("task_conflict", "the existing task is not broker-owned and read-only to clients")
+-                if not hmac.compare_digest(target.read_bytes(), raw):
+-                    raise Refused("task_conflict", "the task path already holds different content")
+-            else:
+-                created = True
+-                os.fchmod(fd, 0o644)
+-                with os.fdopen(fd, "wb") as fh:
+-                    fh.write(raw)
+-                    fh.flush()
+-                    os.fsync(fh.fileno())
+-
+             extra = cm.load_approvals(self.cfg, h)
+             defer = {a.get("name") for a in h.get("planned_actions") or []
+                      if isinstance(a, dict) and a.get("tool") in self.cfg.effects}
+@@ -689,5 +699,25 @@ def doctor(cfg: cm.BrokerConfig) -> int:
+     problems = isolation_problems(cfg)
+     print(json.dumps({"broker_uid": os.geteuid(), "isolation": cfg.isolation["mode"],
+                       "ok": not problems,
+-                      "problems": [{"code": c, "message": m} for c, m in problems]}, indent=2))
++                      "problems": [{"code": c, "message": m} for c, m in problems],
++                      "warnings": sender_warnings(cfg)}, indent=2))
+     return 0 if not problems else 2
++
++
++def sender_warnings(cfg: cm.BrokerConfig) -> list:
++    """(v0.7) A receiver with no `trusted_senders` accepts a task signed by any registered key: with a
++    delegate's, the broker's or the task issuer's key on record too, a task need not come from a human.
++    Advice, not a refusal: registries from before the ceiling keep working as they did."""
++    registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
++    if err:
++        return []
++    agents = registry.get("agents") or {}
++    keyed = [n for n, a in agents.items() if isinstance(a, dict) and a.get("keys")]
++    out = []
++    for name in sorted(agents):
++        policy = hc.receiver_policy(registry, name) or {}
++        if (agents[name] or {}).get("kind") == "agent" and "trusted_senders" not in policy and len(keyed) > 1:
++            out.append({"code": "sender_ceiling_missing",
++                        "message": f"receiver {name!r} has no trusted_senders, so any of {len(keyed)} registered keys "
++                                   f"may sign it a task; list the humans who may (SPEC section 4)"})
++    return out
+diff --git a/src/synthe_commit.py b/src/synthe_commit.py
+index df8558c..ff5f32f 100755
+--- a/src/synthe_commit.py
++++ b/src/synthe_commit.py
+@@ -25,7 +25,7 @@ branch B of remote R"), and the broker, which alone holds the credentials:
+ Supported effects: git_push. (send_email is next; see docs/COMMIT.md.)
+ 
+ Commands:
+-  init       --dir DIR [--broker-id ID]    broker key + config skeleton
++  init       --dir DIR [--broker-id ID]    broker key, task issuer key + config skeleton
+   serve      --config CFG --socket PATH    the broker daemon, run as its own OS
+              (or --listen HOST:PORT)       user; agents use synthe_client.py
+   doctor     --config CFG                  are the key, tokens and state private?
+@@ -1370,16 +1370,30 @@ class LaneEscalated(Deny):
+         self.fields = fields
+ 
+ 
++def _issued_lane(cfg: BrokerConfig, registry: dict, h: dict, params: dict):
++    """The lane a self-issued task's push goes through: always the grant it was issued under, never another
++    one. None when that grant can't approve this push now (its uses spent, say): a human still may. Whether
++    the task itself is still alive is lanes.check_issued's call (revoked, expired, stale: dead)."""
++    import synthe_lane_templates as lanes
++    iug = h.get("issued_under_grant") if isinstance(h.get("issued_under_grant"), dict) else {}
++    tid = (iug.get("grant") or {}).get("template_id") if isinstance(iug.get("grant"), dict) else None
++    try:
++        return lanes.select(cfg, registry, h.get("to"), params, template_id=tid) if isinstance(tid, str) else None
++    except Deny:
++        return None
++
++
+ def _risk_message(risk: dict) -> str:
+     return (f"needs a human: a {risk['tier']}-risk push ({'; '.join(risk['reasons'][:3])}); grant "
+             f"'{risk['template_id']}' approves only {' and '.join(risk['auto_approve'])} pushes without one")
+ 
+ 
+-def _lane_escalation(cfg: BrokerConfig, eff, grant: dict, paths: list, base: str, commit: str):
++def _lane_escalation(cfg: BrokerConfig, eff, grant: dict, paths: list, base: str, commit: str,
++                     self_issued: bool = False):
+     """(LaneEscalated or None, receipt fields) for pushing `commit` over `base` under `grant`. Paths outside
+     the grant's path_scope go to a human (a push the lane doesn't cover is treated like any other push; the
+     receiver policy and forbidden_paths were checked before this and still deny outright). Then, for a
+-    risk-aware grant, the risk tier."""
++    risk-aware grant, the risk tier (for a self-issued task, under the grant's self_issue.escalate_at too)."""
+     outside = [p for p in paths if not any_match(grant["path_scope"], p)]
+     if outside:
+         scope = {"template_id": grant["template_id"], "path_scope": list(grant["path_scope"]),
+@@ -1389,24 +1403,27 @@ def _lane_escalation(cfg: BrokerConfig, eff, grant: dict, paths: list, base: str
+         return LaneEscalated("outside_lane_paths", f"needs a human: {len(outside)} path(s) outside grant "
+                                                    f"'{grant['template_id']}' ({shown})", {"lane_scope": scope}), \
+             {"lane_scope": scope}
+-    if "auto_approve" not in grant:
+-        return None, {}
+-    risk = _lane_risk(cfg, eff, grant, base, commit)
++    import synthe_lane_templates as lanes
++    if "auto_approve" not in grant and lanes.approved_tiers(grant, self_issued) == list(synthe_risk.TIERS):
++        return None, {}  # not risk-aware: it approves every tier, as before
++    risk = _lane_risk(cfg, eff, grant, base, commit, self_issued)
+     esc = LaneEscalated("risk_escalated", _risk_message(risk), {"risk": risk}) if risk["escalated"] else None
+     return esc, {"risk": risk}
+ 
+ 
+-def _lane_risk(cfg: BrokerConfig, eff, grant: dict, base: str, commit: str) -> dict:
++def _lane_risk(cfg: BrokerConfig, eff, grant: dict, base: str, commit: str, self_issued: bool = False) -> dict:
+     """The broker's own classification (synthe_risk) of pushing `commit` over `base` under a risk-aware
+-    grant: every path of every commit in the range, from its mirror, never the agent's description. Paths
+-    and counts only, never file contents. `escalated`: the grant doesn't list this tier."""
++    grant: every path of every commit in the range, from its mirror, never the agent's description (nor,
++    for a self-issued task, the purpose the agent wrote). Paths and counts only, never file contents.
++    `escalated`: the grant doesn't list this tier."""
+     import synthe_lane_templates as lanes
+     rules = lanes.risk_rules(cfg)
+     found = synthe_risk.assess_change(eff.describe(commit, base), rules)
++    tiers = lanes.approved_tiers(grant, self_issued)
+     return {"tier": found["tier"], "reasons": found["reasons"], "paths": found["paths"],
+-            "sensitive_paths": found["sensitive_paths"], "auto_approve": list(grant["auto_approve"]),
++            "sensitive_paths": found["sensitive_paths"], "auto_approve": tiers,
+             "template_id": grant["template_id"], "commit": commit, "base": base,
+-            "rules_digest": synthe_risk.rules_digest(rules), "escalated": not lanes.auto_approves(grant, found["tier"])}
++            "rules_digest": synthe_risk.rules_digest(rules), "escalated": found["tier"] not in tiers}
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -1535,6 +1552,14 @@ def staged_detail(cfg: BrokerConfig, staged_id: str, max_patch: int = 200_000) -
+     # that name no budget of their own.
+     registry, rerr = hc.load_registry(str(cfg.registry_path))
+     if not rerr:
++        # v0.7: who wrote the task, from the signed packet the broker staged and the registry, never its
++        # text; for a self-issued one, also the human's own brief from the grant it embeds.
++        out["task_origin"] = task_origin(cfg, registry, h)
++        iug = h.get("issued_under_grant")
++        g = iug.get("grant") if isinstance(iug, dict) else None
++        brief = g.get("brief") if isinstance(g, dict) else None
++        if isinstance(brief, str):
++            out["lane_brief"] = brief
+         h_eff = copy.deepcopy(h)
+         hc.apply_receiver_defaults(h_eff, hc.receiver_policy(registry, h.get("to")))
+         eff_budget = (h_eff.get("authority") or {}).get("budget")
+@@ -1619,6 +1644,8 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
+     def finish(decision, reasons=None, **fields):
+         reasons = [{**r, "message": str(r.get("message", ""))} for r in reasons or []]
+         receipt.update(decision=decision, reasons=reasons, **fields)
++        if ctx.get("origin") is not None:  # v0.7: who wrote the task, once its signature checked out
++            receipt["task_origin"] = ctx["origin"]
+         if ctx.get("registry") is not None:
+             receipt["plan"] = sp.plan_for(ctx["packet"], ctx["registry"], hc.load_ledger(cfg.ledger_path),
+                                           tuple(cfg.effects), current=(ctx["action"], decision),
+@@ -1677,7 +1704,9 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
+         # 2. authority at commit time: the whole handoff re-validated now. The
+         #    other mediated effects' approvals are checked when they commit.
+         import synthe_lane_templates as lanes
+-        lane = lanes.select(cfg, registry, h.get("to"), params) if etype == "git_push" else None
++        issued = "issued_under_grant" in h  # v0.7: a self-issued task; its lane is the grant it was issued under
++        lane = (_issued_lane(cfg, registry, h, params) if issued else lanes.select(cfg, registry, h.get("to"), params)) \
++            if etype == "git_push" else None
+         at = hc.now_utc()
+         info: dict = {}
+         mediated = [a.get("name") for a in h.get("planned_actions") or []
+@@ -1691,6 +1720,10 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
+             if not _approval_only(reasons, info, action):
+                 raise _DenyMany(reasons)
+             pending = list(reasons)
++        if info.get("signature") == "verified":
++            ctx["origin"] = task_origin(cfg, registry, h)
++        if issued:  # its grant revoked, expired or stale, or not the broker's issue: the task is dead
++            lanes.check_issued(cfg, registry, h)
+ 
+         # 3. a trusted human approved exactly this effect (in the packet, or detached); under a grant that
+         #    names a delegate, otherwise the delegate approved this exact commit. A grant without a delegate
+@@ -1767,7 +1800,8 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
+         if pending:  # a grant still in play also says now whether it covers the push (who is asked meanwhile)
+             return _stage(cfg, finish, packet, h, token, action, params, prep, eff, scope, pending, origin,
+                           receipt["commits_from"], fingerprint, _staged, human_gap=human_gap,
+-                          classify=(lambda paths, base, commit: _lane_escalation(cfg, eff, lane, paths, base, commit))
++                          classify=(lambda paths, base, commit: _lane_escalation(cfg, eff, lane, paths, base, commit,
++                                                                                 issued))
+                           if lane else None)
+ 
+         # 5. inside the claim fence: live check, effect, observe, receipt
+@@ -1777,8 +1811,9 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
+                 laps.lap("fence")  # the ledger lock, the claim and dependency checks
+                 receipt["claim"] = {"epoch": record["epoch"]}
+                 # Revalidate and reserve under the shared lane lock at dispatch.
+-                # Revocation cannot race a push after returning successfully.
+-                if lane:
++                # Revocation cannot race a push after returning successfully. A self-issued task is
++                # re-checked against its grant here too, even under a human's approval.
++                if lane or issued:
+                     def authorize(paths, pushing):
+                         # Signed registry: enforced once a genesis key is pinned
+                         # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
+@@ -1791,10 +1826,15 @@ def propose(cfg: BrokerConfig, proposal, origin: dict | None = None, bundle: byt
+                                                   as_receiver=cfg.receiver_id)
+                         if not valid:
+                             raise _DenyMany(why)
++                        if issued:
++                            lanes.check_issued(cfg, current_registry, h)
++                        if not lane:
++                            return
+                         # Does the grant cover the exact range being pushed, now (its paths; for a risk-aware
+                         # grant, its tier)? A restaged commit is judged anew.
+                         grant = lanes.select(cfg, current_registry, h.get("to"), params, template_id=lane["template_id"])
+-                        escalation, seen = _lane_escalation(cfg, eff, grant, paths, pushing["base"], pushing["commit"])
++                        escalation, seen = _lane_escalation(cfg, eff, grant, paths, pushing["base"], pushing["commit"],
++                                                            issued)
+                         receipt.update(seen)
+                         if escalation:  # before the delegate is asked, before a use is spent
+                             raise escalation
+@@ -1961,7 +2001,14 @@ def _staged_ready(cfg: BrokerConfig, rec: dict) -> bool:
+     mediated = {a.get("name") for a in h.get("planned_actions") or []
+                 if isinstance(a, dict) and a.get("tool") in cfg.effects}
+     import synthe_lane_templates as lanes
+-    lane = lanes.select(cfg, registry, h.get("to"), rec["params"]) if etype == "git_push" else None
++    issued = "issued_under_grant" in h
++    if issued:  # a self-issued task whose grant was revoked or expired: commit it now, to deny it
++        try:
++            lanes.check_issued(cfg, registry, h)
++        except Deny:
++            return True
++    lane = (_issued_lane(cfg, registry, h, rec["params"]) if issued
++            else lanes.select(cfg, registry, h.get("to"), rec["params"])) if etype == "git_push" else None
+     info: dict = {}
+     at = hc.now_utc()
+     ok, reasons = hc.validate(packet, registry=registry, ledger={}, workspace=cfg.workspace, at=at, info=info,
+@@ -2089,6 +2136,9 @@ def submit_approval(cfg: BrokerConfig, approval, origin: dict | None = None) ->
+     registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
+     if err:
+         return {"receipt": finish("approval_rejected", err["reasons"]), "commits": []}
++    origin_of_task = _origin_for_key(cfg, registry, a["idempotency_key"], a["from"])
++    if origin_of_task:  # v0.7: who wrote the task this approval is for (the broker's record, not the approval)
++        receipt["task_origin"] = origin_of_task
+     if a["to"] not in (registry.get("agents") or {}):
+         return {"receipt": finish("approval_rejected", [{
+             "state": "invalid", "code": "unknown_agent:to", "message": f"no receiver '{a['to']}' in the registry"}]),
+@@ -2144,6 +2194,9 @@ def submit_delegate(cfg: BrokerConfig, doc, origin: dict | None = None, escalate
+     registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
+     if err:
+         return {"receipt": finish(rejected, err["reasons"]), "commits": []}
++    origin_of_task = _origin_for_key(cfg, registry, x.get("idempotency_key"), x.get("from"))
++    if origin_of_task:  # v0.7: who wrote the task under review (the broker's record of it)
++        receipt["task_origin"] = origin_of_task
+     staged = None
+     if not escalate and isinstance(x.get("idempotency_key"), str) and isinstance(x.get("action"), str):
+         with _staged_store(cfg) as box:  # a snapshot, released before the lane lock (no lock is ever nested)
+@@ -2183,10 +2236,16 @@ def delegate_grant(cfg: BrokerConfig, staged_id) -> dict:
+         raise Deny("invalid", err["reasons"][0]["code"], err["reasons"][0]["message"])
+     h = rec["packet"]["handoff"]
+     plan = [a for a in h.get("planned_actions") or [] if isinstance(a, dict) and a.get("name") == action]
+-    t = lanes.select(cfg, registry, h.get("to"), rec.get("params") or {}) \
+-        if plan and plan[0].get("tool") == "git_push" else None
++    if not plan or plan[0].get("tool") != "git_push":
++        t = None
++    elif "issued_under_grant" in h:  # a self-issued task: only the grant it was issued under
++        t = _issued_lane(cfg, registry, h, rec.get("params") or {})
++    else:
++        t = lanes.select(cfg, registry, h.get("to"), rec.get("params") or {})
+     t = t or {}
+     return {"id": staged_id, "state": rec.get("state"), "template_id": t.get("template_id"),
++            # who wrote the task (v0.7): a self-issued one was written by the agent whose diff this is
++            "task_origin": task_origin(cfg, registry, h),
+             "delegate": t.get("delegate"), "granted_by": t.get("approver"),
+             # the human's own words to the reviewer, signed with the grant, and the limits it signed
+             "brief": t.get("brief"),
+@@ -2194,6 +2253,349 @@ def delegate_grant(cfg: BrokerConfig, staged_id) -> dict:
+             if t else None, "decisions": lanes.delegate_view(cfg, staged_id)}
+ 
+ 
++# --------------------------------------------------------------------------
++# self-issued tasks (v0.7): the broker issues a task under a lane grant that allows it (SPEC section 16)
++
++ISSUE_REQUEST_FIELDS = {"request_id", "branch", "purpose", "owned_paths", "depends_on", "template_id", "remote"}
++_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
++ISSUED_PUSH = "push_branch"
++
++
++def write_task_file(cfg: BrokerConfig, rel: str, raw: bytes) -> bool:
++    """Install one task file in the broker workspace's tasks/ directory, readable by the agent (0644).
++    Created exclusively and never through a symlink; a file already there must be broker-owned, read-only
++    to others and byte-identical. Returns whether it was created; Deny (task_path_invalid, task_conflict)."""
++    tasks = cfg.workspace / "tasks"
++    if tasks.is_symlink():
++        raise Deny("invalid", "task_path_invalid", "the workspace tasks directory must not be a symlink")
++    tasks.mkdir(parents=True, exist_ok=True)
++    # The broker runs with umask 077 (the LaunchDaemon's), so set the modes: the agent must read its task.
++    if tasks.stat().st_uid == os.geteuid():
++        os.chmod(tasks, 0o755)
++    target = hc.resolve_in_workspace(cfg.workspace, rel)
++    if target is None or target.parent != tasks.resolve() or target.is_symlink():
++        raise Deny("invalid", "task_path_invalid", "task artifact path escapes the broker workspace")
++    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
++    try:
++        fd = os.open(target, flags, 0o644)
++    except FileExistsError:
++        if target.is_symlink() or not target.is_file():
++            raise Deny("invalid", "task_conflict", "the task path exists but is not a regular file")
++        st = target.stat()
++        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
++            raise Deny("invalid", "task_conflict", "the existing task is not broker-owned and read-only to clients")
++        if not hmac.compare_digest(target.read_bytes(), raw):
++            raise Deny("invalid", "task_conflict", "the task path already holds different content")
++        return False
++    os.fchmod(fd, 0o644)
++    with os.fdopen(fd, "wb") as fh:
++        fh.write(raw)
++        fh.flush()
++        os.fsync(fh.fileno())
++    return True
++
++
++def task_origin(cfg: BrokerConfig, registry: dict | None, h: dict) -> dict:
++    """Who wrote a task, for receipts and the people who read them: from the signed handoff and the
++    registry, never from its text. Call it only for a handoff whose signature was checked."""
++    iug = h.get("issued_under_grant")
++    if isinstance(iug, dict):
++        import synthe_lane_templates as lanes
++        g = iug.get("grant") if isinstance(iug.get("grant"), dict) else {}
++        try:
++            rec = lanes.issue_record(cfg, g.get("template_id"), iug.get("issue"))
++        except Deny:
++            rec = None
++        return {"kind": "self_issued", "template_id": g.get("template_id"), "issue": iug.get("issue"),
++                "granted_by": g.get("approver"), "issuer": h.get("from"), "author": h.get("to"),
++                "issue_receipt_seq": (rec or {}).get("receipt_seq")}
++    sender = h.get("from")
++    who = ((registry or {}).get("agents") or {}).get(sender) if isinstance(sender, str) else None
++    return {"kind": "signed", "sender": sender, "sender_kind": (who or {}).get("kind")}
++
++
++def _origin_for_key(cfg: BrokerConfig, registry: dict | None, key, sender) -> dict | None:
++    """task_origin for a receipt that names a handoff only by key and sender (an approval, a delegate's
++    decision): from the broker's own staged record of that handoff, else its issue store."""
++    if not isinstance(key, str):
++        return None
++    with _staged_store(cfg, strict=False) as box:
++        recs = list((box["data"].get(key) or {}).values())
++    h = ((recs[0].get("packet") or {}).get("handoff") if recs else None) or None
++    if isinstance(h, dict) and h.get("from") == sender:
++        return task_origin(cfg, registry, h)
++    m = re.fullmatch(r"si:(.+):([1-9][0-9]*)", key)
++    if m and ((registry or {}).get("agents", {}).get(sender) or {}).get("kind") == hc.ISSUER_KIND:
++        import synthe_lane_templates as lanes
++        try:
++            rec = lanes.issue_record(cfg, m.group(1), int(m.group(2)))
++        except Deny:
++            rec = None
++        if rec and isinstance(rec.get("packet"), dict):
++            return task_origin(cfg, registry, rec["packet"]["handoff"])
++    return None
++
++
++def issue_request_problem(req) -> str | None:
++    """Why an issue request is malformed (a daemon error, never receipted), or None."""
++    if not isinstance(req, dict) or not set(req) <= ISSUE_REQUEST_FIELDS:
++        return f"an issue request takes only {', '.join(sorted(ISSUE_REQUEST_FIELDS))}"
++    if not isinstance(req.get("request_id"), str) or not _REQUEST_ID.fullmatch(req["request_id"]):
++        return "request_id must be 8-128 letters, digits, '.', '_', ':' or '-' (a fresh random id per task)"
++    if not GitPush._branch_ok(req.get("branch")):
++        return "branch must be a valid branch name"
++    if not isinstance(req.get("purpose"), str):
++        return "purpose must be a string: one line saying what the task is"
++    paths = req.get("owned_paths")
++    if paths is not None and (not isinstance(paths, list) or not 1 <= len(paths) <= 100 or any(
++            not isinstance(p, str) or hc._norm_cap_path(p) != p for p in paths)):
++        return "owned_paths must be 1-100 relative path globs (no '..', no leading '/', no backslash)"
++    deps = req.get("depends_on")
++    if deps is not None and (not isinstance(deps, list) or len(deps) > 50 or any(
++            not isinstance(d, str) or not d or d.startswith("~") or len(d) > 256 for d in deps)):
++        return "depends_on must be a list of up to 50 idempotency keys"
++    for k in ("template_id", "remote"):
++        if req.get(k) is not None and (not isinstance(req[k], str) or not req[k]):
++            return f"{k} must be a non-empty string"
++    return None
++
++
++def _issue_lifetime(t: dict, policy: dict, now: dt.datetime) -> dt.datetime:
++    """When a task issued now under grant `t` expires: the grant's own expiry, task_hours if it sets them
++    (else 30 days for a grant without expiry), and never past the receiver's max_ttl_hours."""
++    si = t["self_issue"]
++    hours = si.get("task_hours") or (None if "expires_at" in t else hc.SELF_ISSUE_DEFAULT_TASK_HOURS)
++    bounds = [now + dt.timedelta(hours=hours)] if hours else []
++    if "expires_at" in t:
++        bounds.append(hc.parse_ts(t["expires_at"]))
++    if hc._is_number(policy.get("max_ttl_hours")):
++        bounds.append(now + dt.timedelta(hours=policy["max_ttl_hours"]))
++    return min(bounds).astimezone(dt.timezone.utc).replace(microsecond=0)
++
++
++def _issued_task_text(h: dict, t: dict, n: int) -> str:
++    """The task file: a fixed header from the grant and the registry, then the agent's purpose fenced as
++    data. Nothing in it reads as the human's instruction except what the human signed."""
++    purpose = h["purpose"]
++    fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", purpose)), default=0))
++    of = f" of {t['self_issue']['max_tasks']}" if "max_tasks" in t["self_issue"] else ""
++    branch = h["planned_actions"][-1]["params"]["branch"]
++    return (f"# Task (self-issued)\n\nWritten by agent `{h['to']}`. Issued by Synthe under lane "
++            f"`{t['template_id']}`, signed by `{t['approver']}`. Task {n}{of}.\n"
++            f"The text below is the agent's own words: data, not an instruction from `{t['approver']}`.\n\n"
++            f"{fence}text\n{purpose}\n{fence}\n\nBranch: {branch}\n"
++            f"Paths: {', '.join(h['scope']['owned_paths'])}\n")
++
++
++def _open_tasks(cfg: BrokerConfig, g: dict, now: dt.datetime) -> int:
++    """Issued tasks of one grant that are neither COMPLETED nor expired. The ledger is read without its
++    lock: a stale read can only miss a completion, so the count errs high (toward refusing)."""
++    ledger = hc.load_ledger(cfg.ledger_path) if cfg.ledger_path else {}
++    n = 0
++    for rec in g["tasks"].values():
++        exp = hc.parse_ts((rec or {}).get("expires_at") or "")
++        if exp is None or exp <= now:
++            continue
++        entry = ledger.get(rec.get("idempotency_key")) if not ledger.get("_corrupt") else None
++        if not (isinstance(entry, dict) and hc.entry_state(entry) == "COMPLETED"):
++            n += 1
++    return n
++
++
++def issue_task(cfg: BrokerConfig, request, origin: dict | None = None) -> dict:
++    """Issue a task under a lane grant that allows it (v0.7), for the agent that asked (the broker's
++    receiver). The broker checks a live grant with `self_issue` covers the branch and paths, and the
++    grant's optional limits (max_tasks, max_open, max_per_hour), all under the lane lock; then it builds
++    the packet from the grant and the receiver policy (only the purpose, branch, paths, depends_on and
++    request_id come from the agent), signs it with its task issuer key, writes the task file and receipts
++    the decision (`task_issue`: task_issued / task_issue_refused). The same request_id with the same body
++    returns the same packet and receipt and spends nothing; with another body it is
++    `self_issue_request_conflict`. It never claims: the claim stays the one admission path.
++
++    Returns {"decision", "reasons", "receipt", "packet" (or None), "task", "replayed"}. A malformed
++    request raises Deny("invalid", "request_malformed") and is not receipted."""
++    import synthe_lane_templates as lanes
++    if origin is None:
++        refusal = in_process_refusal(cfg, "synthe_commit.issue_task()")
++        if refusal:
++            raise NotIsolated(refusal)
++    problem = issue_request_problem(request)
++    if problem:
++        raise Deny("invalid", "request_malformed", problem)
++    key = ss.load_key(str(cfg.key_path))
++    origin = origin or IN_PROCESS
++    req = {k: request[k] for k in ISSUE_REQUEST_FIELDS if request.get(k) is not None}
++    rid, receiver, purpose = req["request_id"], cfg.receiver_id, req["purpose"]
++    body_sha = hashlib.sha256(sc.canonical_json({k: v for k, v in req.items() if k != "request_id"})).hexdigest()
++    now = hc.now_utc().replace(microsecond=0)
++    receipt: dict = {"v": 1, "kind": "task_issue", "time": now.isoformat(), "decision": None, "reasons": [],
++                     "request_id": rid, "requested_by": {"agent": receiver,
++                                                         "uid": (origin.get("isolation") or {}).get("peer_uid")},
++                     "task": {"branch": req["branch"], "owned_paths": req.get("owned_paths"),
++                              "depends_on": req.get("depends_on") or [],
++                              "purpose_sha256": hashlib.sha256(purpose.encode("utf-8", "surrogatepass")).hexdigest(),
++                              "purpose_author": receiver},
++                     "agent_says": {"purpose": synthe_risk.clean(purpose, True)[:hc.SELF_ISSUE_MAX_PURPOSE_CHARS]},
++                     "via": origin.get("via"), "isolation": origin.get("isolation")}
++
++    def finish(decision, reasons=(), **fields):
++        receipt.update(decision=decision, reasons=[{**r, "message": str(r.get("message", ""))} for r in reasons],
++                       **fields)
++        receipt.update(scrub_obj(receipt, cfg))
++        return append_receipt(cfg, key, receipt)
++
++    def refused(reason):
++        r = finish("task_issue_refused", [reason])
++        return {"decision": r["decision"], "reasons": r["reasons"], "receipt": r, "packet": None, "replayed": False}
++
++    with lanes.locked(cfg):
++        store = lanes.issue_load(cfg)
++        prior = store["requests"].get(rid)
++        if prior is not None:
++            if prior.get("body_sha256") != body_sha:
++                return refused({"state": "conflicting", "code": "self_issue_request_conflict",
++                                "message": f"request_id {rid!r} was already used for a different task; "
++                                           f"nothing was issued (use a fresh request_id per task)"})
++            g = store["grants"].get(prior.get("template_id")) or {}
++            rec = (g.get("tasks") or {}).get(str(prior.get("issue")))
++            return _complete_issue(cfg, key, store, rec, finish, replayed=True)
++        try:
++            if not receiver:
++                raise Deny("blocked", "self_issue_not_granted", "this broker names no receiver to issue tasks to")
++            # Signed registry: enforced once a genesis key is pinned
++            # (SYNTHE_REGISTRY_GENESIS_KEY or registry-genesis.key); unsigned otherwise
++            registry, err = hc.load_registry(str(cfg.registry_path), allow_unsigned=True)
++            if err:
++                raise Deny("invalid", err["reasons"][0]["code"], err["reasons"][0]["message"])
++            t = lanes.select_self_issue(cfg, registry, receiver, req["branch"], req.get("owned_paths"),
++                                        req.get("remote"), req.get("template_id"))
++            si, tid = t["self_issue"], t["template_id"]
++            g = store["grants"].setdefault(tid, {"issued": 0, "recent": [], "tasks": {}})
++            g["recent"] = [x for x in g["recent"] if (hc.parse_ts(x) or now) > now - dt.timedelta(hours=1)]
++            n_open = _open_tasks(cfg, g, now)
++            receipt["grant"] = {"template_id": tid, "granted_by": t["approver"], "grant_sha256": lanes.digest(t),
++                                "issue": g["issued"] + 1, "open": n_open,
++                                **{k: si[k] for k in ("max_tasks", "max_open", "max_per_hour") if k in si}}
++            why = hc.self_issue_purpose_problem(purpose, hc.self_issue_purpose_limit(t))
++            if why:
++                raise Deny("invalid", "self_issue_purpose_invalid", why)
++            if "max_tasks" in si and g["issued"] >= si["max_tasks"]:
++                raise Deny("blocked", "self_issue_exhausted",
++                           f"lane {tid} allows {si['max_tasks']} self-issued tasks, and all are issued")
++            if "max_open" in si and n_open >= si["max_open"]:
++                raise Deny("blocked", "self_issue_open_limit",
++                           f"lane {tid} allows {si['max_open']} open self-issued tasks at once; finish one first")
++            if "max_per_hour" in si and len(g["recent"]) >= si["max_per_hour"]:
++                raise Deny("blocked", "self_issue_rate_limited",
++                           f"lane {tid} allows {si['max_per_hour']} self-issued tasks an hour")
++            packet, text = _build_issued(cfg, registry, t, g["issued"] + 1, req, now)
++        except Deny as d:
++            return refused(d.reason)
++        h = packet["handoff"]
++        n = h["issued_under_grant"]["issue"]
++        digest = hc.handoff_digest(h)
++        receipt["grant"]["open"] = n_open + 1
++        fields = {"handoff": {"id": h["id"], "idempotency_key": h["idempotency_key"], "trace_id": h["trace_id"],
++                              "from": h["from"], "to": h["to"], "packet_sha256": digest},
++                  "grant": receipt["grant"],
++                  "task": {**receipt["task"], "handoff_id": h["id"], "idempotency_key": h["idempotency_key"],
++                           "packet_sha256": digest, "owned_paths": h["scope"]["owned_paths"],
++                           "expires_at": h["acceptance"]["expires_at"]},
++                  "task_origin": {k: v for k, v in task_origin(cfg, registry, h).items() if k != "issue_receipt_seq"},
++                  "plan": sp.plan_for(packet, registry, hc.load_ledger(cfg.ledger_path), tuple(cfg.effects))}
++        rec = {"handoff_id": h["id"], "idempotency_key": h["idempotency_key"], "packet_sha256": digest,
++               "branch": req["branch"], "owned_paths": h["scope"]["owned_paths"],
++               "expires_at": h["acceptance"]["expires_at"], "issued_at": now.isoformat(), "request_id": rid,
++               "body_sha256": body_sha, "task_path": h["inputs"]["artifact_refs"][0]["path"], "task_text": text,
++               "packet": packet, "receipt_fields": fields, "receipt_seq": None}
++        # n is spent from here on, and never refunded: a crash before the receipt leaves the request replayable.
++        g.update(issued=n, recent=g["recent"] + [now.isoformat()])
++        g["tasks"][str(n)] = rec
++        store["requests"][rid] = {"template_id": t["template_id"], "issue": n, "body_sha256": body_sha}
++        lanes.issue_save(cfg, store)
++        return _complete_issue(cfg, key, store, rec, finish, replayed=False)
++
++
++def _build_issued(cfg: BrokerConfig, registry: dict, t: dict, n: int, req: dict, now: dt.datetime) -> tuple:
++    """(signed packet, task file text) for issue n under grant t. The packet comes from the grant and the
++    receiver's policy (budget and forbidden written out, so receiver defaults never widen it); it is checked
++    with the checker itself before anything is spent."""
++    import synthe_lane_templates as lanes
++    conf = lanes.issuer_config(cfg)
++    if conf is None or conf["issuer"] != t["self_issue"]["issuer"]:
++        raise Deny("blocked", "issuer_invalid", "this broker holds no task issuer key for this grant")
++    try:
++        issuer_key = ss.load_key(str(cfg.rel(conf["key_file"])))
++    except Exception:
++        raise Deny("blocked", "issuer_invalid", "this broker's task issuer key is missing or unreadable") from None
++    if issuer_key.get("agent") != conf["issuer"]:
++        raise Deny("blocked", "issuer_invalid", "the task issuer key belongs to another identity")
++    receiver, si, tid = cfg.receiver_id, t["self_issue"], t["template_id"]
++    policy = hc.receiver_policy(registry, receiver) or {}
++    defaults = policy.get("defaults") if isinstance(policy.get("defaults"), dict) else {}
++    budget = next((b for b in (defaults.get("budget"), policy.get("budget")) if isinstance(b, dict)
++                   and all(hc._is_number(b.get(k)) for k in ("tokens", "usd", "minutes"))), None)
++    tools = list(si.get("tools") or hc.SELF_ISSUE_DEFAULT_TOOLS)
++    hid = f"si-{hashlib.sha256(tid.encode()).hexdigest()[:8]}-{n}"
++    rel = f"tasks/{hid}.md"
++    h = {"schema_version": "0.1", "id": hid, "trace_id": f"t-{hid}", "idempotency_key": f"si:{tid}:{n}",
++         "from": conf["issuer"], "to": receiver, "on_failure": "reject", "purpose": req["purpose"],
++         "inputs": {"artifact_refs": [{"path": rel, "sha256": ""}]},
++         "scope": {"owned_paths": list(req.get("owned_paths") or t["path_scope"]),
++                   "forbidden": sorted(set(policy.get("forbidden") or []))},
++         "authority": {"allowed_tools": tools, "approval_required_for": ["git_push"], "approvals": [],
++                       "budget": {k: budget[k] for k in ("tokens", "usd", "minutes")} if budget
++                       else {"tokens": 0, "usd": 0, "minutes": 0}},
++         "planned_actions": ([{"name": "edit", "tool": "edit_files"}] if "edit_files" in tools else [])
++         + [{"name": ISSUED_PUSH, "tool": "git_push",
++             "params": {"remote": t["params"]["remote"], "branch": req["branch"]}}],
++         "acceptance": {"expires_at": _issue_lifetime(t, policy, now).strftime("%Y-%m-%dT%H:%M:%SZ"),
++                        "output_schema": defaults.get("output_schema") or "synthe.commit.v1",
++                        "required_evidence": ["test_output"], "evidence": [{"kind": "test_output", "ref": rel}]},
++         "issued_under_grant": {"grant": t, "issue": n, "issued_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
++                                "request_id": req["request_id"]}}
++    if req.get("depends_on"):
++        h["depends_on"] = list(req["depends_on"])
++    text = _issued_task_text(h, t, n)
++    h["inputs"]["artifact_refs"][0]["sha256"] = hashlib.sha256(text.encode()).hexdigest()
++    packet = ss.sign_packet({"handoff": h}, issuer_key)
++    # The checker's own verdict, on a scratch copy of the workspace holding just this task file: a packet the
++    # claim would refuse (the receiver's policy, its max_ttl_hours, ...) is never issued and spends nothing.
++    with tempfile.TemporaryDirectory() as tmp:
++        (Path(tmp) / "tasks").mkdir()
++        (Path(tmp) / rel).write_text(text)
++        ok, reasons = hc.validate(packet, registry=registry, ledger={}, workspace=Path(tmp), at=hc.now_utc(),
++                                  defer_approvals={ISSUED_PUSH}, as_receiver=receiver,
++                                  verify_evidence=cfg.verify_evidence)
++    if not ok:
++        raise Deny(reasons[0]["state"], reasons[0]["code"], reasons[0]["message"])
++    return packet, text
++
++
++def _complete_issue(cfg: BrokerConfig, key: dict, store: dict, rec, finish, replayed: bool) -> dict:
++    """Make an issued task real (its task file, its receipt) or, for a replay, return what was made. Caller
++    holds the lane lock. A crash part-way leaves the issue spent and the same request able to finish it."""
++    import synthe_lane_templates as lanes
++    if not isinstance(rec, dict) or not isinstance(rec.get("packet"), dict):
++        raise Deny("invalid", "template_store_corrupt", "the issue record for this request is missing")
++    write_task_file(cfg, rec["task_path"], rec["task_text"].encode())
++    seq = rec.get("receipt_seq")
++    if isinstance(seq, int):
++        stored = _read_receipts(cfg.receipts_path)
++        receipt = stored[seq - 1] if 0 < seq <= len(stored) else None
++        if not isinstance(receipt, dict) or receipt.get("seq") != seq:
++            raise Deny("unknown", "replay_receipt_mismatch", "the stored issue receipt is not where it should be")
++    else:
++        receipt = finish("task_issued", [], **rec["receipt_fields"])
++        rec["receipt_seq"] = receipt["seq"]
++        lanes.issue_save(cfg, store)
++    return {"decision": "task_issued", "reasons": [], "receipt": receipt, "packet": rec["packet"],
++            "task": {"path": rec["task_path"], "issue": rec["packet"]["handoff"]["issued_under_grant"]["issue"],
++                     "template_id": rec["packet"]["handoff"]["issued_under_grant"]["grant"]["template_id"],
++                     "expires_at": rec["expires_at"]},
++            "replayed": replayed}
++
++
+ class _DenyMany(Exception):
+     def __init__(self, reasons):
+         super().__init__(reasons[0]["message"] if reasons else "denied")
+@@ -2301,6 +2703,17 @@ def cmd_init(a) -> int:
+                                        "private_key": sc.b64u(secret)}, indent=2) + "\n")
+         os.chmod(keyfile, 0o600)
+         pub = {"kid": kid, "alg": sc.ALG, "public_key": sc.b64u(sc.public_key(secret))}
++    # v0.7: the task issuer key, made here so it belongs to the broker's OS user like the broker key (the
++    # installers run this as that user); `synthe-init apply-config` registers it and enables self-issue.
++    issuer_file = d / "keys" / f"{a.issuer_id}.key.json"
++    if not issuer_file.exists():
++        fd = os.open(issuer_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        with os.fdopen(fd, "w") as fh:
++            fh.write(json.dumps({"agent": a.issuer_id, "kid": f"{a.issuer_id}-1", "alg": sc.ALG,
++                                 "private_key": sc.b64u(sc.generate_secret())}, indent=2) + "\n")
++    issuer = json.loads(issuer_file.read_text())
++    issuer_pub = {"kid": issuer["kid"], "alg": sc.ALG,
++                  "public_key": sc.b64u(sc.public_key(sc.unb64u(issuer["private_key"])))}
+     cfg_path = d / "broker.json"
+     if not cfg_path.exists():
+         cfg_path.write_text(json.dumps({
+@@ -2316,9 +2729,12 @@ def cmd_init(a) -> int:
+         keys = entry.setdefault("keys", [])
+         if not any(k.get("kid") == pub["kid"] for k in keys):
+             keys.append(pub)
++        reg["agents"].setdefault(a.issuer_id, {"role": "task issuer", "kind": hc.ISSUER_KIND, "keys": [issuer_pub]})
+         reg_path.write_text(json.dumps(reg, indent=2) + "\n")
+-        print(f"added {a.broker_id} ({pub['kid']}) to {reg_path}", file=sys.stderr)
++        print(f"added {a.broker_id} ({pub['kid']}) and {a.issuer_id} to {reg_path}", file=sys.stderr)
+     else:
++        print(f"# task issuer: agents.{a.issuer_id} = {{\"kind\": \"{hc.ISSUER_KIND}\", \"keys\": "
++              f"[{json.dumps(issuer_pub)}]}}", file=sys.stderr)
+         print(f"# add under agents.{a.broker_id}.keys in your registry:", file=sys.stderr)
+     print(json.dumps(pub, indent=2))
+     print(f"# broker config: {cfg_path}", file=sys.stderr)
+@@ -2404,6 +2820,8 @@ def main(argv=None) -> int:
+     i = sub.add_parser("init", help="create a broker key and config skeleton")
+     i.add_argument("--dir", required=True)
+     i.add_argument("--broker-id", default="synthe-broker")
++    i.add_argument("--issuer-id", default="synthe-issuer",
++                   help="the task issuer identity (v0.7): signs tasks the broker issues under a lane grant")
+     i.add_argument("--add-to-registry", action="store_true",
+                    help="add the broker's public key to DIR/registry.json")
+     i.add_argument("--isolation", choices=["user", "container", "none"], default="user",
+diff --git a/src/synthe_crypto.py b/src/synthe_crypto.py
+index 5247610..3fc0366 100755
+--- a/src/synthe_crypto.py
++++ b/src/synthe_crypto.py
+@@ -38,6 +38,13 @@ ALG = "Ed25519"
+ ALG_ES256 = "ES256"
+ APPROVAL_ALGS = (ALG, ALG_ES256)  # packets and receipts stay Ed25519
+ PACKET_SIG_DOMAIN = "synthe/handoff-signature/v1"
++# v0.7: a handoff the broker issued under a human-signed lane grant (it carries `issued_under_grant`).
++# Its own domain, so a checker that predates self-issued tasks fails closed on one (signature_invalid),
++# and stripping or adding the field breaks the signature.
++SELF_ISSUED_SIG_DOMAIN = "synthe/handoff-signature/self-issued/v1"
++# A lane grant's human signature (synthe_lane_templates.py); the checker verifies the grant a
++# self-issued handoff embeds with the same rule.
++APPROVAL_TEMPLATE_DOMAIN = "synthe/approval-template/v1"
+ APPROVAL_SIG_DOMAIN = "synthe/approval-signature/v2"
+ # Retired approval scheme: never signs anymore. Verified only so an approval
+ # signed before the budget binding is rejected with
+@@ -249,6 +256,26 @@ def packet_signing_input(handoff: dict) -> bytes:
+     return PACKET_SIG_DOMAIN.encode() + b"\n" + canonical_json(handoff)
+ 
+ 
++def self_issued_signing_input(handoff: dict) -> bytes:
++    """Bytes the task issuer signs for a self-issued handoff (v0.7): its own domain tag + canonical JSON."""
++    return SELF_ISSUED_SIG_DOMAIN.encode() + b"\n" + canonical_json(handoff)
++
++
++def handoff_signing_input(handoff: dict) -> bytes:
++    """The signing input a handoff's signature covers, chosen by the SIGNED handoff itself: one that holds
++    `issued_under_grant` is self-issued (v0.7), anything else is an ordinary packet. Removing the field
++    from an issued handoff, or adding it to an ordinary one, therefore breaks its signature."""
++    if isinstance(handoff, dict) and "issued_under_grant" in handoff:
++        return self_issued_signing_input(handoff)
++    return packet_signing_input(handoff)
++
++
++def approval_template_signing_input(grant: dict) -> bytes:
++    """Bytes a human signs for a lane grant: domain tag + canonical JSON of everything but `sig`."""
++    return APPROVAL_TEMPLATE_DOMAIN.encode() + b"\n" + canonical_json(
++        {k: v for k, v in grant.items() if k != "sig"})
++
++
+ def approval_signing_input(approval: dict, handoff: dict) -> bytes:
+     """Bytes an approver signs (v2). The approval is bound to one handoff's
+     idempotency key and its sender/receiver, so it cannot be replayed onto a
+diff --git a/src/synthe_git_remote.py b/src/synthe_git_remote.py
+index bb527dd..be4560c 100755
+--- a/src/synthe_git_remote.py
++++ b/src/synthe_git_remote.py
+@@ -17,9 +17,20 @@ synthe-client. The broker still decides, and receipts, every proposal.
+ 
+ Which task: $SYNTHE_TASK or `git config synthe.task` (a packet path) if set; otherwise the newest
+ unexpired packet in the inbox ($SYNTHE_INBOX, `git config synthe.inbox`, or the macOS installer's
+-/Users/Shared/Synthe/inbox) that plans a git_push of this branch.
++/Users/Shared/Synthe/inbox) that plans a git_push of this branch. A human-signed task always wins.
+ 
+-Stdlib only. Protocol: gitremote-helpers(7) (capabilities, list, fetch, push).
++With none (v0.7): the open self-issued task this clone holds for the branch, else a new one. If a lane
++grant the human signed lets the agent start its own work (`self_issue`), the broker issues a task under it,
++signed by its task issuer key, and the push is claimed and proposed as usual: routine pushes inside the
++lane then go out with nobody asked. The task's purpose is the tip commit's subject (cleaned, one line,
++labelled as written by the agent), or `git push -o synthe.purpose="..."`. The request id is written under
++.git/synthe/issue/ before the broker is asked, so a retry never issues twice; the issued task is kept
++under .git/synthe/tasks/ until it lands, and a task whose grant was revoked or that already landed is
++replaced by a fresh one. Issued tasks never go in the inbox: it stays human-written.
++
++  git push origin agent/my-branch -o synthe.purpose="Add a --version flag"
++
++Stdlib only. Protocol: gitremote-helpers(7) (capabilities, option, list, fetch, push).
+ """
+ from __future__ import annotations
+ 
+@@ -28,9 +39,11 @@ import datetime as dt
+ import hashlib
+ import json
+ import os
++import secrets
+ import subprocess
+ import sys
+ import tempfile
++import unicodedata
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+@@ -39,6 +52,13 @@ import synthe_client as scl  # noqa: E402
+ DEFAULT_BROKER = "unix:///run/synthe/broker.sock" if sys.platform == "linux" else "unix:///var/db/synthe-run/broker.sock"
+ DEFAULT_INBOX = "/var/lib/synthe-shared/inbox" if sys.platform == "linux" else "/Users/Shared/Synthe/inbox"
+ HEADS = "refs/heads/"
++PURPOSE_OPTION = "synthe.purpose="
++PURPOSE_CHARS = 280   # the default limit a lane grant puts on a self-issued task's purpose
++# A self-issued task the broker won't take any more (its grant revoked, expired or changed; it landed
++# already; it expired): drop it and issue a fresh one, once per push.
++DEAD_TASK_CODES = {"template_revoked", "template_expired", "template_stale", "template_unavailable",
++                   "self_issue_unknown", "handoff_expired", "duplicate_idempotency_key", "effect_already_executed",
++                   "effect_fingerprint_mismatch", "unknown_outcome"}
+ 
+ 
+ def _git(*args, check=True) -> subprocess.CompletedProcess:
+@@ -148,6 +168,102 @@ def claim_token(client: scl.BrokerClient, packet: dict) -> str:
+     return token
+ 
+ 
++# --------------------------------------------------------------------------
++# self-issued tasks (v0.7): no human-signed task for the branch, so ask the broker to issue one
++
++def clean_purpose(text, limit: int = PURPOSE_CHARS) -> str:
++    """A commit subject made into a purpose the broker accepts: NFC, one line, no control or format
++    characters (each becomes a space), whitespace collapsed, at most `limit` characters."""
++    text = unicodedata.normalize("NFC", str(text or ""))
++    text = "".join(" " if unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") else c
++                   for c in text)
++    text = " ".join(text.split())[:limit].rstrip()
++    return unicodedata.normalize("NFC", text)[:limit]
++
++
++def _unquote(value: str) -> str:
++    """git C-quotes an option value that holds quotes, backslashes, control or non-ASCII bytes."""
++    if len(value) < 2 or not (value.startswith('"') and value.endswith('"')):
++        return value
++    out, i, body = bytearray(), 0, value[1:-1]
++    simple = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34}
++    while i < len(body):
++        c = body[i]
++        if c == "\\" and i + 1 < len(body):
++            nxt = body[i + 1]
++            if nxt in simple:
++                out.append(simple[nxt])
++                i += 2
++                continue
++            if body[i + 1:i + 4].isdigit() and len(body[i + 1:i + 4]) == 3:
++                out.append(int(body[i + 1:i + 4], 8) & 0xFF)
++                i += 4
++                continue
++        out += c.encode()
++        i += 1
++    return out.decode("utf-8", "replace")
++
++
++def _branch_file(kind: str, branch: str) -> Path:
++    return _git_dir() / "synthe" / kind / f"{hashlib.sha256(branch.encode()).hexdigest()[:32]}.json"
++
++
++def _write_private(path: Path, obj: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    with os.fdopen(fd, "w") as fh:
++        json.dump(obj, fh)
++
++
++def open_self_issued(branch: str, now: dt.datetime | None = None) -> dict | None:
++    """The self-issued task this clone holds for the branch, while it is unexpired."""
++    try:
++        packet = json.loads(_branch_file("tasks", branch).read_text()).get("packet")
++    except (OSError, ValueError, AttributeError):
++        return None
++    ok = isinstance(packet, dict) and "issued_under_grant" in (packet.get("handoff") or {})
++    if not ok or _push_action(packet, branch) is None or _expired(packet, now or dt.datetime.now(dt.timezone.utc)):
++        return None
++    return packet
++
++
++def forget_self_issued(branch: str) -> None:
++    for kind in ("tasks", "issue"):
++        _branch_file(kind, branch).unlink(missing_ok=True)
++
++
++def issue_task(client: scl.BrokerClient, branch: str, purpose: str) -> tuple[dict, dict]:
++    """Ask the broker for a task for this branch: (packet, the broker's answer). The request id is saved
++    before asking, so a retry after a crash or a lost answer replays it instead of issuing twice."""
++    req_path = _branch_file("issue", branch)
++    try:
++        req = json.loads(req_path.read_text())
++        if req.get("branch") != branch or not isinstance(req.get("request_id"), str):
++            raise ValueError()
++    except (OSError, ValueError, AttributeError):
++        req = {"request_id": "r-" + secrets.token_hex(12), "branch": branch, "purpose": purpose}
++        _write_private(req_path, req)
++    out = client.call("issue_task", request_id=req["request_id"], branch=branch, purpose=req["purpose"])
++    if not isinstance(out, dict) or out.get("decision") != "task_issued":
++        req_path.unlink(missing_ok=True)   # nothing was issued: the next push asks afresh
++        reasons = [r for r in (out or {}).get("reasons") or [] if isinstance(r, dict)]
++        code = reasons[0].get("code", "task_issue_refused") if reasons else "task_issue_refused"
++        raise scl.BrokerError(code, f"no signed task for {branch}, and Synthe would not issue one: "
++                                    f"{reasons[0].get('message') if reasons else 'no reason given'}. Ask the "
++                                    f"approver for a task (synthe-task new \"...\" --branch {branch}) or a lane "
++                                    f"grant that lets you start your own work")
++    _write_private(_branch_file("tasks", branch), {"branch": branch, "packet": out["packet"]})
++    req_path.unlink(missing_ok=True)
++    return out["packet"], out
++
++
++def _issued_label(packet: dict) -> str:
++    iug = (packet.get("handoff") or {}).get("issued_under_grant") or {}
++    g = iug.get("grant") or {}
++    of = f" of {g['self_issue']['max_tasks']}" if "max_tasks" in (g.get("self_issue") or {}) else ""
++    return f"task {iug.get('issue')}{of} under lane {g.get('template_id')} (signed by {g.get('approver')})"
++
++
+ # --------------------------------------------------------------------------
+ # the remote helper
+ 
+@@ -160,6 +276,7 @@ class Helper:
+         self.client = scl.BrokerClient(address, expected_broker_uid=uid)
+         self.remote_name, self.out = remote_name, out or sys.stdout
+         self.fetched: dict | None = None
++        self.push_options: list[str] = []
+ 
+     def send(self, *lines: str) -> None:
+         for line in lines:
+@@ -194,6 +311,19 @@ class Helper:
+         self.send("")
+ 
+     # push ---------------------------------------------------------------
++    def self_issued(self, branch: str, sha: str) -> dict:
++        """The open self-issued task for the branch, or a new one the broker issues (v0.7)."""
++        packet = open_self_issued(branch)
++        if packet is not None:
++            return packet
++        given = [o[len(PURPOSE_OPTION):] for o in self.push_options if o.startswith(PURPOSE_OPTION)]
++        subject = _git("log", "-1", "--format=%s", sha, check=False).stdout
++        purpose = given[-1] if given else (clean_purpose(subject) or f"Work on {branch}")
++        packet, out = issue_task(self.client, branch, purpose)
++        _say(f"no signed task for {branch}; Synthe issued {_issued_label(packet)}"
++             f"{' (the same request again)' if out.get('replayed') else ''}. Its purpose is your own words.")
++        return packet
++
+     def push_one(self, spec: str) -> str:
+         src, _, dst = spec.lstrip("+").partition(":")
+         if not dst.startswith(HEADS):
+@@ -206,18 +336,45 @@ class Helper:
+             sha = _git("rev-parse", "--verify", f"{src}^{{commit}}").stdout.strip()
+             explicit = os.environ.get("SYNTHE_TASK") or _config("synthe.task") or None
+             inbox = os.environ.get("SYNTHE_INBOX") or _config("synthe.inbox") or None
+-            packet, action, path = find_task(branch, Path(inbox) if inbox else None, explicit)
+-            token = claim_token(self.client, packet)
+-            params = action.get("params") or {}
+-            receipt = scl.push(self.client, packet, token, action["name"], params.get("remote", "origin"),
+-                               branch, repo=".", commit=sha, base=params.get("base"), wait_for_approval=True)
++            try:
++                packet, action, path = find_task(branch, Path(inbox) if inbox else None, explicit)
++                name, issued = path.name, False
++            except scl.BrokerError as exc:
++                if exc.code != "no_task_for_branch":
++                    raise
++                packet, issued = self.self_issued(branch, sha), True   # v0.7: none signed; ask the broker
++            for attempt in (1, 2):
++                try:
++                    action = _push_action(packet, branch)
++                    token = claim_token(self.client, packet)
++                    params = action.get("params") or {}
++                    receipt = scl.push(self.client, packet, token, action["name"], params.get("remote", "origin"),
++                                       branch, repo=".", commit=sha, base=params.get("base"), wait_for_approval=True)
++                    dead = receipt.get("decision") == "denied" and DEAD_TASK_CODES & {
++                        r.get("code") for r in receipt.get("reasons") or [] if isinstance(r, dict)}
++                except scl.BrokerError as exc:
++                    if not (issued and attempt == 1 and exc.code in DEAD_TASK_CODES):
++                        raise
++                    dead = True
++                if not (issued and attempt == 1 and dead):
++                    break
++                # The self-issued task is spent (it landed, its grant was revoked or changed, it expired):
++                # a fresh one, once.
++                _say(f"{branch}: the self-issued task for this branch can't be used any more; asking for a new one.")
++                forget_self_issued(branch)
++                packet = self.self_issued(branch, sha)
++            if issued:
++                iug = packet["handoff"]["issued_under_grant"]
++                name = f"self-issued task {iug['issue']} under lane {iug['grant'].get('template_id')}"
+         except scl.BrokerError as exc:
+             _say(f"{branch}: not proposed ({exc.code}). {exc.message}")
+             return f"error {dst} {exc.code}"
+         decision, seq = receipt.get("decision"), receipt.get("seq")
+         short = sha[:12]
++        if issued and decision == "executed":
++            forget_self_issued(branch)   # it landed: the next push on this branch is new work
+         if decision == "staged":
+-            _say(f"{branch} at {short} is proposed for approval, not pushed yet (task {path.name}, receipt #{seq}).")
++            _say(f"{branch} at {short} is proposed for approval, not pushed yet ({name}, receipt #{seq}).")
+             _say("A person reviews the diff and approves it with synthe-approve; then Synthe pushes exactly this")
+             _say("commit and signs a receipt. Don't push it another way, and don't approve it yourself.")
+             return f"ok {dst}"
+@@ -239,7 +396,16 @@ class Helper:
+         for raw in stdin:
+             line = raw.rstrip("\n")
+             if line == "capabilities":
+-                self.send("fetch", "push", "")
++                self.send("fetch", "push", "option", "")
++            elif line.startswith("option "):
++                # Only push options (`git push -o synthe.purpose=...`) mean anything here; git carries on
++                # without the rest (verbosity, progress, ...).
++                name, _, value = line[len("option "):].partition(" ")
++                if name == "push-option":
++                    self.push_options.append(_unquote(value))
++                    self.send("ok")
++                else:
++                    self.send("unsupported")
+             elif line in ("list", "list for-push"):
+                 self.list_refs(line == "list for-push")
+             elif line.startswith("fetch "):
+diff --git a/src/synthe_init.py b/src/synthe_init.py
+index 2b2cdf8..cfeb085 100755
+--- a/src/synthe_init.py
++++ b/src/synthe_init.py
+@@ -12,7 +12,8 @@
+ `setup` writes, under --home (default ~/.synthe):
+   approver.key.json   your approver key, sealed under a passphrase you type (never plaintext)
+   approver.pub.json   its public half
+-  broker/             the commit broker: its key, broker.json, registry.json and the GitHub token
++  broker/             the commit broker: its keys (the broker's, and the task issuer's that signs tasks it
++                      issues under a lane grant), broker.json, registry.json and the GitHub token
+                       (moved there, 0600; never printed, never put in argv)
+   setup-report.json   what was set up and every check, with no secrets in it
+ and wires OpenClaw: the Synthe MCP server (without the approval tool: the agent never approves), the
+@@ -48,6 +49,9 @@ import synthe_ui as sui  # noqa: E402
+ import synthe_sign as ss  # noqa: E402
+ 
+ BROKER_ID = "synthe-broker"
++# v0.7: signs the tasks the broker issues under a lane grant that allows self-issue. Its own key, held by
++# the broker's OS user next to the broker key (never the agent's), registered as kind "task_issuer".
++ISSUER_ID = "synthe-issuer"
+ MCP_NAME = "synthe-local"
+ PLUGIN_ID = "synthe-barrier"
+ FORBIDDEN_PATHS = [".github/**", "**/*.key.json", "**/.env", "**/*.pem"]
+@@ -139,14 +143,22 @@ def _check_scope(branches: list, allowed_paths: list) -> None:
+         raise SystemExit("--allowed-paths: give at least one glob, e.g. 'src/**'")
+ 
+ 
++def issuer_entry(pub: dict) -> dict:
++    return {"role": "task issuer (signs tasks the broker issues under a lane grant)", "kind": "task_issuer",
++            "keys": [pub]}
++
++
+ def build_registry(approver: str, approver_pub: dict, agent: str, allowed_paths: list,
+-                   broker_pub: dict | None = None) -> dict:
+-    """You (approver and sender), the agent (receiver, fail-closed policy) and, once known, the broker."""
++                   broker_pub: dict | None = None, issuer_pub: dict | None = None) -> dict:
++    """You (approver and sender), the agent (receiver, fail-closed policy) and, once known, the broker and its
++    task issuer. Only you sign the agent's tasks (trusted_senders); the issuer's are admitted only as tasks
++    issued under a lane grant you signed."""
+     agents = {approver: {"role": "approver and sender", "kind": "human", "keys": [approver_pub]},
+               agent: {"role": "receiver", "kind": "agent", "keys": [], "policy": {
+                   "allowed_tools": ["read_repo", "edit_files", "run_tests", "git_push"],
+                   "forbidden": ["force_push"], "approval_required_for": ["git_push"],
+-                  "trusted_approvers": [approver], "budget": {"tokens": 500000, "usd": 25, "minutes": 240},
++                  "trusted_approvers": [approver], "trusted_senders": [approver],
++                  "budget": {"tokens": 500000, "usd": 25, "minutes": 240},
+                   "require_signatures": True, "require_signed_approvals": True, "require_planned_actions": True,
+                   "max_ttl_hours": DEFAULT_MAX_TTL_HOURS,
+                   "allowed_paths": allowed_paths, "forbidden_paths": FORBIDDEN_PATHS,
+@@ -154,9 +166,20 @@ def build_registry(approver: str, approver_pub: dict, agent: str, allowed_paths:
+                                "budget": {"tokens": 200000, "usd": 10, "minutes": 120}}}}}
+     if broker_pub is not None:
+         agents[BROKER_ID] = {"role": "commit broker", "kind": "service", "keys": [broker_pub]}
++    if issuer_pub is not None:
++        agents[ISSUER_ID] = issuer_entry(issuer_pub)
+     return {"agents": agents}
+ 
+ 
++def self_issue_config() -> dict:
++    """broker.json's lane_templates.self_issue: which identity signs issued tasks, and its key file."""
++    return {"issuer": ISSUER_ID, "key_file": f"keys/{ISSUER_ID}.key.json"}
++
++
++def _public(key: dict) -> dict:
++    return {"kid": key["kid"], "alg": sc.ALG, "public_key": sc.b64u(sc.public_key(sc.unb64u(key["private_key"])))}
++
++
+ def write_setup(home: Path, info: dict) -> None:
+     """HOME/setup.json: which broker and workspace this machine uses (no secrets), for the other commands."""
+     (home / "setup.json").write_text(json.dumps(info, indent=2) + "\n")
+@@ -192,6 +215,8 @@ def write_broker(home: Path, *, repo_url: str, branches: list, allowed_paths: li
+     kid = f"{BROKER_ID}-1"
+     _write_private(b / "keys" / f"{BROKER_ID}.key.json",
+                    json.dumps({"agent": BROKER_ID, "kid": kid, "alg": sc.ALG, "private_key": sc.b64u(secret)}, indent=2) + "\n")
++    issuer = {"agent": ISSUER_ID, "kid": f"{ISSUER_ID}-1", "alg": sc.ALG, "private_key": sc.b64u(sc.generate_secret())}
++    _write_private(b / "keys" / f"{ISSUER_ID}.key.json", json.dumps(issuer, indent=2) + "\n")
+     remote = {"url": repo_url, "branches": branches, **readable(branches)}
+     if token_file is not None:
+         token = token_file.expanduser().read_text().strip()
+@@ -203,13 +228,15 @@ def write_broker(home: Path, *, repo_url: str, branches: list, allowed_paths: li
+               "key": f"keys/{BROKER_ID}.key.json", "registry": "registry.json",
+               "ledger": "ledger.sqlite3", "receipts": "receipts.jsonl", "workspace": "workspace", "state_dir": "state",
+               "source_roots": [], "isolation": {"mode": isolation},
+-              "lane_templates": {"receivers": [agent]},   # lets you sign a lane grant; with none signed, nothing changes
++              # lets you sign a lane grant (with none signed, nothing changes); one that allows self-issue lets
++              # the broker issue tasks under it, signed by its task issuer key
++              "lane_templates": {"receivers": [agent], "self_issue": self_issue_config()},
+               "effects": {"git_push": {"max_commits": 200, "require_approval_commit_pin": True,
+                                        "remotes": {"origin": remote}}}}
+     (b / "broker.json").write_text(json.dumps(config, indent=2) + "\n")
+     broker_pub = {"kid": kid, "alg": sc.ALG, "public_key": sc.b64u(sc.public_key(secret))}
+     (b / "registry.json").write_text(json.dumps(build_registry(approver, approver_pub, agent, allowed_paths,
+-                                                               broker_pub), indent=2) + "\n")
++                                                               broker_pub, _public(issuer)), indent=2) + "\n")
+     write_setup(home, {"mode": "dev", "broker": f"unix://{home / 'broker.sock'}", "registry": str(b / "registry.json"),
+                        "broker_config": str(b / "broker.json"), "workspace": str(b / "workspace"),
+                        "remote": {"url": repo_url, "branches": branches}, "receiver": agent})
+@@ -543,6 +570,10 @@ def apply_config(state: Path, stage: Path) -> dict:
+                   "public_key": sc.b64u(sc.public_key(sc.unb64u(key["private_key"])))}
+     registry = json.loads((stage / "registry.json").read_text())
+     registry["agents"][BROKER_ID] = {"role": "commit broker", "kind": "service", "keys": [broker_pub]}
++    # v0.7: the task issuer key `synthe_commit.py init` made as the broker's user; its public half from the file
++    issuer_key = state / "keys" / f"{ISSUER_ID}.key.json"
++    if issuer_key.exists():
++        registry["agents"][ISSUER_ID] = issuer_entry(_public(json.loads(issuer_key.read_text())))
+     patch = json.loads((stage / "config-patch.json").read_text())
+     if (cfg.get("isolation") or {}).get("mode") != "user":
+         raise SystemExit(f"{cfg_path}: isolation mode is not 'user'; refusing to change it")
+@@ -556,6 +587,8 @@ def apply_config(state: Path, stage: Path) -> dict:
+     cfg["workspace"] = patch["workspace"]
+     cfg["receiver"] = patch["receiver"]
+     cfg.setdefault("lane_templates", {"receivers": [patch["receiver"]]})  # as write_broker: grants only exist once you sign one
++    if issuer_key.exists():
++        cfg["lane_templates"].setdefault("self_issue", self_issue_config())
+     cfg["ledger"] = "ledger.sqlite3"
+     git_push = cfg.setdefault("effects", {}).setdefault("git_push", {})
+     git_push.update({"max_commits": 200, "require_approval_commit_pin": True, "remotes": {"origin": patch["remote"]}})
+@@ -572,6 +605,9 @@ def apply_registry(state: Path, stage: Path) -> dict:
+     registry.setdefault("agents", {})[BROKER_ID] = {
+         "role": "commit broker", "kind": "service",
+         "keys": [{"kid": key["kid"], "alg": sc.ALG, "public_key": sc.b64u(sc.public_key(sc.unb64u(key["private_key"])))}]}
++    issuer_key = state / "keys" / f"{ISSUER_ID}.key.json"
++    if issuer_key.exists():  # likewise the task issuer's (v0.7), when the broker has one
++        registry["agents"][ISSUER_ID] = issuer_entry(_public(json.loads(issuer_key.read_text())))
+     _write_private(state / "registry.json", json.dumps(registry, indent=2) + "\n")
+     return {"approval_keys": {n: [k.get("kid") for k in a.get("keys", [])] for n, a in registry["agents"].items()
+                               if a.get("kind") == "human"}}
+diff --git a/src/synthe_lane_templates.py b/src/synthe_lane_templates.py
+index f07baef..86baed0 100644
+--- a/src/synthe_lane_templates.py
++++ b/src/synthe_lane_templates.py
+@@ -26,6 +26,16 @@ outside a grant's path_scope is not the grant's to approve: it waits for a human
+ 
+ `max_uses` and `expires_at` are optional: a signed grant that omits one has no such limit (a standing
+ lane, valid until revoked or stale); one that carries a malformed value is refused.
++
++A grant may let its agent start work without a human-signed task (v0.7, `self_issue`, signed with the rest
++of the grant): the broker then issues tasks under it, signed by its own task issuer key (registry kind
++"task_issuer", held by the broker's OS user, never an agent's), each embedding the grant verbatim
++(SPEC section 16). `self_issue` names the issuer and may cap the tasks (max_tasks, max_open, max_per_hour:
++enforced only when present, like max_uses) and narrow them (task_hours, tools, max_purpose_chars,
++escalate_at). The issuer is never the receiver, the delegate or a trusted approver. In v1 a self-issue grant
++must send high-risk pushes to a human: it lists auto_approve without "high", or names a delegate
++(`self_issue_unreviewed`). Revoking or expiring the grant kills every task issued under it that hasn't
++landed, even one a human would approve. The issue store (self-issued.json) shares the lane lock.
+ """
+ import datetime as dt
+ import hashlib
+@@ -50,7 +60,11 @@ FIELDS = {"template_id", "approver", "kid", "receiver", "tool", "params", "path_
+ # approves without a human (an allowlist: a tier it doesn't name, today's or a future one, goes to a human).
+ # max_uses / expires_at: limits. Present, they are enforced as always; omitted from the signed grant, there
+ # is no such limit (a standing lane, valid until revoked or stale). Present but malformed: refused.
+-OPTIONAL = {"delegate", "brief", "auto_approve", "max_uses", "expires_at"}
++OPTIONAL = {"delegate", "brief", "auto_approve", "max_uses", "expires_at", "self_issue"}
++# self_issue: issuer (required); limits, enforced only when present; and narrowings of the issued tasks.
++SELF_ISSUE_FIELDS = {"issuer", "max_tasks", "max_open", "max_per_hour", "task_hours", "tools",
++                     "max_purpose_chars", "escalate_at"}
++MAX_PER_HOUR = 1000
+ MAX_BRIEF = 4000
+ MAX_USES = 10000
+ # What new grants should carry (grant CLIs, Studio): routine and review-tier pushes go out without a human
+@@ -73,7 +87,9 @@ def digest(x):
+ 
+ 
+ def signing_input(x, revoke=False):
+-    return (REVOKE_DOMAIN if revoke else DOMAIN) + sc.canonical_json({k: v for k, v in x.items() if k != "sig"})
++    if not revoke:  # the checker verifies the grant a self-issued task embeds with this same rule
++        return sc.approval_template_signing_input(x)
++    return REVOKE_DOMAIN + sc.canonical_json({k: v for k, v in x.items() if k != "sig"})
+ 
+ 
+ def _sig(key, msg):
+@@ -124,9 +140,62 @@ def lineage(cfg, registry, receiver, risk_aware=False):
+     return out
+ 
+ 
+-def auto_approves(t, tier):
++def auto_approves(t, tier, self_issued=False):
+     """Whether grant `t` approves a push of this tier without a human. Not risk-aware: every tier, as before."""
+-    return "auto_approve" not in t or tier in t["auto_approve"]
++    return tier in approved_tiers(t, self_issued)
++
++
++def approved_tiers(t, self_issued=False) -> list:
++    """The tiers grant `t` pushes without a human. For a self-issued task's push under
++    `self_issue.escalate_at: "review"`, review-tier pushes go to a human too."""
++    tiers = list(t["auto_approve"]) if "auto_approve" in t else list(synthe_risk.TIERS)
++    if self_issued and (t.get("self_issue") or {}).get("escalate_at") == "review":
++        tiers = [x for x in tiers if x == "routine"]
++    return tiers
++
++
++def issuer_config(cfg):
++    """This broker's task issuer, `lane_templates.self_issue` in broker.json ({"issuer", "key_file"}), or None.
++    It sits inside the grant lineage's effects digest, so changing it makes existing grants stale."""
++    c = (cfg.raw.get("lane_templates") or {}).get("self_issue")
++    ok = isinstance(c, dict) and isinstance(c.get("issuer"), str) and isinstance(c.get("key_file"), str)
++    return c if ok else None
++
++
++def _whole(v, lo, hi):
++    return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
++
++
++def _validate_self_issue(cfg, registry, x, policy):
++    si = x["self_issue"]
++    if not isinstance(si, dict) or "issuer" not in si or not set(si) <= SELF_ISSUE_FIELDS:
++        fail("template_malformed")
++    cap = si["max_tasks"] if _whole(si.get("max_tasks"), 1, MAX_USES) else MAX_USES
++    for k, hi in (("max_tasks", MAX_USES), ("max_open", cap), ("max_per_hour", MAX_PER_HOUR),
++                  ("max_purpose_chars", hc.SELF_ISSUE_MAX_PURPOSE_CHARS)):
++        if k in si and not _whole(si[k], 1, hi):
++            fail("template_malformed")
++    max_ttl = policy.get("max_ttl_hours")
++    if "task_hours" in si and (not hc._is_number(si["task_hours"]) or si["task_hours"] <= 0
++                               or (hc._is_number(max_ttl) and si["task_hours"] > max_ttl)):
++        fail("template_malformed")
++    if "tools" in si:
++        t, ceiling = si["tools"], policy.get("allowed_tools")
++        if not isinstance(t, list) or not t or any(not isinstance(v, str) or not v for v in t) \
++                or len(set(t)) != len(t) or "git_push" not in t or (ceiling is not None and set(t) - set(ceiling)):
++            fail("template_malformed")
++    if "escalate_at" in si and si["escalate_at"] not in ("review", "high"):
++        fail("template_malformed")
++    issuer, mine = si["issuer"], issuer_config(cfg)
++    entry = registry.get("agents", {}).get(issuer) if isinstance(issuer, str) else None
++    if not isinstance(entry, dict) or entry.get("kind") != hc.ISSUER_KIND or not sc.usable_keys(registry, issuer) \
++            or issuer in (x["receiver"], x.get("delegate")) or issuer in (policy.get("trusted_approvers") or []) \
++            or mine is None or mine["issuer"] != issuer:
++        fail("issuer_invalid")
++    # v1: no unreviewed self-issue. The agent picks, writes and lands its own work, so a high-risk push must
++    # reach a human: the grant is risk-aware and doesn't approve "high" alone, or it names a delegate.
++    if "delegate" not in x and ("auto_approve" not in x or "high" in x["auto_approve"]):
++        fail("self_issue_unreviewed")
+ 
+ 
+ def enabled(cfg, receiver):
+@@ -165,6 +234,8 @@ def validate(cfg, registry, x):
+         entry = registry.get("agents", {}).get(d) if isinstance(d, str) else None
+         if not isinstance(entry, dict) or entry.get("kind") != DELEGATE_KIND or d == x["receiver"]:
+             fail("delegate_invalid")
++    if "self_issue" in x:
++        _validate_self_issue(cfg, registry, x, policy)
+     # Ed25519 (passphrase key) or ES256 (Touch ID key): the registered key decides which.
+     if not _verifies(registry, x, signing_input(x)):
+         fail("template_signature_invalid")
+@@ -337,6 +408,94 @@ def view(cfg):
+         return {"templates": out, "enabled_receivers": (cfg.raw.get("lane_templates") or {}).get("receivers", [])}
+ 
+ 
++# --------------------------------------------------------------------------
++# self-issued tasks (v0.7): the broker issues tasks under a grant that allows it (synthe_commit.issue_task)
++
++def issue_path(cfg):
++    return cfg.state_dir / "self-issued.json"
++
++
++def issue_load(cfg):
++    """{"grants": {template_id: {"issued": n, "recent": [issued_at...], "tasks": {"n": record}}},
++    "requests": {request_id: {"template_id", "issue", "body_sha256"}}}. Caller holds locked(cfg) to write."""
++    p = issue_path(cfg)
++    if not p.exists():
++        return {"grants": {}, "requests": {}}
++    try:
++        s = json.loads(p.read_text())
++        if set(s) != {"grants", "requests"} or not all(isinstance(v, dict) for v in s.values()):
++            raise ValueError()
++        if any(not isinstance(g, dict) or not _whole(g.get("issued"), 0, 10**9) or not isinstance(g.get("tasks"), dict)
++               or not isinstance(g.get("recent"), list) for g in s["grants"].values()):
++            raise ValueError()
++        return s
++    except (OSError, ValueError, TypeError):
++        fail("template_store_corrupt")
++
++
++def issue_save(cfg, s):
++    save(cfg, s, issue_path(cfg))
++
++
++def issue_record(cfg, template_id, issue):
++    """The broker's record of one issued task, or None."""
++    g = issue_load(cfg)["grants"].get(template_id) if isinstance(template_id, str) else None
++    return (g or {}).get("tasks", {}).get(str(issue)) if g else None
++
++
++def check_issued(cfg, registry, h):
++    """A self-issued handoff's standing at the broker, or Deny: its grant is the one in the store, byte for
++    byte, still valid (signature, expiry, lineage), not revoked, and the broker issued exactly this packet.
++    Run at claim, at propose, for staged retries, and again under the lane lock at dispatch: revoking or
++    expiring the grant kills the task even under a human's approval (the human can sign a task instead).
++    Returns (grant, issue record)."""
++    iug = h.get("issued_under_grant") if isinstance(h, dict) else None
++    g = iug.get("grant") if isinstance(iug, dict) else None
++    tid = g.get("template_id") if isinstance(g, dict) else None
++    s = load(cfg)
++    t = s["templates"].get(tid) if isinstance(tid, str) else None
++    if t is None or t != g:
++        fail("template_unavailable")
++    if tid in s["revoked"]:
++        fail("template_revoked")
++    validate(cfg, registry, t)
++    rec = issue_record(cfg, tid, iug.get("issue"))
++    if not isinstance(rec, dict) or rec.get("packet_sha256") != hc.handoff_digest(h):
++        fail("self_issue_unknown")
++    return t, rec
++
++
++def select_self_issue(cfg, registry, receiver, branch, owned_paths, remote=None, template_id=None):
++    """The grant to issue a task under: a live grant for this receiver with `self_issue` whose branch pattern,
++    remote and paths cover the request (the first by id, as select() picks). `template_id` pins one."""
++    from synthe_commit import Deny
++    s = load(cfg)
++    if template_id is not None and "self_issue" not in (s["templates"].get(template_id) or {}):
++        fail("self_issue_not_granted")
++    live = []
++    for tid, t in sorted(s["templates"].items()):
++        if (template_id and tid != template_id) or t.get("receiver") != receiver or "self_issue" not in t:
++            continue
++        try:
++            validate(cfg, registry, t)
++            if tid in s["revoked"]:
++                fail("template_revoked")
++            if exhausted(s, t):
++                fail("template_exhausted")
++            live.append(t)
++        except Deny:
++            if template_id:
++                raise
++    if not live:
++        fail("self_issue_not_granted")
++    for t in live:
++        if (remote or t["params"]["remote"]) == t["params"]["remote"] \
++                and hc.glob_match(t["params"]["branch_pattern"], branch) \
++                and all(any(hc._glob_covers(p, o) for p in t["path_scope"]) for o in owned_paths or t["path_scope"]):
++            return t
++    fail("self_issue_scope")
++
++
+ # --------------------------------------------------------------------------
+ # delegates: a grant's named approver signs each push (or sends it to a human)
+ 
+diff --git a/src/synthe_plan.py b/src/synthe_plan.py
+index 3b869c7..f2baa13 100755
+--- a/src/synthe_plan.py
++++ b/src/synthe_plan.py
+@@ -109,8 +109,22 @@ def plan_for(packet, registry: dict | None, ledger: dict | None, mediated_tools=
+     for key in h.get("depends_on") or []:
+         dep = ledger.get(key)
+         depends.append({"key": key, "state": hc.entry_state(dep) if isinstance(dep, dict) else "UNKNOWN"})
++    # v0.7: who wrote the purpose. A self-issued task's was written by this same agent, so the plan also
++    # carries the human's own words for the lane (the grant's signed `brief`), re-read at every step.
++    iug = h.get("issued_under_grant")
++    grant = iug.get("grant") if isinstance(iug, dict) and isinstance(iug.get("grant"), dict) else None
++    if grant is not None:
++        origin = {"kind": "self_issued", "template_id": grant.get("template_id"), "issue": iug.get("issue"),
++                  "granted_by": grant.get("approver")}
++        author = h.get("to")
++    else:
++        origin, author = {"kind": "signed", "sender": h.get("from")}, h.get("from")
++    extra = {"brief": grant["brief"]} if grant is not None and isinstance(grant.get("brief"), str) else {}
+     return {
+         "purpose": h.get("purpose"),
++        "purpose_author": author,
++        "task_origin": origin,
++        **extra,
+         "handoff": {k: h.get(k) for k in ("id", "idempotency_key", "trace_id", "from", "to")},
+         "claim_state": claim_state,
+         "planned_actions": actions,
+diff --git a/src/synthe_sign.py b/src/synthe_sign.py
+index 0a0ea99..0de30a6 100755
+--- a/src/synthe_sign.py
++++ b/src/synthe_sign.py
+@@ -243,7 +243,7 @@ def sign_packet(packet: dict, key: dict) -> dict:
+     h = packet["handoff"]
+     if h.get("from") != key["agent"]:
+         raise SystemExit(f"key belongs to '{key['agent']}' but packet is from '{h.get('from')}'")
+-    sig = sc.sign_bytes(key["_secret"], sc.packet_signing_input(h))
++    sig = sc.sign_bytes(key["_secret"], sc.handoff_signing_input(h))  # v0.7: self-issued ones in their own domain
+     packet["signature"] = {"signer": key["agent"], "kid": key["kid"], "alg": sc.ALG,
+                            "sig": sc.b64u(sig)}
+     return packet
+@@ -507,7 +507,7 @@ def cmd_verify(a) -> int:
+                    and sc.kid_is_revoked(registry, sig.get("signer"), sig.get("kid")))
+         key = None if revoked else sc.find_key(registry, sig.get("signer"), sig.get("kid"))
+         good = (key is not None and sig.get("signer") == h.get("from")
+-                and sc.verify_bytes(key, sc.packet_signing_input(h), sc.unb64u(sig.get("sig", ""))))
++                and sc.verify_bytes(key, sc.handoff_signing_input(h), sc.unb64u(sig.get("sig", ""))))
+         report["packet_signature"] = "REVOKED" if revoked else ("verified" if good else "INVALID")
+         ok &= good and not revoked
+     for appr in (h.get("authority", {}) or {}).get("approvals", []) or []:
+diff --git a/tests/test_task_grant.py b/tests/test_task_grant.py
+index 93bcae3..5da9ca1 100644
+--- a/tests/test_task_grant.py
++++ b/tests/test_task_grant.py
+@@ -180,7 +180,7 @@ def test_uses_brief_agent_and_remote_are_checked(live):
+ 
+ def test_a_broker_without_lane_grants_switched_on_says_how(live, tmp_path):
+     cfg = json.loads((live["home"] / "broker" / "broker.json").read_text())
+-    assert cfg["lane_templates"] == {"receivers": ["openclaw"]}     # setup switches it on
++    assert cfg["lane_templates"]["receivers"] == ["openclaw"]     # setup switches it on (and names its issuer)
+     s = {**st.setup_of(live["home"]), "receiver": "builder"}
+     with pytest.raises(SystemExit, match="aren't switched on for builder"):
+         sg.plan(s, client=live["client"], **spec())
+-- 
+2.43.0
+
