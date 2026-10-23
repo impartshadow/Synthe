@@ -114,8 +114,8 @@ Then it does the rest by itself:
   even to read;
 - runs the doctor.
 
-**You should see:** the doctor's report near the end, with the level **ENFORCED** and every check
-`PASS`. Its last lines suggest OpenClaw's setup wizard; skip that and use step 6.
+**You should see:** the doctor's report near the end, with the level **ENFORCED**, every check `PASS`
+except one expected `WARN` for barrier plugin mode (it notes that `tui --local` skips the plugin). Its last lines suggest OpenClaw's setup wizard; skip that and use step 6.
 
 If the level isn't ENFORCED, stop here: the failing check says what's wrong.
 
@@ -193,7 +193,7 @@ git ls-remote https://github.com/YOU/REPO.git refs/heads/agent/first-push refs/h
 You're done when all four of these hold:
 - [ ] `refs/heads/agent/first-push` exists, and its commit starts with the characters from step 8.
 - [ ] `refs/heads/main` is the same commit it was before you started.
-- [ ] The doctor in step 5 said **ENFORCED** with every check `PASS`.
+- [ ] The doctor in step 5 said **ENFORCED**, with only the barrier plugin mode `WARN`.
 - [ ] OpenClaw said it **proposed** the push and waited. It didn't push.
 
 If the branch isn't there, run `synthe-approve` again: an unapproved proposal stays staged, and the
