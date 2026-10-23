@@ -94,10 +94,15 @@ def test_the_summary_says_what_is_allowed_and_what_is_not(live):
     assert text.splitlines()[0] == ("Agent openclaw may push to agent/* changing src/** and tests/**, "
                                     "up to 50 times, until Fri Oct 30 12:00 UTC.")
     assert "Pushes to other branches still ask you." in text
-    assert "touches other files is refused, not asked about" in text
+    assert ("High-risk pushes (CI workflows, key and secret files, 400+ changed lines, mass deletions, 30+ commits, "
+            "per the broker's rules) and pushes outside these paths still ask you.") in text
+    assert "reads paths and sizes, not code" in text
+    assert "refused" not in text and "not asked about" not in text
     assert "nobody reviews each push" in text and "signs a receipt for every push" in text
     assert "Never, whatever this says: .github/**" in text
-    assert body["lineage"] == live["client"].call("lane_template_draft", receiver="openclaw")["lineage"]
+    draft = live["client"].call("lane_template_draft", receiver="openclaw", auto_approve=["routine", "review"])
+    assert body["lineage"] == draft["lineage"] and "risk_rules_digest" in body["lineage"]   # a risk-aware lineage
+    assert body["auto_approve"] == draft["auto_approve"] == ["routine", "review"]
     assert (body["max_uses"], body["expires_at"], body["tool"]) == (50, "2026-10-30T12:00:00Z", "git_push")
     assert body["params"] == {"remote": "origin", "branch_pattern": "agent/*"} and body["path_scope"] == PATHS
 
@@ -105,7 +110,7 @@ def test_the_summary_says_what_is_allowed_and_what_is_not(live):
 def test_the_default_lane_has_no_limit_and_no_expiry_and_the_summary_says_it_is_standing(live):
     body, text = sg.plan(st.setup_of(live["home"]), client=live["client"], now=NOW, tz=UTC, branch="agent/*",
                          paths=PATHS)
-    assert (body["max_uses"], body["expires_at"]) == (10000, "9999-01-01T00:00:00Z")      # the most the broker accepts
+    assert "max_uses" not in body and "expires_at" not in body       # omitted, not a huge number: there is no limit
     assert text.splitlines()[0] == ("Agent openclaw may push to agent/* changing src/** and tests/**, "
                                     "with no limit on pushes, with no expiry.")
     assert f"standing permission: it stays open until you close it (synthe-task revoke-grant {body['template_id']})" in text
@@ -125,6 +130,73 @@ def test_summary_wording_for_one_use_one_path_a_reviewer_and_another_remote():
                                     "until Fri Oct 23 18:30 UTC.")
     assert "reviewed by claude-reviewer instead of you" in text and "nobody reviews" not in text
     assert sg._join(["a", "b", "c"]) == "a, b and c"
+
+
+def test_the_summary_says_which_pushes_still_interrupt_you_for_each_set_of_tiers():
+    base = {"receiver": "openclaw", "params": {"remote": "origin", "branch_pattern": "agent/*"}, "path_scope": ["src/**"],
+            "template_id": "lane-1"}
+    both = sg.summary({**base, "auto_approve": ["routine", "review"]}).splitlines()[1]
+    assert both.startswith("Pushes to other branches still ask you. High-risk pushes (CI workflows, ")
+    assert "Review-level" not in both and both.count("still ask you") == 2
+    routine = sg.summary({**base, "auto_approve": ["routine"]}).splitlines()[1]
+    assert "Review-level pushes (Dockerfile" in routine and "and high-risk pushes (CI workflows" in routine
+    assert "any deletion" in routine
+    everything = sg.summary({**base, "auto_approve": ["routine", "review", "high"]}).splitlines()[1]
+    assert "lets every risk level through. Only pushes outside these paths still ask you." in everything
+    old = sg.summary(base).splitlines()[1]
+    assert "not risk-aware" in old and "high-risk ones included" in old       # a grant signed before risk tiers
+    # the words follow the broker's own rules, an operator's custom lists included
+    rules = {"high_paths": [".github/workflows/*", "infra/*", "deploy/*.tf"], "high_lines": 100, "high_commits": 5,
+             "review_paths": ["package.json"], "review_lines": 50}
+    custom = sg.summary({**base, "auto_approve": ["routine"]}, rules=rules).splitlines()[1]
+    assert "(CI workflows, infra/*, deploy/*.tf, 100+ changed lines, mass deletions, 5+ commits, per the broker's rules)" in custom
+    assert "(package.json, 50+ changed lines, any deletion, per the broker's rules)" in custom
+    hostile = {"high_paths": ["x\x1b[2Jy"]}
+    assert "\x1b" not in sg.summary({**base, "auto_approve": ["routine", "review"]}, rules=hostile)
+
+
+@pytest.mark.parametrize("value, tiers", [("routine", ["routine"]), ("routine,review", ["routine", "review"]),
+                                          (" Review , routine ", ["routine", "review"]), ("high,routine,review,high",
+                                                                                          ["routine", "review", "high"]),
+                                          (["review"], ["review"])])
+def test_auto_approve_tiers_are_read_into_the_brokers_order(value, tiers):
+    assert sg.parse_tiers(value) == tiers
+
+
+@pytest.mark.parametrize("value", ["", " , ", "critical", "routine,medium", "all", "none", "routine;review", []])
+def test_unknown_or_empty_tiers_are_refused_before_asking_the_broker(value):
+    with pytest.raises(SystemExit, match="--auto-approve"):
+        sg.parse_tiers(value)
+
+
+def test_the_tiers_are_the_brokers_default_unless_you_name_them(live):
+    s = st.setup_of(live["home"])
+    default = live["client"].call("lane_template_draft", receiver="openclaw")["auto_approve_default"]
+    body, _ = sg.plan(s, client=live["client"], **spec())
+    assert body["auto_approve"] == default == ["routine", "review"]
+    for given, wanted in (("routine", ["routine"]), ("routine,review,high", ["routine", "review", "high"])):
+        body, text = sg.plan(s, client=live["client"], **spec(auto_approve=given))
+        assert body["auto_approve"] == wanted
+        assert body["lineage"] == live["client"].call("lane_template_draft", receiver="openclaw",
+                                                      auto_approve=wanted)["lineage"]
+    with pytest.raises(SystemExit, match="unknown tier 'critical'"):
+        sg.plan(s, client=live["client"], **spec(auto_approve="routine,critical"))
+
+
+def test_the_default_tiers_follow_what_the_broker_says(live):
+    class Draft:
+        def __init__(self, inner):
+            self.inner, self.calls = inner, []
+
+        def call(self, op, **kw):
+            self.calls.append((op, kw))
+            out = self.inner.call(op, **kw)
+            return {**out, "auto_approve_default": ["routine"]} if op == "lane_template_draft" else out
+    client = Draft(live["client"])
+    body, text = sg.plan(st.setup_of(live["home"]), client=client, **spec())
+    assert body["auto_approve"] == ["routine"] and "Review-level pushes" in text
+    drafts = [kw for op, kw in client.calls if op == "lane_template_draft"]
+    assert drafts[-1]["auto_approve"] == ["routine"]           # the lineage it signs is for the tiers it lists
 
 
 # ---- what is refused before anything is signed -----------------------------------------------------
@@ -165,7 +237,7 @@ def test_paths_inside_the_policy_pass_even_when_narrower(live):
 
 def test_uses_brief_agent_and_remote_are_checked(live):
     s = st.setup_of(live["home"])
-    for uses in (0, -1, sg.UNLIMITED_USES + 1):
+    for uses in (0, -1, sg.MAX_USES + 1):
         with pytest.raises(SystemExit, match="--uses"):
             sg.plan(s, client=live["client"], **spec(uses=uses))
     with pytest.raises(SystemExit, match="--brief"):
@@ -241,14 +313,32 @@ def test_a_signed_grant_lets_a_push_inside_it_go_without_asking_and_others_still
     assert git(live["remote"], "branch", "--list", "agent/other") == ""
 
 
-def test_a_push_on_the_lanes_branch_but_outside_its_paths_is_refused_not_asked_about(live):
+def test_a_push_on_the_lanes_branch_but_outside_its_paths_asks_you_first(live):
     open_lane(live, branch="agent/*", paths=["src/**"])
     r = propose(live, "agent/wide", {"tests/new_test.py": "def test_x(): pass\n"})
-    assert r["decision"] == "denied" and "template_scope" in {x["code"] for x in r["reasons"]}, r
+    codes = {x["code"] for x in r["reasons"]}
+    assert r["decision"] == "staged" and "outside_lane_paths" in codes and "template_scope" not in codes, r
+    assert r["lane_scope"]["outside_paths"] == ["tests/new_test.py"] and r["lane_scope"]["outside_count"] == 1
+    assert r["staged"]["waiting_for"] == ["approval", "scope"]
     assert sg.list_grants(live["client"])[0]["status"] == "active"
     assert propose(live, "agent/narrow", {"src/ok.py": "ok = 1\n"})["decision"] == "executed"     # in paths: fine
-    assert git(live["remote"], "branch", "--list", "agent/wide") == ""
+    assert git(live["remote"], "branch", "--list", "agent/wide") == ""                               # nothing went out
     assert sg.list_grants(live["client"])[0]["uses_left"] == 2       # only the push inside the paths spent a use
+
+
+def test_a_high_risk_push_in_the_default_lane_asks_you_and_with_every_tier_it_does_not(live):
+    big = "".join(f"line_{i} = {i}\n" for i in range(450))          # 450 changed lines: high-risk on size alone
+    open_lane(live, branch="agent/std-*", paths=["src/**"], uses=None, until=None)
+    r = propose(live, "agent/std-big", {"src/big.py": big})
+    assert r["decision"] == "staged" and "risk_escalated" in {x["code"] for x in r["reasons"]}, r
+    assert r["risk"]["tier"] == "high" and r["risk"]["auto_approve"] == ["routine", "review"]
+    assert git(live["remote"], "branch", "--list", "agent/std-big") == ""
+    assert propose(live, "agent/std-small", {"src/small.py": "x = 1\n"})["decision"] == "executed"
+    assert propose(live, "agent/std-deps", {"src/setup.py": "from setuptools import setup\n"})["decision"] == "executed"   # review
+    open_lane(live, branch="agent/free-*", paths=["src/**"], uses=None, until=None, auto_approve="routine,review,high")
+    assert propose(live, "agent/free-big", {"src/big2.py": big})["decision"] == "executed"
+    open_lane(live, branch="agent/careful-*", paths=["src/**"], uses=None, until=None, auto_approve="routine")
+    assert propose(live, "agent/careful-deps", {"src/setup.py": "from setuptools import setup\n"})["decision"] == "staged"
 
 
 def test_a_grant_signed_by_someone_else_or_tampered_with_is_refused_by_the_broker(live, tmp_path):
@@ -354,8 +444,18 @@ def sui_plain():
     return synthe_ui.UI(stream=open("/dev/null", "w"))
 
 
-def test_a_lane_with_no_limits_is_listed_as_standing_and_never_flagged():
-    forever = grant_row("open-1", left=9990, uses=10000, expires_at="9999-01-01T00:00:00Z")
+def standing_row(tid="open-1", **over):
+    """A lane as the broker lists it when the signed grant omits both limits: no max_uses, no expires_at."""
+    row = grant_row(tid, left=None, **over)
+    del row["max_uses"], row["expires_at"]
+    return row
+
+
+@pytest.mark.parametrize("forever", [
+    standing_row(auto_approve=["routine", "review"]),
+    grant_row("open-1", left=9990, uses=10000, expires_at="9999-01-01T00:00:00Z"),      # opened before limits were optional
+], ids=["omitted", "legacy-sentinels"])
+def test_a_lane_with_no_limits_is_listed_as_standing_and_never_flagged(forever):
     [row] = sg.list_grants(Listing(forever), NOW)
     assert row["hints"] == []
     text = sg.render_grants([row], ui=sui_plain(), tz=UTC)
@@ -364,6 +464,35 @@ def test_a_lane_with_no_limits_is_listed_as_standing_and_never_flagged():
     assert sg.renew_command(forever) == "synthe-task grant --branch 'agent/*' --paths 'src/**,tests/**'"
     capped = sg.renew_command(grant_row())
     assert "--uses 50 --until 7d" in capped
+
+
+def test_a_standing_lane_sorts_first_and_a_capped_one_still_shows_its_numbers():
+    rows = sg.list_grants(Listing(grant_row("capped", hours=500), standing_row("standing"), grant_row("short", hours=30)), NOW)
+    assert [r["template_id"] for r in rows] == ["standing", "capped", "short"]
+    assert rows[0]["left"] is None
+    text = sg.render_grants(rows, ui=sui_plain(), tz=UTC)
+    assert "standing  open" in text and "capped  open" in text and "50 of 50 uses left, until" in text
+
+
+def test_the_listing_says_which_pushes_go_out_alone_and_which_still_ask_you():
+    rows = sg.list_grants(Listing(standing_row("a", auto_approve=["routine", "review"]),
+                                  standing_row("b", auto_approve=["routine"]),
+                                  standing_row("c", auto_approve=["routine", "review", "high"]),
+                                  standing_row("d")), NOW)
+    text = {r["template_id"]: sg.alone(r) for r in rows}
+    assert text["a"] == "goes out on its own: routine and review-level; high-risk pushes and pushes outside its paths ask you"
+    assert text["b"] == ("goes out on its own: routine; review-level and high-risk pushes and pushes outside its paths "
+                         "ask you")
+    assert text["c"] == "goes out on its own: routine, review-level and high-risk; pushes outside its paths ask you"
+    assert text["d"].startswith("not risk-aware: every kind of push goes out, high-risk ones too")
+    shown = sg.render_grants(rows, ui=sui_plain(), tz=UTC)
+    assert "  goes out on its own: routine and review-level; high-risk pushes and pushes outside its paths ask you" in shown
+
+
+def test_the_renew_command_keeps_tiers_that_are_not_the_default():
+    assert "--auto-approve" not in sg.renew_command(grant_row(auto_approve=["routine", "review"]))
+    assert "--auto-approve routine " in sg.renew_command(grant_row(auto_approve=["routine"])) + " "
+    assert "--auto-approve routine,review,high" in sg.renew_command(grant_row(auto_approve=["routine", "review", "high"]))
 
 
 def test_the_renew_command_keeps_the_remote_the_reviewer_and_a_short_brief():
@@ -405,17 +534,35 @@ def test_the_cli_defaults_come_from_setup(live, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "Agent openclaw may push to agent/* changing src/** and tests/**, with no limit on pushes, with no expiry" in out
     assert "Lane open: lane-" in out and "no use limit, no expiry" in out
+    assert "High-risk pushes (CI workflows" in out and "and pushes outside these paths still ask you." in out
     [g] = sg.list_grants(live["client"])
-    assert (g["max_uses"], g["path_scope"], g["expires_at"]) == (10000, PATHS, "9999-01-01T00:00:00Z")
+    assert "max_uses" not in g and "expires_at" not in g and g["uses_left"] is None     # nothing was signed to limit it
+    assert (g["path_scope"], g["auto_approve"]) == (PATHS, ["routine", "review"])
     with pytest.raises(SystemExit, match="--until 'whenever'"):
         st.main(["grant", "--until", "whenever", "--home", str(live["home"])])
     assert st.main(["grant", "--until", "45d", "--uses", "20", "--paths", "src/**", "--home", str(live["home"])]) == 0
-    capped = [x for x in sg.list_grants(live["client"]) if x["max_uses"] == 20]
+    capped = [x for x in sg.list_grants(live["client"]) if x.get("max_uses") == 20]
     assert len(capped) == 1 and capped[0]["path_scope"] == ["src/**"] and capped[0]["expires_at"] < "2026-13"
     assert not sg.no_expiry(dt.datetime.strptime(capped[0]["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC))
     with pytest.raises(SystemExit, match="never main or master"):
         st.main(["grant", "--branch", "main", "--home", str(live["home"])])
     assert len(sg.list_grants(live["client"])) == 2                    # the refusals signed nothing
+
+
+def test_the_cli_passes_auto_approve_through_and_refuses_unknown_tiers(live, capsys, monkeypatch):
+    monkeypatch.setattr(sg, "_terminal", lambda: True)
+    monkeypatch.setattr(sg, "_yes", lambda q: True)
+    monkeypatch.setattr(sg, "unlock_key", lambda *a, **kw: live["key"])
+    with pytest.raises(SystemExit, match="unknown tier 'severe'"):
+        st.main(["grant", "--auto-approve", "routine,severe", "--home", str(live["home"])])
+    assert sg.list_grants(live["client"]) == []                        # refused before anything was signed
+    assert st.main(["grant", "--auto-approve", "routine", "--home", str(live["home"])]) == 0
+    out = capsys.readouterr().out
+    assert "Review-level pushes (" in out and "and high-risk pushes (" in out
+    [g] = sg.list_grants(live["client"])
+    assert g["auto_approve"] == ["routine"]
+    assert st.main(["grants", "--home", str(live["home"])]) == 0
+    assert "goes out on its own: routine; review-level and high-risk pushes and pushes outside its paths ask you" in capsys.readouterr().out
 
 
 def test_the_cli_asks_for_a_branch_when_setup_has_several(live, monkeypatch):
@@ -462,12 +609,16 @@ def test_the_autonomous_lane_is_the_recommended_default_at_a_terminal(live, answ
                          confirm=lambda q: asked.append(q) or True) == "lane"
     [g] = sg.list_grants(live["client"])
     assert prompts == ["Choose 1 or 2 [2]: "]
-    assert (g["status"], g["max_uses"], g["path_scope"], g["params"]["branch_pattern"]) == ("active", 10000, PATHS, "agent/*")
-    assert g["expires_at"] == "9999-01-01T00:00:00Z" and g["hints"] == []
+    assert (g["status"], g["path_scope"], g["params"]["branch_pattern"]) == ("active", PATHS, "agent/*")
+    assert "max_uses" not in g and "expires_at" not in g and g["hints"] == []         # no limits are signed, none exist
+    assert g["auto_approve"] == ["routine", "review"]                # the broker's default: high-risk still asks
     assert asked == ["Sign it with your key? [Y/n] "]                # it still shows the terms and asks
     assert any("with no limit on pushes, with no expiry" in x and "standing permission" in x for x in lines)
+    assert any("High-risk pushes (CI workflows" in x and "outside these paths still ask you" in x for x in lines)
     assert propose(live, "agent/default-lane", {"tests/test_new.py": "def test_ok(): pass\n"})["decision"] == "executed"
     assert propose(live, "agent/second", {"src/s.py": "s = 1\n"})["decision"] == "executed"     # no asking, no counting down
+    big = "".join(f"line_{i} = {i}\n" for i in range(450))
+    assert propose(live, "agent/third", {"src/big.py": big})["decision"] == "staged"            # high-risk: it asks you
 
 
 def test_choosing_2_then_declining_the_terms_keeps_asking(live):

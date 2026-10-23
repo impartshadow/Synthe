@@ -37,6 +37,7 @@ import synthe_client as scl  # noqa: E402
 import synthe_crypto as sc  # noqa: E402
 import synthe_lane_templates as lanes  # noqa: E402
 import synthe_mcp  # noqa: E402
+import synthe_risk  # noqa: E402
 import synthe_sign as ss  # noqa: E402
 
 DEFAULT_MINUTES = 30
@@ -231,16 +232,49 @@ class ApproverServer(synthe_mcp.SyntheServer):
 # --------------------------------------------------------------------------
 # CLI
 
-def grant_body(a) -> dict:
-    """The unsigned grant a human signs (Studio, the Lab, or synthe-sign); printed, never signed here."""
-    exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=a.hours)
+LINEAGE_PLACEHOLDER = "<from the broker: op lane_template_draft with receiver, delegate and auto_approve>"
+
+
+def tiers(text: str) -> list:
+    """--auto-approve: distinct known risk tiers, in the broker's order."""
+    wanted = [x.strip().lower() for x in text.split(",") if x.strip()]
+    bad = [x for x in wanted if x not in synthe_risk.TIERS]
+    if bad or not wanted:
+        raise argparse.ArgumentTypeError(f"{'unknown tier ' + repr(bad[0]) if bad else 'name at least one tier'}; "
+                                         f"choose from {', '.join(synthe_risk.TIERS)} (e.g. routine,review)")
+    return [t for t in synthe_risk.TIERS if t in wanted]
+
+
+def grant_body(a, client=None) -> tuple[dict, str | None]:
+    """The unsigned grant a human signs (Studio, the Lab, or synthe-sign), and a note when it is not complete.
+    Printed, never signed here.
+
+    The grant carries `auto_approve` (the risk tiers it approves without a human; default the broker's: routine
+    and review, so a high-risk push and a push outside the paths still wait for you). It carries `max_uses` /
+    `expires_at` only if you pass --max-uses / --hours: leave them out and the lane has no such limit.
+    `lineage` is what the grant is signed against, and only the broker can compute it: with broker access
+    (--broker, SYNTHE_BROKER or your setup) it is filled in from op `lane_template_draft`; without it, it is a
+    placeholder and the note says so. A placeholder lineage is not accepted: the broker would refuse the grant."""
     body = {"template_id": a.id, "receiver": a.receiver, "tool": "git_push",
             "params": {"remote": a.remote, "branch_pattern": a.branch}, "path_scope": a.paths,
-            "max_uses": a.max_uses, "expires_at": exp.strftime("%Y-%m-%dT%H:%M:%SZ"), "delegate": a.delegate,
-            "lineage": "<from the broker: op lane_template_draft>"}
+            "delegate": a.delegate, "auto_approve": a.auto_approve or list(lanes.DEFAULT_AUTO_APPROVE),
+            "lineage": LINEAGE_PLACEHOLDER}
+    if a.max_uses is not None:
+        body["max_uses"] = a.max_uses
+    if a.hours is not None:
+        exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=a.hours)
+        body["expires_at"] = exp.strftime("%Y-%m-%dT%H:%M:%SZ")
     if a.brief:
         body["brief"] = a.brief
-    return body
+    try:
+        client = client or scl.BrokerClient(getattr(a, "broker", None))
+        body["lineage"] = client.call("lane_template_draft", receiver=a.receiver, delegate=a.delegate,
+                                      auto_approve=body["auto_approve"])["lineage"]
+    except scl.BrokerError as e:
+        return body, (f"lineage left as a placeholder ({e.code}: {e.message}). Run this where the broker is "
+                      f"reachable (--broker or SYNTHE_BROKER) to fill it in; the broker refuses a grant whose "
+                      f"lineage is not the one it computes.")
+    return body, None
 
 
 def main(argv=None) -> int:
@@ -257,8 +291,13 @@ def main(argv=None) -> int:
     g.add_argument("--remote", default="origin")
     g.add_argument("--branch", required=True, help="branch pattern, e.g. agent/*")
     g.add_argument("--paths", nargs="+", required=True)
-    g.add_argument("--max-uses", type=int, default=20)
-    g.add_argument("--hours", type=int, default=72)
+    g.add_argument("--max-uses", type=int, help="cap the number of pushes, 1 to 10000 (default: no limit)")
+    g.add_argument("--hours", type=int, help="cap how long the grant lasts (default: no expiry; it stays open "
+                                             "until you revoke it)")
+    g.add_argument("--auto-approve", type=tiers, metavar="TIERS", help="risk tiers the grant approves without a "
+                   "human, from routine, review, high (default: routine,review; a high-risk push still asks you)")
+    g.add_argument("--broker", default=os.environ.get("SYNTHE_BROKER"),
+                   help="broker address, to fill in the lineage the grant is signed against (op lane_template_draft)")
     g.add_argument("--brief", help="your instructions to the reviewer (signed with the grant)")
     for name in ("mcp", "queue", "show", "approve", "escalate"):
         c = sub.add_parser(name)
@@ -288,7 +327,14 @@ def main(argv=None) -> int:
               f"this process as its own user so no agent can read the key.", file=sys.stderr)
         return 0
     if a.cmd == "grant":
-        print(json.dumps(grant_body(a), indent=2))
+        if a.max_uses is not None and not 1 <= a.max_uses <= lanes.MAX_USES:
+            ap.error(f"--max-uses: between 1 and {lanes.MAX_USES} (leave it out for no limit)")
+        if a.hours is not None and a.hours < 1:
+            ap.error("--hours: at least 1 (leave it out for no expiry)")
+        body, note = grant_body(a)
+        print(json.dumps(body, indent=2))
+        if note:
+            print(f"# {note}", file=sys.stderr)
         return 0
     if not a.key:
         ap.error("--key (or SYNTHE_APPROVER_KEY) is required")
