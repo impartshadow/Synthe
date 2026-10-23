@@ -104,6 +104,20 @@ workflow-level `concurrency` group.
 
 ### Ledger integrity: sealed chain + out-of-cache anchor (v0.6)
 
+> **`GITHUB_TOKEN` can't write repository variables.** Workflow permissions have no variables
+> scope, so with `GITHUB_TOKEN` alone the anchor is never published and **a stale cache restore
+> goes undetected**. You need all three of these on every invocation of the Action (`claim` and
+> `complete`):
+>
+> | Input | Value |
+> |---|---|
+> | `anchor-token` | A fine-grained personal access token (or GitHub App token) for this repository with **Variables: read and write**, stored as a secret, e.g. `${{ secrets.SYNTHE_ANCHOR_TOKEN }}`. |
+> | `ledger-anchor` | `${{ vars.SYNTHE_LEDGER_ANCHOR }}` |
+> | `ledger-hmac-key` | A secret, e.g. `${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}` |
+>
+> Without `anchor-token`, the Action logs a warning and keeps going: the seal still catches
+> corruption, but an older ledger snapshot passes as current.
+
 Cache chaining alone cannot tell a *fresh* restore from a *stale* one: an
 older snapshot, a forged empty file, or a deleted ledger all used to load as
 valid, silently forgetting claims. Every ledger write is now sealed into a
@@ -213,6 +227,12 @@ jobs:
           registry: agents/registry.json
           workspace: .
           phase: complete
+          # The same three as the claim step. The complete phase restores, re-seals and
+          # re-publishes the ledger too, and a ledger sealed with the HMAC key is refused
+          # by a run without it.
+          ledger-anchor: ${{ vars.SYNTHE_LEDGER_ANCHOR }}
+          anchor-token: ${{ secrets.SYNTHE_ANCHOR_TOKEN }}
+          ledger-hmac-key: ${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}
 ```
 
 Notes on the shape:
@@ -354,8 +374,11 @@ Not yet proven:
 | Input       | Required | Default | Description |
 |-------------|----------|---------|-------------|
 | `packet`    | yes      | —       | Path to the handoff packet JSON. |
-| `registry`  | no       | —       | Path to the agent registry JSON (canonical ids + aliases). Without it, identity checks are skipped. |
+| `registry`  | no       | —       | Path to the agent registry JSON (canonical ids + aliases). Without it, identity checks are skipped. Its signature is checked only when `SYNTHE_REGISTRY_GENESIS_KEY` is set in the job's `env`; see [`docs/REGISTRY_GENESIS_KEY.md`](../docs/REGISTRY_GENESIS_KEY.md). |
 | `ledger`    | no       | *(managed)* | Path to an idempotency ledger JSON for duplicate detection. Leave unset and the Action persists `.synthe/ledger.json` across runs via `actions/cache` (see above). Set it only if you manage that file's persistence yourself. |
+| `ledger-hmac-key` | no | — | HMAC key sealing the ledger chain. Pass a secret, e.g. `${{ secrets.SYNTHE_LEDGER_HMAC_KEY }}`, on both phases. |
+| `ledger-anchor` | no | — | The published chain head: `${{ vars.SYNTHE_LEDGER_ANCHOR }}`. Reading it needs no token. Empty on the first run. |
+| `anchor-token` | no | — | Token that writes the `SYNTHE_LEDGER_ANCHOR` repository variable after each run. **`GITHUB_TOKEN` can't**: use a fine-grained token with "Variables: read and write" on this repository, from a secret. Without it, stale cache restores aren't detected. |
 | `ledger-bootstrap` | no | `'false'` | Set to `'true'` for ONE run to declare a fresh ledger chain after an eviction-guard failure (reconcile in-flight effects first) or when adding the Action to a workflow that already has runs. |
 | `workspace` | no       | `.`     | Root for artifact existence/hash checks. |
 | `phase`     | no       | `claim` | `claim`: validate + record the key as `RESERVED`. `complete`: after the effect is real, flip the key to `COMPLETED` (same packet/registry/ledger inputs). |
