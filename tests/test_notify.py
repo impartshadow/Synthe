@@ -169,6 +169,117 @@ def test_a_wait_still_open_is_notified_and_names_the_branch_and_size(w):
     assert "synthe-approve" in e["body"] and "your approval" in e["body"]
 
 
+def risk_receipt(**over):
+    """What the broker writes when a risk-aware lane sends a push to its human (docs/COMMIT.md, Risk-aware lanes)."""
+    risk = {"tier": "high", "reasons": ["changes .github/workflows/ci.yml"], "paths": [".github/workflows/ci.yml"],
+            "sensitive_paths": 1, "auto_approve": ["routine"], "template_id": "lane-1", "commit": "a" * 40,
+            "base": "b" * 40, "rules_digest": "c" * 64, "escalated": True}
+    return {"seq": 5, "decision": "staged", "effect": {"action": PUSH, "branch": "agent/feature-x"},
+            "handoff": {"idempotency_key": "k"},
+            "reasons": [{"state": "blocked", "code": "risk_escalated", "message": "needs a human"},
+                        {"state": "blocked", "code": "approval_missing", "message": "m"}],
+            "staged": {"id": f"k/{PUSH}", "waiting_for": ["approval", "risk"]}, "risk": risk, **over}
+
+
+def scope_receipt(**over):
+    scope = {"template_id": "lane-1", "path_scope": ["src/**", "tests/**"], "outside_paths": ["docs/a.md", "docs/b.md", "README.md"],
+             "outside_count": 3, "commit": "a" * 40}
+    return {"seq": 6, "decision": "staged", "effect": {"action": PUSH, "branch": "agent/feature-x"},
+            "handoff": {"idempotency_key": "k2"},
+            "reasons": [{"state": "blocked", "code": "outside_lane_paths", "message": "needs a human"}],
+            "staged": {"id": f"k2/{PUSH}", "waiting_for": ["approval", "scope"]}, "lane_scope": scope, **over}
+
+
+def test_a_high_risk_push_your_lane_sent_to_you_says_what_and_why():
+    e = sn.describe(risk_receipt())
+    assert e["level"] == "waiting" and e["lane"] == "risk" and e["title"] == "Synthe is waiting for you"
+    assert e["body"] == ("Needs you: agent/feature-x changes a CI workflow (.github/workflows/ci.yml). "
+                         "Your lane lets routine work through; this one is high-risk. Run synthe-approve to see the diff.")
+    assert [x["seq"] for x in sn.select([risk_receipt()])] == [5]
+
+
+def test_the_risk_wording_follows_the_receipt_not_a_fixed_script():
+    def body(**risk):
+        r = risk_receipt()
+        r["risk"] = {**r["risk"], **risk}
+        return sn.describe(r)["body"]
+    assert body(auto_approve=["routine", "review"]).count("lets routine and review-level work through") == 1
+    big = body(paths=[], reasons=["450 lines changed", "deletes 3 files"])
+    assert big.startswith("Needs you: agent/feature-x: 450 lines changed; deletes 3 files. ")
+    both = body(paths=["package.json", "Makefile"], reasons=["changes package.json and 1 more", "450 lines changed"], tier="review")
+    assert both.startswith("Needs you: agent/feature-x changes a build or dependency file (package.json, …); 450 lines changed. ")
+    assert "this one is review-level." in both
+    assert "changes a file that looks like it holds secrets or keys (deploy/prod.pem)" in body(paths=["deploy/prod.pem"])
+    assert body(paths=[], reasons=[]).startswith("Needs you: agent/feature-x is a high-risk push. ")
+    assert "Your lane sends this kind of push to you." in body(auto_approve=[], tier="someday")
+
+
+def test_a_push_outside_your_lane_says_how_many_files_and_what_the_lane_covers():
+    e = sn.describe(scope_receipt())
+    assert e["level"] == "waiting" and e["lane"] == "scope"
+    assert e["body"] == ("Needs you: agent/feature-x changes 3 files outside your lane (docs/a.md, …). "
+                         "Your lane covers src/** and tests/**; anything else asks you. Run synthe-approve to see the diff.")
+    one = scope_receipt()
+    one["lane_scope"] = {**one["lane_scope"], "outside_paths": ["docs/a.md"], "outside_count": 1}
+    assert "changes 1 file outside your lane (docs/a.md)." in sn.describe(one)["body"]
+    many = scope_receipt()
+    many["lane_scope"] = {**many["lane_scope"], "path_scope": ["a/**", "b/**", "c/**", "d/**"]}
+    assert "Your lane covers a/**, b/** and c/** …;" in sn.describe(many)["body"]
+
+
+@pytest.mark.parametrize("make, field", [(risk_receipt, "risk"), (scope_receipt, "lane_scope")])
+@pytest.mark.parametrize("junk", [None, "text", 7, [], {}, {"tier": ["high"], "paths": "x", "reasons": 3, "outside_paths": {"a": 1},
+                                                           "outside_count": "many", "path_scope": 5, "auto_approve": "routine"}])
+def test_a_receipt_with_odd_escalation_fields_is_still_a_wait_for_you(make, field, junk):
+    e = sn.describe(make(**{field: junk}))
+    assert e["level"] == "waiting" and e["body"].startswith("Needs you: agent/feature-x")
+
+
+def test_hostile_text_in_an_escalation_reaches_no_notification_unescaped():
+    r = risk_receipt()
+    r["effect"] = {"action": PUSH, "branch": "agent/" + HOSTILE}
+    r["risk"] = {**r["risk"], "paths": [".github/workflows/" + HOSTILE], "reasons": [HOSTILE, "450 lines changed " + HOSTILE]}
+    s = scope_receipt()
+    s["effect"] = r["effect"]
+    s["lane_scope"] = {**s["lane_scope"], "outside_paths": ["docs/" + HOSTILE], "path_scope": ["src/" + HOSTILE]}
+    for e in (sn.describe(r), sn.describe(s)):
+        assert e["level"] == "waiting"
+        for text in (e["body"], e["headline"], e["why"], e["branch"]):
+            assert not re.search("[\x00-\x1f\x7f-\x9f\u202e]", text), repr(text)   # escaping for Slack and notify-send
+                                                                          # happens at delivery, as for every message
+        assert len(e["body"]) < 900
+
+
+def test_malformed_risk_rules_are_a_problem_to_fix_not_a_push_to_approve():
+    r = {"seq": 7, "decision": "staged", "effect": {"action": PUSH, "branch": "agent/x"}, "handoff": {"idempotency_key": "k3"},
+         "reasons": [{"state": "blocked", "code": "risk_rules_invalid", "message": "risk rules invalid"}],
+         "staged": {"id": f"k3/{PUSH}", "waiting_for": ["approval"]}}
+    e = sn.describe(r)
+    assert e["level"] == "problem" and e["body"].startswith("Needs a look: pushes under your lane are waiting for you on 'agent/x'")
+    d = sn.describe({**r, "decision": "denied", "staged": None})
+    assert d["level"] == "problem" and "risk rules are malformed" in d["body"] and d["body"].endswith("Nothing was pushed.")
+
+
+def test_a_reviewer_blocked_from_approving_a_high_risk_push_is_not_a_second_alarm():
+    r = {"seq": 8, "kind": "delegate_approval", "decision": "delegate_approval_rejected", "handoff": {"idempotency_key": "k"},
+         "reasons": [{"state": "blocked", "code": "risk_escalated", "message": "m"}]}
+    assert sn.describe(r)["level"] == "retry" and sn.select([r]) == []
+
+
+def test_the_digest_says_how_many_pushes_your_lane_sent_to_you_and_why():
+    now = dt.datetime(2026, 10, 23, 12, tzinfo=dt.timezone.utc)
+    stamp = {"time": (now - dt.timedelta(hours=1)).isoformat()}
+    done = {"seq": 7, "decision": "executed", "handoff": {"idempotency_key": "k"}, "effect": {"action": PUSH, "branch": "agent/feature-x"},
+            **stamp}
+    d = sn.build_digest([{**risk_receipt(), **stamp}, {**scope_receipt(), **stamp}, done], now=now)
+    assert (d["needed_you"], d["lane_high_risk"], d["lane_outside_paths"], d["needed_you_shipped"]) == (2, 1, 1, 1)
+    text = sn.render_digest(d, {"count": 7, "signer": "synthe-broker", "head": "ab" * 32, "complete": True})
+    assert ("Your lane sent 2 of them to you: 1 riskier than your lane lets through and 1 outside your lane's files. "
+            "Everything else in the lane went out on its own.") in text
+    quiet = sn.render_digest(sn.build_digest([done], now=now), {"count": 1, "signer": "s", "head": None, "complete": True})
+    assert "Your lane sent" not in quiet
+
+
 @pytest.mark.parametrize("waiting_for, level", [
     (["approval"], "waiting"), (["escalated"], "waiting"), (["approval", "escalated"], "waiting"),
     (["review"], "quiet"), (["dependency"], "quiet"), (["review", "dependency"], "quiet"),
