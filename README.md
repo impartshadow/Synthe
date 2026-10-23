@@ -38,6 +38,9 @@ Verified on 2026-10-07 on macOS, against real GitHub. The evidence is in
 
 Using Claude Code, Cursor, Cline, or no AI at all? See [`docs/ANY_AGENT.md`](docs/ANY_AGENT.md).
 
+Want to hear from Synthe only when it stops or flags something, and what that was worth? `synthe-notify`
+checks the receipt chain, then notifies you in plain English. See [`docs/NOTIFY.md`](docs/NOTIFY.md).
+
 
 ## What's here
 
