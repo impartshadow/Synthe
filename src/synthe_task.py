@@ -3,6 +3,7 @@
 """synthe-task: give your agent a task as a signed Synthe handoff, in one command.
 
   synthe-task new "Fix the login redirect" --branch agent/login-fix [--home ~/.synthe] [--hours 24]
+  synthe-task grant | grants | revoke-grant ID      let routine pushes in a lane go without asking (synthe_grant.py)
 
 Builds a handoff from you to the agent (edit files, then push the branch, which needs your approval),
 pins the task text by SHA-256, and signs it with your approver key (it asks for your passphrase). In
@@ -64,7 +65,7 @@ def setup_of(home: Path) -> dict:
     policy = agents[receivers[0]].get("policy") or {}
     return {"sender": humans[0], "receiver": receivers[0], "remote": remote, "policy": policy,
             "workspace": Path(info["workspace"]).resolve(), "mode": info.get("mode", "dev"),
-            "broker": info.get("broker")}
+            "broker": info.get("broker"), "registry": registry, "broker_config": info.get("broker_config")}
 
 
 def build_task(home: Path, purpose: str, branch: str, hours: float = 24, now: dt.datetime | None = None,
@@ -147,7 +148,11 @@ def main(argv=None) -> int:
     n.add_argument("--branch", required=True, help="the agent branch it pushes, e.g. agent/login-fix")
     n.add_argument("--hours", type=float, default=24, help="how long the task stays open (default 24)")
     n.add_argument("--home", default="~/.synthe")
+    import synthe_grant as sg  # lane grants: its own module, shared with the setup offer
+    sg.add_parsers(sub)
     a = ap.parse_args(argv)
+    if a.cmd != "new":
+        return sg.run(a)
     home = Path(a.home).expanduser()
     setup_of(home)  # a missing or broken setup fails here, before the passphrase prompt
     key = ss.load_key(str(home / "approver.key.json"), require_encrypted=True)
