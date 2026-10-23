@@ -647,7 +647,14 @@ def wire_openclaw(oc: OpenClaw, home: Path, assume_yes: bool) -> list:
     # The status line ("a push waits for your approval") is a before_prompt_build hook, which OpenClaw
     # blocks for non-bundled plugins unless they're allowed conversation access (seen live, 2026-10-07).
     step("plugin status line", "config", "set", f"plugins.entries.{PLUGIN_ID}.hooks.allowConversationAccess", "true")
-    step("skill", "skills", "install", str(integ / "skill" / "synthe"), "--force")
+    skill = str(integ / "skill" / "synthe")
+    agents = _openclaw_agents(oc)
+    if not agents:
+        step("skill", "skills", "install", skill, "--force")
+    # Each configured agent has its own workspace, and a plain install reaches none of them: on a live
+    # multi-agent install the doctor found the skill missing for every agent (2026-10-22).
+    for agent in agents:
+        step(f"skill ({agent})", "skills", "install", skill, "--agent", agent, "--force")
     return steps
 
 
