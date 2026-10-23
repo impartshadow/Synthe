@@ -38,7 +38,7 @@ def test_harmless_mentions_are_allowed(command):
 
 
 # Reads are not publishing (2026-10-22): blocking every `gh api` and every curl to api.github.com made the
-# hook refuse harmless commands. Only a provable read is allowed; the write forms stay in the denied list.
+# hook refuse harmless commands. Only an evident write is denied; the write forms stay in the denied list.
 @pytest.mark.parametrize("command", [
     "gh api /repos/example/repo", "gh api repos/example/repo/pulls/13 -q .head.sha",
     "gh api -X GET repos/example/repo/pulls", "gh api --method=get repos/example/repo",
@@ -48,6 +48,13 @@ def test_harmless_mentions_are_allowed(command):
     "curl -q -s https://api.github.com/repos/example/repo", "curl --disable -sSL https://api.github.com/x",
     "curl -q -X GET https://api.github.com/repos/example/repo", "curl -q -I https://api.github.com/",
     "curl -q -sXGET https://api.github.com/x", "curl -q --url https://api.github.com/x -H 'Accept: y'",
+    # Ordinary spellings no longer need -q or only familiar options (2026-10-22): they changed workflows.
+    "curl -s https://api.github.com/repos/example/repo", "curl -sL https://api.github.com/repos/a/b/releases/latest",
+    "curl -q --unknown-flag https://api.github.com/x", "curl -s -H 'Authorization: Bearer $T' https://api.github.com/user",
+    "curl -fsS --retry 3 -o out.json https://api.github.com/repos/a/b", "wget -qO- https://api.github.com/repos/a/b",
+    "gh api --unknown repos/example/repo", "gh api repos/a/b repos/c/d", "gh api http://api.github.com/repos/x",
+    "gh api repos/a/b/pulls --jq '.[].number'", "gh api repos/$OWNER/$REPO/pulls",
+    'curl -s -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user', 'curl -s "$URL"',
 ])
 def test_github_api_reads_are_allowed(command):
     assert not hook.denied(event(command))
@@ -60,10 +67,12 @@ def test_github_api_reads_are_allowed(command):
     "curl --config payload.conf https://api.github.com/repos/example/repo/pulls",
     "curl -K payload.conf https://api.github.com/repos/example/repo/pulls",
     "gh api -H 'Accept: application/json' graphql", "gh api https://api.github.com/graphql",
-    "curl -s https://api.github.com/repos/example/repo",  # no -q: ~/.curlrc could add a body
     "curl -q -K payload.conf https://api.github.com/x", "curl -q -sK payload.conf https://api.github.com/x",
-    "curl -q --unknown-flag https://api.github.com/x", "gh api --unknown repos/example/repo",
-    "gh api repos/a/b repos/c/d", "gh api http://api.github.com/repos/x", "gh api https://evil.example/graphql",
+    "gh api https://evil.example/graphql", "wget --method=PUT https://api.github.com/x",
+    "wget --body-data=x --method=PATCH https://api.github.com/x",
+    # An unknown variable may be an option, a GitHub URL or a GraphQL path.
+    "curl $OPTS https://api.github.com/x", "curl -s $URL", "curl -s$X https://api.github.com/x", "curl -d x $URL",
+    "gh api $ENDPOINT", "gh api repos/a/$X", "gh api -X $M repos/a/b",
     "gh api -X", "gh api --method", "curl -q https://api.github.com/x -X", "gh api repos/example/repo/graphql",
     "gh pr create --fill", "gh pr create --dry-run --head feature", "gh -R example/repo pr create",
 ])
