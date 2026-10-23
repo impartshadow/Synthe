@@ -283,21 +283,42 @@ def _command_denied(words, docs, variables, depth):
         for i, word in enumerate(words):
             if re.fullmatch(r"-[A-Za-z]+", word) and "c" in word[1:]:
                 return i + 1 >= len(words) or _shell_denied(words[i + 1], depth + 1, variables)
+        if not docs and not any(not word.startswith("-") for word in words):
+            return True  # A script piped on stdin (`... | base64 -d | sh`) is code the hook cannot see.
         return any(_shell_denied(doc["body"], depth + 1, variables) for doc in docs)
+    if executable == "alias":
+        # An alias body runs later as a command (`bash -c "alias p='git push'; p"`).
+        return any(_shell_denied(word.split("=", 1)[1], depth + 1, variables) for word in words if "=" in word)
+    if executable in {"git-push", "git-send-pack", "git-http-push"}:
+        return True  # The dashed forms in git's exec-path, e.g. /usr/lib/git-core/git-send-pack.
     if executable == "eval":
         return _shell_denied(" ".join(words), depth + 1, variables)
     if executable == "git":
         while words and words[0].startswith("-"):
             option = words.pop(0)
+            value = None
             if option in {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"} and words:
-                words.pop(0)
-        return bool(words) and _expand(words[0], variables) in {"push", "send-pack", "http-push"}
+                value = words.pop(0)
+            elif option.startswith(("-c", "--config-env=")):
+                value = option.split("=", 1)[1] if option.startswith("--") else option[2:]
+            # `git -c alias.p=push p` runs push under another name, so no alias is set from the command line.
+            if value is not None and option != "-C" and _expand(value, variables).lower().startswith("alias."):
+                return True
+        if not words:
+            return False
+        subcommand = _expand(words[0], variables)
+        # `git credential fill` prints the stored credential; the helpers are run as `git credential-<name>`.
+        return subcommand in {"push", "send-pack", "http-push", "credential"} or subcommand.startswith("credential-")
     if executable == "gh":
         while words and words[0].startswith("-"):
             option = words.pop(0)
             if option in {"-R", "--repo", "--hostname"} and words:
                 words.pop(0)
         args = [_expand(word, variables) for word in words[:2]]
+        if args[:2] in (["auth", "token"], ["auth", "git-credential"]):
+            return True  # Prints or hands out the token.
+        if args[:2] == ["auth", "status"]:
+            return any(_expand(word, variables) in {"-t", "--show-token"} for word in words[2:])
         if args and args[0] == "api":
             return not _gh_api_read_only([_expand(word, variables) for word in words[1:]])
         # `gh pr create` can push an unpublished head branch itself (even with --dry-run), so it is denied.
@@ -306,9 +327,9 @@ def _command_denied(words, docs, variables, depth):
             ["release", "edit"], ["release", "delete"]]
     if executable == "curl":
         expanded = [_expand(word, variables) for word in words]
-        return any("api.github.com" in w.lower() for w in expanded) and not _curl_read_only(expanded)
+        return any(_github_api_host(w) for w in expanded) and not _curl_read_only(expanded)
     if executable in {"wget", "http", "https", "xh"}:
-        return any("api.github.com" in _expand(word, variables).lower() for word in words)
+        return any(_github_api_host(_expand(word, variables)) for word in words)
     if re.fullmatch(r"python(?:[23](?:\.\d+)?)?", executable):
         if "-c" in words:
             i = words.index("-c")
@@ -331,6 +352,11 @@ _CURL_VALUE = {"-H": "header", "--header": "header", "-X": "method", "--request"
                "--connect-timeout": "x", "--retry": "x", "-A": "x", "--user-agent": "x", "--url": "url"}
 _CURL_BOOL = {"-s", "--silent", "-S", "--show-error", "-f", "--fail", "--fail-with-body", "-L", "--location",
               "-i", "--include", "-I", "--head", "-v", "--verbose", "--compressed", "-g", "--globoff"}
+
+
+def _github_api_host(word) -> bool:
+    # uploads.github.com takes release assets with the same token as the REST API.
+    return any(host in word.lower() for host in ("api.github.com", "uploads.github.com"))
 
 
 def _method_is_read(value) -> bool:
