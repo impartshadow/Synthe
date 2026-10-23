@@ -312,21 +312,25 @@ def _command_denied(words, docs, variables, depth):
             option = words.pop(0)
             if option in {"-R", "--repo", "--hostname"} and words:
                 words.pop(0)
-        args = [_expand(word, variables) for word in words[:2]]
+        args = _expand_values(words[:2], variables)
         if args[:2] in (["auth", "token"], ["auth", "git-credential"]):
             return True  # Prints or hands out the token.
         if args[:2] == ["auth", "status"]:
             return any(_expand(word, variables) in {"-t", "--show-token"} for word in words[2:])
         if args and args[0] == "api":
-            return not _gh_api_read_only([_expand(word, variables) for word in words[1:]])
+            return _gh_api_writes(_expand_values(words[1:], variables))
         # `gh pr create` can push an unpublished head branch itself (even with --dry-run), so it is denied.
         return bool(args) and args[:2] in [
             ["pr", "merge"], ["pr", "create"], ["repo", "sync"], ["release", "create"], ["release", "upload"],
             ["release", "edit"], ["release", "delete"]]
     if executable == "curl":
-        expanded = [_expand(word, variables) for word in words]
-        return any(_github_api_host(w) for w in expanded) and not _curl_read_only(expanded)
-    if executable in {"wget", "http", "https", "xh"}:
+        expanded = _expand_values(words, variables)
+        return any(_github_api_host(w) or "$" in w for w in expanded) and _curl_writes(expanded)
+    if executable == "wget":
+        expanded = _expand_values(words, variables)
+        return any(_github_api_host(w) or "$" in w for w in expanded) and _wget_writes(expanded)
+    if executable in {"http", "https", "xh"}:
+        # httpie and xh send a body for any `key=value` item, so a call to the API is not checked further.
         return any(_github_api_host(_expand(word, variables)) for word in words)
     if re.fullmatch(r"python(?:[23](?:\.\d+)?)?", executable):
         if "-c" in words:
@@ -336,20 +340,38 @@ def _command_denied(words, docs, variables, depth):
     return False
 
 
-# Reads are not publishing, but only a call that is *provably* a read is let through (Codex's review,
-# 2026-10-22). Every option must be known, with its value consumed the way the tool consumes it
-# (glued short options like `-sX POST` included); an unknown option, a body or field, a non-GET method,
-# GraphQL, or anything else uncertain is denied. curl counts as a read only with -q/--disable first,
-# because otherwise ~/.curlrc can add a method or body that the command line doesn't show.
-_GH_API_VALUE = {"-H": "header", "--header": "header", "-X": "method", "--method": "method",
-                 "-q": "x", "--jq": "x", "-t": "x", "--template": "x", "-p": "x", "--preview": "x",
-                 "--hostname": "x", "--cache": "x"}
-_GH_API_BOOL = {"-i", "--include", "--paginate", "--silent", "--slurp", "--verbose"}
-_CURL_VALUE = {"-H": "header", "--header": "header", "-X": "method", "--request": "method",
-               "-o": "x", "--output": "x", "-w": "x", "--write-out": "x", "-m": "x", "--max-time": "x",
-               "--connect-timeout": "x", "--retry": "x", "-A": "x", "--user-agent": "x", "--url": "url"}
-_CURL_BOOL = {"-s", "--silent", "-S", "--show-error", "-f", "--fail", "--fail-with-body", "-L", "--location",
-              "-i", "--include", "-I", "--head", "-v", "--verbose", "--compressed", "-g", "--globoff"}
+# Only a call that evidently writes is denied (2026-10-22). The hook is a guard, not the boundary: the
+# credential wall is. An earlier version let through only calls it could prove were reads, which blocked
+# plain `curl -s https://api.github.com/...` and any unfamiliar option, and changed ordinary workflows.
+# Writes stay denied in every spelling found in review: glued short options (`-sX POST`, `-sd`), config
+# files (`-K`), bodies and fields that imply POST, a method override, GraphQL, and gh's `-H` taking the
+# next token. Not covered: a ~/.curlrc that adds a body, and scripts the hook cannot read.
+_CURL_WRITES = {"-d", "-F", "-T", "-K", "--data", "--data-ascii", "--data-binary", "--data-raw",
+                "--data-urlencode", "--json", "--form", "--form-string", "--upload-file", "--config"}
+_CURL_SHORT_VALUE = set("AbcCDeEHmoPQrtuUwxXyYz") | set("dFTK")
+_CURL_LONG_VALUE = {"--header", "--output", "--write-out", "--max-time", "--connect-timeout", "--retry",
+                    "--user-agent", "--url", "--user", "--referer", "--cookie", "--cookie-jar", "--proxy",
+                    "--cacert", "--cert", "--key", "--resolve", "--range", "--dump-header", "--retry-delay",
+                    "--retry-max-time", "--limit-rate", "--request"}
+_GH_API_WRITES = {"-f", "-F", "--field", "--raw-field", "--input"}
+_GH_API_SHORT_VALUE = set("HXqtpfF")
+_GH_API_LONG_VALUE = {"--header", "--method", "--jq", "--template", "--preview", "--hostname", "--cache",
+                      "--field", "--raw-field", "--input"}
+
+
+def _expand_values(words, variables) -> list:
+    """Expand what can be expanded. A word that only carries a value (`\"Bearer $GITHUB_TOKEN\"`, a URL)
+    keeps an unknown variable as written; one that could become an option (`$OPTS` unquoted, `-s$X`) raises,
+    so the command is denied. A kept `$` counts as a possible GitHub host and a possible GraphQL path."""
+    out = []
+    for word in words:
+        try:
+            out.append(_expand(word, variables))
+        except ValueError:
+            if word.startswith("-") or (word.startswith("$") and not getattr(word, "quoted", False)):
+                raise
+            out.append(str(word))
+    return out
 
 
 def _github_api_host(word) -> bool:
@@ -361,83 +383,79 @@ def _method_is_read(value) -> bool:
     return isinstance(value, str) and value.upper() in {"GET", "HEAD"}
 
 
-def _parse_options(args, value_opts, bool_opts):
-    """[(option, value)] and positionals, or None when any option is unknown or lacks its value.
-    Short options may be combined (-sS) and the last may carry a glued or following value (-sXPOST, -sX POST)."""
-    opts, positional, i = [], [], 0
+def _options(args, short_value, long_value, honor_double_dash):
+    """Yield (option, value) and (None, positional) the way the tool reads them. Short options may be
+    combined (-sS), and the first one that takes a value takes the rest of the word or the next word
+    (-sXPOST, -sX POST). A missing value yields (option, None)."""
+    i = 0
     while i < len(args):
         a = args[i]
         if a == "--":
-            positional += args[i + 1:]
-            break
-        if a.startswith("--"):
+            if honor_double_dash:
+                for rest in args[i + 1:]:
+                    yield None, rest
+                return
+        elif a.startswith("--"):
             name, eq, val = a.partition("=")
-            if name in value_opts:
-                if not eq:
-                    if i + 1 >= len(args):
-                        return None
-                    i += 1
-                    val = args[i]
-                opts.append((name, val))
-            elif name in bool_opts and not eq:
-                opts.append((name, None))
-            else:
-                return None
+            if not eq and name in long_value:
+                i += 1
+                val = args[i] if i < len(args) else None
+            yield name, val if (eq or name in long_value) else None
         elif a.startswith("-") and len(a) > 1:
-            j = 1
-            while j < len(a):
+            for j in range(1, len(a)):
                 flag = "-" + a[j]
-                if flag in bool_opts:
-                    opts.append((flag, None))
-                    j += 1
-                    continue
-                if flag in value_opts:
+                if a[j] in short_value:
                     val = a[j + 1:]
                     if not val:
-                        if i + 1 >= len(args):
-                            return None
                         i += 1
-                        val = args[i]
-                    opts.append((flag, val))
+                        val = args[i] if i < len(args) else None
+                    yield flag, val
                     break
-                return None
+                yield flag, None
         else:
-            positional.append(a)
+            yield None, a
         i += 1
-    return opts, positional
 
 
-def _methods_read_only(opts, value_opts) -> bool:
-    return all(_method_is_read(v) for o, v in opts if value_opts.get(o) == "method")
+def _curl_writes(args) -> bool:
+    for option, value in _options(args, _CURL_SHORT_VALUE, _CURL_LONG_VALUE, True):
+        if option in _CURL_WRITES:
+            return True
+        if option in ("-X", "--request") and not _method_is_read(value):
+            return True
+    return False
 
 
-def _gh_api_read_only(args) -> bool:
-    parsed = _parse_options(args, _GH_API_VALUE, _GH_API_BOOL)
-    if parsed is None:
-        return False
-    opts, positional = parsed
-    if len(positional) != 1 or not _methods_read_only(opts, _GH_API_VALUE):
-        return False
-    endpoint = positional[0].split("?", 1)[0].split("#", 1)[0]
+def _graphql(endpoint) -> bool:
+    endpoint = endpoint.split("?", 1)[0].split("#", 1)[0]
     if "://" in endpoint:
-        scheme, _, rest = endpoint.partition("://")
-        host, _, path = rest.partition("/")
-        if scheme.lower() != "https" or host.lower() != "api.github.com":
-            return False
-        endpoint = path
+        endpoint = endpoint.partition("://")[2].partition("/")[2]
     path = endpoint.strip("/").lower()
-    return bool(path) and path != "graphql" and not path.endswith("/graphql")
+    return path == "graphql" or path.endswith("/graphql")
 
 
-def _curl_read_only(args) -> bool:
-    if not args or args[0] not in ("-q", "--disable"):
-        return False
-    parsed = _parse_options(args[1:], _CURL_VALUE, _CURL_BOOL)
-    if parsed is None:
-        return False
-    opts, positional = parsed
-    urls = positional + [v for o, v in opts if o == "--url"]
-    return bool(urls) and _methods_read_only(opts, _CURL_VALUE)
+def _gh_api_writes(args) -> bool:
+    # `--` is not honoured here: anything after it is still checked, so `gh api x -- -X POST` stays denied.
+    positional = []
+    for option, value in _options(args, _GH_API_SHORT_VALUE, _GH_API_LONG_VALUE, False):
+        if option is None:
+            positional.append(value)
+        elif option in _GH_API_WRITES:
+            return True
+        elif option in ("-X", "--method") and not _method_is_read(value):
+            return True
+    return not positional or any(_graphql(p) or re.search(r"\$\{?\w+\}?$", p) for p in positional)
+
+
+def _wget_writes(args) -> bool:
+    for a in args:
+        name, _, value = a.partition("=")
+        if name in {"--post-data", "--post-file", "--body-data", "--body-file"}:
+            return True
+        if name == "--method" and not _method_is_read(value):
+            return True
+    return False
+
 
 def _shell_denied(source, depth=0, variables=None):
     if depth > MAX_DEPTH:
